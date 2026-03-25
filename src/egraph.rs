@@ -181,7 +181,7 @@ impl EGraph {
     }
 
     /// Check whether two e-class ids are equivalent.
-    pub fn equiv(&mut self, a: Id, b: Id) -> bool {
+    pub fn equiv(&self, a: Id, b: Id) -> bool {
         self.find(a) == self.find(b)
     }
 
