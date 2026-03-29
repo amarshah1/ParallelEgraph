@@ -79,9 +79,9 @@ impl EGraph {
     }
 
     /// Find the canonical representative with path halving.
-    pub fn find(&self, mut id: Id) -> Id {
+    pub fn find(&mut self, mut id: Id) -> Id {
         while self.parent[id as usize] != id {
-            // self.parent[id as usize] = self.parent[self.parent[id as usize] as usize];
+            self.parent[id as usize] = self.parent[self.parent[id as usize] as usize];
             id = self.parent[id as usize];
         }
         id
@@ -148,7 +148,8 @@ impl EGraph {
         while !self.worklist.is_empty() {
             let todo: Vec<Id> = std::mem::take(&mut self.worklist);
             for id in todo {
-                self.repair(self.find(id));
+                let id_root = self.find(id); 
+                self.repair(id_root);
             }
         }
     }
@@ -181,8 +182,10 @@ impl EGraph {
     }
 
     /// Check whether two e-class ids are equivalent.
-    pub fn equiv(&self, a: Id, b: Id) -> bool {
-        self.find(a) == self.find(b)
+    pub fn equiv(&mut self, a: Id, b: Id) -> bool {
+        let a_root = self.find(a);
+        let b_root = self.find(b);  
+        a_root == b_root
     }
 
     /// Number of distinct e-classes.
