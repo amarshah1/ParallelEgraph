@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use crate::unionfind::ConcurrentUnionFind;
+
 pub type Id = u32;
 
 /// An e-node: an operator applied to e-class IDs.
@@ -36,10 +38,14 @@ impl std::fmt::Display for ENode {
 
 /// E-graph: maintains e-classes, a union-find, a hashcons, and supports
 /// merge with congruence closure.
+///
+/// The union-find is lock-free (based on concurrent DSU with ranks and
+/// path compression via CAS), so `find` and `equiv` do not require `&mut self`.
+/// When constructed with `new_parallel()`, batch merge operations use rayon
+/// to run union-find operations across multiple threads.
 pub struct EGraph {
-    // Union-find
-    parent: Vec<Id>,
-    size: Vec<u32>,
+    // Lock-free concurrent union-find (works in both sequential and parallel modes)
+    uf: ConcurrentUnionFind,
 
     // E-class id -> e-nodes in that class
     classes: HashMap<Id, Vec<ENode>>,
@@ -54,41 +60,52 @@ pub struct EGraph {
     // E-classes needing congruence repair
     worklist: Vec<Id>,
 
-    next_id: Id,
+    // Whether to use parallel (rayon) operations for batch merges
+    parallel: bool,
 }
 
 impl EGraph {
+    /// Create a new e-graph in sequential mode.
     pub fn new() -> Self {
         EGraph {
-            parent: Vec::new(),
-            size: Vec::new(),
+            uf: ConcurrentUnionFind::new(),
             classes: HashMap::new(),
             parents: HashMap::new(),
             hashcons: HashMap::new(),
             worklist: Vec::new(),
-            next_id: 0,
+            parallel: false,
         }
+    }
+
+    /// Create a new e-graph in parallel mode.
+    /// Batch merges via `parallel_merge_all` will use rayon for parallelism.
+    pub fn new_parallel() -> Self {
+        EGraph {
+            uf: ConcurrentUnionFind::new(),
+            classes: HashMap::new(),
+            parents: HashMap::new(),
+            hashcons: HashMap::new(),
+            worklist: Vec::new(),
+            parallel: true,
+        }
+    }
+
+    pub fn is_parallel(&self) -> bool {
+        self.parallel
     }
 
     fn make_id(&mut self) -> Id {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.parent.push(id);
-        self.size.push(1);
-        id
+        self.uf.make_set()
     }
 
-    /// Find the canonical representative with path halving.
-    pub fn find(&mut self, mut id: Id) -> Id {
-        while self.parent[id as usize] != id {
-            self.parent[id as usize] = self.parent[self.parent[id as usize] as usize];
-            id = self.parent[id as usize];
-        }
-        id
+    /// Find the canonical representative. Lock-free, does not require `&mut self`.
+    /// Path compression happens via CAS on the internal atomic array.
+    pub fn find(&self, id: Id) -> Id {
+        self.uf.find_root(id)
     }
 
     /// Canonicalize an e-node: replace each child with its find root.
-    fn canonicalize(&mut self, node: &ENode) -> ENode {
+    fn canonicalize(&self, node: &ENode) -> ENode {
         let children = node.children.iter().map(|&c| self.find(c)).collect();
         ENode { op: node.op.clone(), children }
     }
@@ -115,32 +132,72 @@ impl EGraph {
 
     /// Merge two e-classes. Returns the new canonical id.
     pub fn merge(&mut self, a: Id, b: Id) -> Id {
-        let mut a = self.find(a);
-        let mut b = self.find(b);
+        let a = self.find(a);
+        let b = self.find(b);
         if a == b {
             return a;
         }
 
-        // Union by size: smaller merges into larger
-        if self.size[a as usize] < self.size[b as usize] {
-            std::mem::swap(&mut a, &mut b);
-        }
-        // b merges into a
-        self.parent[b as usize] = a;
-        self.size[a as usize] += self.size[b as usize];
+        // Perform the lock-free union
+        self.uf.union(a, b);
+        let root = self.find(a);
+        let merged = if root == a { b } else { a };
 
         // Merge class contents
-        if let Some(nodes_b) = self.classes.remove(&b) {
-            self.classes.entry(a).or_default().extend(nodes_b);
+        if let Some(nodes) = self.classes.remove(&merged) {
+            self.classes.entry(root).or_default().extend(nodes);
         }
 
         // Merge parent (use) lists
-        if let Some(parents_b) = self.parents.remove(&b) {
-            self.parents.entry(a).or_default().extend(parents_b);
+        if let Some(parent_list) = self.parents.remove(&merged) {
+            self.parents.entry(root).or_default().extend(parent_list);
         }
 
-        self.worklist.push(a);
-        a
+        self.worklist.push(root);
+        root
+    }
+
+    /// Batch-merge many pairs in parallel using rayon.
+    ///
+    /// Phase 1: all union-find operations run lock-free across threads.
+    /// Phase 2: metadata (classes, parent lists) is reconciled sequentially.
+    /// Phase 3: affected roots are added to the worklist for `rebuild`.
+    pub fn parallel_merge_all(&mut self, pairs: &[(Id, Id)]) {
+        use rayon::prelude::*;
+
+        if pairs.is_empty() {
+            return;
+        }
+
+        // Phase 1: parallel UF unions (lock-free CAS)
+        {
+            let uf = &self.uf;
+            pairs.par_iter().for_each(|&(a, b)| {
+                uf.union(a, b);
+            });
+        }
+
+        // Phase 2: reconcile metadata — re-key classes and parent lists by root
+        let old_classes = std::mem::take(&mut self.classes);
+        for (class_id, nodes) in old_classes {
+            let root = self.find(class_id);
+            self.classes.entry(root).or_default().extend(nodes);
+        }
+
+        let old_parents = std::mem::take(&mut self.parents);
+        for (class_id, parent_list) in old_parents {
+            let root = self.find(class_id);
+            self.parents.entry(root).or_default().extend(parent_list);
+        }
+
+        // Phase 3: add affected roots to worklist
+        let mut roots_seen = std::collections::HashSet::new();
+        for &(a, _) in pairs {
+            let root = self.find(a);
+            if roots_seen.insert(root) {
+                self.worklist.push(root);
+            }
+        }
     }
 
     /// Restore the congruence invariant after merges.
@@ -148,7 +205,7 @@ impl EGraph {
         while !self.worklist.is_empty() {
             let todo: Vec<Id> = std::mem::take(&mut self.worklist);
             for id in todo {
-                let id_root = self.find(id); 
+                let id_root = self.find(id);
                 self.repair(id_root);
             }
         }
@@ -181,11 +238,9 @@ impl EGraph {
         }
     }
 
-    /// Check whether two e-class ids are equivalent.
-    pub fn equiv(&mut self, a: Id, b: Id) -> bool {
-        let a_root = self.find(a);
-        let b_root = self.find(b);  
-        a_root == b_root
+    /// Check whether two e-class ids are equivalent. Lock-free.
+    pub fn equiv(&self, a: Id, b: Id) -> bool {
+        self.find(a) == self.find(b)
     }
 
     /// Number of distinct e-classes.
@@ -324,5 +379,85 @@ mod tests {
         eg.merge(a, b);
         eg.rebuild();
         assert!(eg.equiv(gfaa, gfbb), "g(f(a),a) == g(f(b),b) after a=b");
+    }
+
+    // ---- Parallel mode tests ----
+
+    #[test]
+    fn parallel_basic_merge() {
+        let mut eg = EGraph::new_parallel();
+        let a = eg.add(ENode::leaf("a"));
+        let b = eg.add(ENode::leaf("b"));
+        let c = eg.add(ENode::leaf("c"));
+
+        eg.parallel_merge_all(&[(a, b), (b, c)]);
+        eg.rebuild();
+
+        assert!(eg.equiv(a, b));
+        assert!(eg.equiv(b, c));
+        assert!(eg.equiv(a, c));
+    }
+
+    #[test]
+    fn parallel_congruence() {
+        let mut eg = EGraph::new_parallel();
+        let a = eg.add(ENode::leaf("a"));
+        let b = eg.add(ENode::leaf("b"));
+        let fa = eg.add(ENode::new("f", vec![a]));
+        let fb = eg.add(ENode::new("f", vec![b]));
+
+        eg.parallel_merge_all(&[(a, b)]);
+        eg.rebuild();
+
+        assert!(eg.equiv(fa, fb), "f(a) == f(b) after parallel merge a=b");
+    }
+
+    #[test]
+    fn parallel_cascading_congruence() {
+        let mut eg = EGraph::new_parallel();
+        let a = eg.add(ENode::leaf("a"));
+        let b = eg.add(ENode::leaf("b"));
+        let fa = eg.add(ENode::new("f", vec![a]));
+        let fb = eg.add(ENode::new("f", vec![b]));
+        let gfa = eg.add(ENode::new("g", vec![fa]));
+        let gfb = eg.add(ENode::new("g", vec![fb]));
+
+        eg.parallel_merge_all(&[(a, b)]);
+        eg.rebuild();
+
+        assert!(eg.equiv(fa, fb));
+        assert!(eg.equiv(gfa, gfb), "g(f(a)) == g(f(b)) cascading (parallel)");
+    }
+
+    #[test]
+    fn parallel_multi_arg_congruence() {
+        let mut eg = EGraph::new_parallel();
+        let a = eg.add(ENode::leaf("a"));
+        let b = eg.add(ENode::leaf("b"));
+        let c = eg.add(ENode::leaf("c"));
+        let d = eg.add(ENode::leaf("d"));
+        let fac = eg.add(ENode::new("f", vec![a, c]));
+        let fbd = eg.add(ENode::new("f", vec![b, d]));
+
+        eg.parallel_merge_all(&[(a, b), (c, d)]);
+        eg.rebuild();
+
+        assert!(eg.equiv(fac, fbd), "f(a,c) == f(b,d) after parallel a=b, c=d");
+    }
+
+    #[test]
+    fn parallel_many_merges() {
+        let mut eg = EGraph::new_parallel();
+        let n = 100;
+        let ids: Vec<Id> = (0..n).map(|i| eg.add(ENode::leaf(format!("x{i}")))).collect();
+
+        // Merge all into one equivalence class
+        let pairs: Vec<(Id, Id)> = (0..n - 1).map(|i| (ids[i as usize], ids[(i + 1) as usize])).collect();
+        eg.parallel_merge_all(&pairs);
+        eg.rebuild();
+
+        for i in 0..n {
+            assert!(eg.equiv(ids[0], ids[i as usize]), "all should be equivalent");
+        }
     }
 }

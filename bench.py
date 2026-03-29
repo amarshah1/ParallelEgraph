@@ -29,12 +29,15 @@ def build_our_solver(release: bool) -> str:
     return os.path.join("target", profile, "parallel-egraph")
 
 
-def run_one(solver: str, path: str) -> tuple[str, float, str]:
+def run_one(solver: str, path: str, parallel: bool) -> tuple[str, float, str]:
     """Run the solver on a single file. Returns (result, elapsed_secs, error)."""
     start = time.perf_counter()
     try:
+        cmd = [solver, path]
+        if parallel:
+            cmd.append("-p")
         proc = subprocess.run(
-            [solver, path],
+            cmd,
             capture_output=True,
             text=True,
             timeout=300,
@@ -54,6 +57,7 @@ def main():
     parser.add_argument("folder", help="Directory containing .smt2 files")
     parser.add_argument("--solver", help="Path to external solver binary (e.g. z3, cvc5)")
     parser.add_argument("--debug", action="store_true", help="Use debug build (only for our solver, default is release)")
+    parser.add_argument("--parallel", action="store_true", help="Use parallel mode (only for our solver)")
     parser.add_argument("--csv", dest="csv_file", help="Write results to CSV")
     args = parser.parse_args()
 
@@ -71,7 +75,7 @@ def main():
 
     # Warmup: run the first benchmark once without recording
     print(f"\nWarmup: {os.path.basename(files[0])}", flush=True)
-    run_one(solver, files[0])
+    run_one(solver, files[0], args.parallel)
 
     results = []
     total_time = 0.0
@@ -82,7 +86,7 @@ def main():
 
     for path in files:
         name = os.path.basename(path)
-        result, elapsed, error = run_one(solver, path)
+        result, elapsed, error = run_one(solver, path, args.parallel)
         total_time += elapsed
         results.append((name, result, elapsed, error))
 
