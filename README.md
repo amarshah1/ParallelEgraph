@@ -36,24 +36,35 @@ The `benchmarks/` directory contains QF_UF benchmarks from the [SMT-COMP 2025 Ze
 
 ### Synthetic Benchmarks
 
-The `gen_bench.py` script generates scalable QF_UF benchmarks parameterized by size `n`, designed to stress-test parallel e-graph operations. Each benchmark produces a single deeply-nested disequality that requires processing the entire formula — no individual assertion pair gives an immediate contradiction.
+The `gen_bench.py` script generates scalable QF_UF benchmarks parameterized by size `n`, designed to stress-test parallel e-graph operations. Each benchmark produces a single UNSAT disequality that requires processing the entire formula — no individual assertion pair gives an immediate contradiction. A balanced binary tree keeps nesting depth at O(log m) where m is the number of leaf terms.
 
 ```
 python gen_bench.py <family> <n> [output_dir]
 python gen_bench.py all <n> [output_dir]
 python gen_bench.py sweep <n1> <n2> <step> [output_dir]
+python gen_bench.py sweep:<family> <n1> <n2> <step> [output_dir]
 ```
 
-Four families are available:
-
-| Family   | Merges | Congruences | Nesting Depth | Stress Target |
-|----------|--------|-------------|---------------|---------------|
-| `chain`  | 2n+1   | n (sequential cascade) | n | Sequential rebuild |
-| `wide`   | n      | n (independent) | n-1 | Parallel merge |
-| `fanout` | 1      | n (independent) | n | Parallel rebuild |
-| `grid`   | n      | n² (independent) | n² | Combined |
-
 Output defaults to `synthetic_benchmarks/`.
+
+Four families are available, spanning O(n) to O(2^n) congruence counts:
+
+| Family | Merges | Congruences | Stress Target |
+|--------|--------|-------------|---------------|
+| `chain` | 2n+1 | n | Sequential depth |
+| `grid` | n | n² | Parallel rebuild |
+| `cube` | n | n³ | Heavy rebuild |
+| `exp` | 1 | 2^(n+1)−2 | Exponential cascade |
+
+**chain** — Sequential congruence cascade. Asserts `a0 = b0`, then defines `a_{i+1} = f(a_i)` and `b_{i+1} = f(b_i)` for n levels, with a single disequality `a_n != b_n`. Each congruence step depends on the previous one, making this inherently sequential. Useful as a baseline showing the limit of parallelism.
+
+**grid** — Quadratic congruences via binary function. Declares n constant pairs `a_i = b_i` and a binary function `f`. The single disequality compares a balanced tree of all n² terms `f(a_i, a_j)` against `f(b_i, b_j)`. All n merges are independent (parallelizable), and the n² congruences `f(a_i, a_j) = f(b_i, b_j)` are all independent of each other — a good target for parallel rebuild.
+
+**cube** — Cubic congruences via ternary function. Same structure as grid but with a 3-ary function `f(a_i, a_j, a_k)`, producing n³ congruences from n merges. Stresses rebuild throughput more heavily than grid at the same n.
+
+**exp** — Exponential congruence cascade. A single merge `a = b` propagates through n layers, each with 2 unary functions. Layer i has 2^i named terms per side (e.g., `ta1_0 = f0(a)`, `ta2_0 = f2(ta1_0)`). The merge cascades: layer 1 congruences trigger layer 2, which triggers layer 3, etc., producing 2^(n+1)−2 total congruences. Tests how the solver handles cascading congruence discovery where later work depends on earlier results.
+
+**Note on scaling limits:** The number of congruences discovered during congruence closure is bounded by the number of distinct e-nodes, which equals the number of distinct subterms in the formula. This means exponential congruences (exp family) necessarily require exponential formula size — there is no compact encoding that avoids this. For practical scaling, the polynomial families (grid, cube) are more useful. These could be generalized to a `power_k` family using a k-ary function to produce n^k congruences from n merges (e.g., k=4 for n⁴, k=5 for n⁵).
 
 ## TODOS
 
