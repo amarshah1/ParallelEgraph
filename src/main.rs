@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use parallel_egraph::{solve, solve_parallel, SolveResult};
+use parallel_egraph::{solve_with_mode, SolveResult};
 
 fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
@@ -26,11 +26,7 @@ fn main() -> Result<(), String> {
     let input = fs::read_to_string(&input_file)
         .map_err(|e| format!("Error reading file {}: {}", input_file.display(), e))?;
 
-    let result = if parallel {
-        solve_parallel(&input)?
-    } else {
-        solve(&input)?
-    };
+    let result = solve_with_mode(&input, parallel)?;
 
     match result {
         SolveResult::Sat => println!("sat"),

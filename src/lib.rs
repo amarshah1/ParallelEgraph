@@ -16,18 +16,9 @@ pub enum SolveResult {
     Unsat,
 }
 
-/// Parse and solve an SMT-LIB QF_UF string (sequential mode).
-pub fn solve(input: &str) -> Result<SolveResult, String> {
-    solve_with_mode(input, false)
-}
-
-/// Parse and solve an SMT-LIB QF_UF string (parallel mode).
-/// Union-find merges run lock-free across rayon threads.
-pub fn solve_parallel(input: &str) -> Result<SolveResult, String> {
-    solve_with_mode(input, true)
-}
-
-fn solve_with_mode(input: &str, parallel: bool) -> Result<SolveResult, String> {
+/// Parse and solve an SMT-LIB QF_UF string .
+/// Union-find merges run lock-free across rayon threads (parallel mode).
+pub fn solve_with_mode(input: &str, parallel: bool) -> Result<SolveResult, String> {
     let commands = UntypedAst
         .parse_script_str(input)
         .map_err(|e| format!("Parse error: {e}"))?;
