@@ -21,6 +21,26 @@ Solve an SMT-LIB 2 file:
 cargo run -- tests/03_congruence_unsat.smt2
 ```
 
+Solve in parallel mode (union-find merges run lock-free across threads via rayon):
+```
+cargo run -- --parallel tests/03_congruence_unsat.smt2
+```
+
+Control thread count with `RAYON_NUM_THREADS` (defaults to number of logical CPUs):
+```
+RAYON_NUM_THREADS=4 cargo run -- --parallel tests/15_stress_unsat.smt2
+```
+
+### Parallel Mode
+
+The `--parallel` (or `-p`) flag enables a lock-free concurrent union-find based on the concurrent DSU algorithm with rank-based union and path compression via CAS (compare-and-swap). In parallel mode:
+
+1. **Phase 1**: All equality assertions are collected, and their union-find operations execute in parallel across rayon threads (lock-free CAS, no mutexes).
+2. **Phase 2**: E-class metadata (class contents, parent/use lists) is reconciled sequentially.
+3. **Phase 3**: `rebuild()` restores the congruence invariant as usual.
+
+This is most beneficial when many independent merges can be batched (e.g., the `grid` and `cube` synthetic benchmarks).
+
 ## Tests
 
 Run all unit tests and regression tests:
@@ -68,7 +88,7 @@ Four families are available, spanning O(n) to O(2^n) congruence counts:
 
 ## TODOS
 
-    - Come up with a scalable benchmark set that does not involve boolean connectives
-    - Implement parallel (concurrent?) union-find
-    - Implement parallel (concurrent?) union predecessors
+    - Come up with a scalable benchmark set that does not involve boolean connectives ✅
+    - Implement parallel (concurrent?) union-find ⏳ (STARTED, BUT INEFFICIENT)
+    - Implement parallel (concurrent?) union predecessors ⏳ (STARTED, BUT INEFFICIENT)
     - Build and SMT harness around the egraph to support boolean connectives (note this means that the egraph has to be backtrackable)
