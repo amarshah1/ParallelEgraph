@@ -50,3 +50,43 @@ smt2_test!(t13_diamond_unsat,            "13_diamond_unsat.smt2");
 smt2_test!(t14_diamond_sat,              "14_diamond_sat.smt2");
 smt2_test!(t15_stress_unsat,             "15_stress_unsat.smt2");
 smt2_test!(t16_stress_multiarg_sat,      "16_stress_multiarg_sat.smt2");
+
+// ---- Parallel mode regression tests ----
+
+fn run_smt2_parallel(name: &str) {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join(name);
+    let input = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    let expected = expected_result(name);
+    let actual =
+        solve_with_mode(&input, true).unwrap_or_else(|e| panic!("{name} (parallel): solve failed: {e}"));
+    assert_eq!(actual, expected, "{name} (parallel): expected {expected:?}, got {actual:?}");
+}
+
+macro_rules! smt2_test_parallel {
+    ($func_name:ident, $file:expr) => {
+        #[test]
+        fn $func_name() {
+            run_smt2_parallel($file);
+        }
+    };
+}
+
+smt2_test_parallel!(p01_trivial_sat,              "01_trivial_sat.smt2");
+smt2_test_parallel!(p02_trivial_unsat,            "02_trivial_unsat.smt2");
+smt2_test_parallel!(p03_congruence_unsat,         "03_congruence_unsat.smt2");
+smt2_test_parallel!(p04_different_ops_sat,        "04_different_ops_sat.smt2");
+smt2_test_parallel!(p05_cascade_unsat,            "05_cascade_unsat.smt2");
+smt2_test_parallel!(p06_multiarg_unsat,           "06_multiarg_unsat.smt2");
+smt2_test_parallel!(p07_partial_args_sat,         "07_partial_args_sat.smt2");
+smt2_test_parallel!(p08_transitivity_unsat,       "08_transitivity_unsat.smt2");
+smt2_test_parallel!(p09_no_reverse_congruence_sat,"09_no_reverse_congruence_sat.smt2");
+smt2_test_parallel!(p10_deep_nesting_unsat,       "10_deep_nesting_unsat.smt2");
+smt2_test_parallel!(p11_multi_diseq_sat,          "11_multi_diseq_sat.smt2");
+smt2_test_parallel!(p12_hidden_congruence_unsat,  "12_hidden_congruence_unsat.smt2");
+smt2_test_parallel!(p13_diamond_unsat,            "13_diamond_unsat.smt2");
+smt2_test_parallel!(p14_diamond_sat,              "14_diamond_sat.smt2");
+smt2_test_parallel!(p15_stress_unsat,             "15_stress_unsat.smt2");
+smt2_test_parallel!(p16_stress_multiarg_sat,      "16_stress_multiarg_sat.smt2");

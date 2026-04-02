@@ -130,19 +130,27 @@ pub fn solve_timed(input: &str, parallel: bool) -> Result<(SolveResult, SolveTim
 
         Ok((result, SolveTimings { parse_s, build_s, merge_s, rebuild_s, check_s, total_s, solve_s }))
     } else {
-        // Sequential: build and merge are interleaved
+        // Sequential: time build (add_term) and merge separately
+        let mut build_accum = 0.0f64;
+        let mut merge_accum = 0.0f64;
         for assertion in &assertions {
-            match process::process_assertion(&mut eg, assertion) {
+            let t0 = Instant::now();
+            let a = process::process_assertion(&mut eg, assertion);
+            build_accum += t0.elapsed().as_secs_f64();
+
+            match a {
                 Assertion::Equality(a, b) => {
+                    let t1 = Instant::now();
                     eg.merge(a, b);
+                    merge_accum += t1.elapsed().as_secs_f64();
                 }
                 Assertion::Disequality(a, b) => {
                     disequalities.push((a, b));
                 }
             }
         }
-        let build_s = 0.0; // interleaved, can't separate
-        let merge_s = build_start.elapsed().as_secs_f64(); // build+merge combined
+        let build_s = build_accum;
+        let merge_s = merge_accum;
 
         // --- Rebuild ---
         let rebuild_start = Instant::now();
@@ -162,7 +170,7 @@ pub fn solve_timed(input: &str, parallel: bool) -> Result<(SolveResult, SolveTim
 
         end_solve_region();
         let total_s = total_start.elapsed().as_secs_f64();
-        let solve_s = merge_s + rebuild_s + check_s;
+        let solve_s = build_s + merge_s + rebuild_s + check_s;
 
         Ok((result, SolveTimings { parse_s, build_s, merge_s, rebuild_s, check_s, total_s, solve_s }))
     }

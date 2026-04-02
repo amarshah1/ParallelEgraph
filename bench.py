@@ -105,6 +105,8 @@ def main():
     else:
         solver = build_our_solver(not args.debug)
         solver_name = "parallel-egraph"
+        # Always use detailed timing for our solver
+        args.timing = True
 
     # Warmup
     print(f"\nWarmup: {os.path.basename(files[0])}", flush=True)
