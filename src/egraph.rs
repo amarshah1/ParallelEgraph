@@ -43,9 +43,35 @@ impl std::fmt::Display for ENode {
 /// path compression via CAS), so `find` and `equiv` do not require `&mut self`.
 /// When constructed with `new_parallel()`, batch merge operations use rayon
 /// to run union-find operations across multiple threads.
+///
+/// In parallel mode, the primary data structures are:
+/// - `uf`: lock-free union-find (the only shared mutable state during rebuild)
+/// - `nodes`: flat array of non-leaf enodes (immutable after build phase)
+/// - `parent_index`: child_class -> [node indices] (maintained during rebuild)
+/// - `changed`: per-class flags
+///
+/// The `classes`/`parents`/`hashcons`/`worklist` structures are only used in
+/// sequential mode. In parallel mode, `hashcons` is used during `add()` for
+/// dedup but not during rebuild.
 pub struct EGraph {
     // Lock-free concurrent union-find (works in both sequential and parallel modes)
     uf: ConcurrentUnionFind,
+
+    // --- Parallel mode primary structures ---
+
+    // Flat array of all non-leaf enodes: (enode, class_id).
+    // Append-only during build phase, immutable during rebuild.
+    // Class membership resolved via find(class_id).
+    nodes: Vec<(ENode, Id)>,
+
+    // child_class -> [indices into nodes].
+    // Built during add(), maintained (consolidated) during parallel_rebuild().
+    parent_index: Vec<Vec<usize>>,
+
+    // Per-class changed flags for parallel rebuild (indexed by class id)
+    changed: Vec<bool>,
+
+    // --- Sequential mode structures ---
 
     // E-class id -> e-nodes in that class
     classes: HashMap<Id, Vec<ENode>>,
@@ -54,14 +80,13 @@ pub struct EGraph {
     // has this class as a child (the "use list" / "parent list")
     parents: HashMap<Id, Vec<(ENode, Id)>>,
 
-    // Canonical e-node -> e-class id
-    hashcons: HashMap<ENode, Id>,
-
     // E-classes needing congruence repair (sequential mode)
     worklist: Vec<Id>,
 
-    // Per-class changed flags for parallel rebuild (indexed by class id)
-    changed: Vec<bool>,
+    // --- Shared ---
+
+    // Canonical e-node -> e-class id (used by add() for dedup in both modes)
+    hashcons: HashMap<ENode, Id>,
 
     // Whether to use parallel (rayon) operations for batch merges
     parallel: bool,
@@ -72,11 +97,13 @@ impl EGraph {
     pub fn new() -> Self {
         EGraph {
             uf: ConcurrentUnionFind::new(),
+            nodes: Vec::new(),
+            parent_index: Vec::new(),
+            changed: Vec::new(),
             classes: HashMap::new(),
             parents: HashMap::new(),
-            hashcons: HashMap::new(),
             worklist: Vec::new(),
-            changed: Vec::new(),
+            hashcons: HashMap::new(),
             parallel: false,
         }
     }
@@ -86,11 +113,13 @@ impl EGraph {
     pub fn new_parallel() -> Self {
         EGraph {
             uf: ConcurrentUnionFind::new(),
+            nodes: Vec::new(),
+            parent_index: Vec::new(),
+            changed: Vec::new(),
             classes: HashMap::new(),
             parents: HashMap::new(),
-            hashcons: HashMap::new(),
             worklist: Vec::new(),
-            changed: Vec::new(),
+            hashcons: HashMap::new(),
             parallel: true,
         }
     }
@@ -117,20 +146,40 @@ impl EGraph {
 
     /// Add a single e-node. Returns the e-class id it belongs to.
     pub fn add(&mut self, node: ENode) -> Id {
+        // Canonicalize Enode to add
         let canon = self.canonicalize(&node);
 
         // Check hashcons for an existing congruent node
         if let Some(&id) = self.hashcons.get(&canon) {
+            // If already exists, just return that node
             return self.find(id);
         }
 
         // Fresh e-class
         let id = self.make_id();
-        // Register as parent of each child
-        for &child in &canon.children {
-            self.parents.entry(child).or_default().push((canon.clone(), id));
+
+        // Register non-leaf nodes in flat array + parent index (for parallel rebuild)
+        if !canon.children.is_empty() {
+            let node_idx = self.nodes.len();
+            self.nodes.push((canon.clone(), id));
+            // Grow parent_index to cover all class IDs
+            if self.parent_index.len() < self.uf.len() {
+                self.parent_index.resize_with(self.uf.len(), Vec::new);
+            }
+            for &child in &canon.children {
+                let child_root = self.find(child) as usize;
+                self.parent_index[child_root].push(node_idx);
+            }
         }
-        self.classes.entry(id).or_default().push(canon.clone());
+
+        // Sequential mode: also maintain parents and classes
+        if !self.parallel {
+            for &child in &canon.children {
+                self.parents.entry(child).or_default().push((canon.clone(), id));
+            }
+            self.classes.entry(id).or_default().push(canon.clone());
+        }
+
         self.hashcons.insert(canon, id);
         id
     }
@@ -184,65 +233,67 @@ impl EGraph {
             });
         }
 
-        // Phase 2: mark changed classes (grow changed vec if needed)
+        // Phase 2: consolidate parent_index entries under new roots + mark changed.
+        // After parallel unions, parent_index entries may be keyed under old
+        // (non-root) class IDs. Move them to the current root so the rebuild
+        // loop can find all parents of changed classes.
+        self.parent_index.resize_with(self.uf.len(), Vec::new);
         self.changed.resize(self.uf.len(), false);
         for &(a, b) in pairs {
-            let root = self.find(a);
-            self.changed[root as usize] = true;
-            // Also mark b's side in case union chose b's root
-            let root_b = self.find(b);
-            self.changed[root_b as usize] = true;
+            let root = self.find(a) as usize;
+            if (a as usize) != root {
+                let entries = std::mem::take(&mut self.parent_index[a as usize]);
+                self.parent_index[root].extend(entries);
+            }
+            if (b as usize) != root {
+                let entries = std::mem::take(&mut self.parent_index[b as usize]);
+                self.parent_index[root].extend(entries);
+            }
+            self.changed[root] = true;
         }
     }
 
     /// Batch-parallel congruence closure using the round-based algorithm.
     ///
-    /// Each round: (1) parallel frontier filter, (2) parallel canonicalization,
+    /// Uses only `uf`, `nodes`, `parent_index`, and `changed` — no HashMap
+    /// access during the hot loop. The `nodes` array and `parent_index` are
+    /// built during `add()` and maintained across rounds.
+    ///
+    /// Each round: (1) frontier from parent_index, (2) parallel canonicalization,
     /// (3) parallel semisort by signature, (4) merge candidate extraction,
-    /// (5) parallel merge application, (6) parallel changed-flag update.
+    /// (5) parallel merge application, (6) changed-flag + parent_index update.
     fn parallel_rebuild(&mut self) {
         use rayon::prelude::*;
 
-        // Build flat array of all non-leaf enodes for parallel scanning.
-        // We use find() on stale class_ids, so no metadata reconciliation needed.
-        let all_nodes: Vec<(ENode, Id)> = self
-            .classes
-            .iter()
-            .flat_map(|(&class_id, nodes)| {
-                nodes
-                    .iter()
-                    .filter(|n| !n.children.is_empty())
-                    .map(move |n| (n.clone(), class_id))
-            })
-            .collect();
-
-        // Ensure changed flags cover all class ids
+        // Ensure parent_index and changed flags cover all class ids
+        self.parent_index.resize_with(self.uf.len(), Vec::new);
         self.changed.resize(self.uf.len(), false);
 
         loop {
-            // 1. GATHER FRONTIER [par_iter + filter]
-            //    Parallel filter: keep nodes where any child's root is changed.
-            let uf = &self.uf;
-            let changed = &self.changed;
-            let frontier: Vec<&(ENode, Id)> = all_nodes
-                .par_iter()
-                .filter(|(node, _)| {
-                    node.children
-                        .iter()
-                        .any(|&c| changed[uf.find_root(c) as usize])
-                })
-                .collect();
+            // 1. GATHER FRONTIER [push from changed classes via parent_index]
+            //    O(frontier) — only visit parents of changed classes.
+            let mut frontier_indices: Vec<usize> = Vec::new();
+            for (class_id, &is_changed) in self.changed.iter().enumerate() {
+                if is_changed {
+                    frontier_indices.extend_from_slice(&self.parent_index[class_id]);
+                }
+            }
+            frontier_indices.sort_unstable();
+            frontier_indices.dedup();
 
-            if frontier.is_empty() {
+            if frontier_indices.is_empty() {
                 break;
             }
 
             // 2. CANONICALIZE [par_iter + map]
             //    Parallel map: compute (canonical_signature, class_root).
             //    Safe because find() is lock-free.
-            let mut canonicalized: Vec<(ENode, Id)> = frontier
+            let uf = &self.uf;
+            let nodes = &self.nodes;
+            let mut canonicalized: Vec<(ENode, Id)> = frontier_indices
                 .par_iter()
-                .map(|(node, class_id)| {
+                .map(|&idx| {
+                    let (node, class_id) = &nodes[idx];
                     let canon = ENode {
                         op: node.op.clone(),
                         children: node.children.iter().map(|&c| uf.find_root(c)).collect(),
@@ -286,55 +337,27 @@ impl EGraph {
                 uf.union(a, b);
             });
 
-            // 6. UPDATE CHANGED FLAGS [par_iter + for_each]
-            //    Reset all flags, then mark merged roots.
+            // 6. UPDATE CHANGED FLAGS + MERGE PARENT INDEX
+            //    Consolidate parent_index entries under the new root so
+            //    future rounds find all parents. Mark both sides changed.
             self.changed.par_iter_mut().for_each(|c| *c = false);
-            let uf = &self.uf;
-            for &(a, _) in &merge_pairs {
-                let root = uf.find_root(a);
-                self.changed[root as usize] = true;
-            }
-        }
-
-        // POST-REBUILD CLEANUP: reconcile metadata to consistent state.
-
-        // Reconcile classes: re-key by current root
-        let old_classes = std::mem::take(&mut self.classes);
-        for (class_id, nodes) in old_classes {
-            let root = self.find(class_id);
-            self.classes.entry(root).or_default().extend(nodes);
-        }
-
-        // Rebuild parents: scan all non-leaf nodes, register under each child root
-        self.parents.clear();
-        for (&class_id, nodes) in &self.classes {
-            let class_root = self.find(class_id);
-            for node in nodes {
-                if node.children.is_empty() {
-                    continue;
+            for &(a, b) in &merge_pairs {
+                let root = self.uf.find_root(a) as usize;
+                if (a as usize) != root {
+                    let entries = std::mem::take(&mut self.parent_index[a as usize]);
+                    self.parent_index[root].extend(entries);
                 }
-                let canon = self.canonicalize(node);
-                for &child in &canon.children {
-                    let child_root = self.find(child);
-                    self.parents
-                        .entry(child_root)
-                        .or_default()
-                        .push((canon.clone(), class_root));
+                if (b as usize) != root {
+                    let entries = std::mem::take(&mut self.parent_index[b as usize]);
+                    self.parent_index[root].extend(entries);
                 }
+                self.changed[root] = true;
             }
         }
 
-        // Rebuild hashcons: scan all nodes, insert canonical forms
-        self.hashcons.clear();
-        for (&class_id, nodes) in &self.classes {
-            let class_root = self.find(class_id);
-            for node in nodes {
-                let canon = self.canonicalize(node);
-                self.hashcons.entry(canon).or_insert(class_root);
-            }
-        }
-
-        // Clear changed flags
+        // Clear changed flags — no other cleanup needed.
+        // The union-find is the source of truth for class membership.
+        // nodes/parent_index remain valid (stale class_ids resolved via find()).
         self.changed.iter_mut().for_each(|c| *c = false);
     }
 
