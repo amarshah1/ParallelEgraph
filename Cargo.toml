@@ -7,3 +7,14 @@ edition = "2021"
 yaspar = "2.7.0"
 yaspar-ir = "2.7.2"
 rayon = "1.10"
+tikv-jemallocator = "0.6"
+
+[dev-dependencies]
+rand = { version = "0.8", features = ["small_rng"] }
+
+[profile.release]
+debug = true
+
+[[bench]]
+name = "uf_ycsb"
+harness = false

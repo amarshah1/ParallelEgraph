@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use parallel_egraph::{solve, SolveResult};
+use parallel_egraph::{solve_with_mode, SolveResult};
 
 fn expected_result(filename: &str) -> SolveResult {
     if filename.contains("_unsat") {
@@ -21,7 +21,7 @@ fn run_smt2(name: &str) {
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
     let expected = expected_result(name);
     let actual =
-        solve(&input).unwrap_or_else(|e| panic!("{name}: solve failed: {e}"));
+        solve_with_mode(&input, false).unwrap_or_else(|e| panic!("{name}: solve failed: {e}"));
     assert_eq!(actual, expected, "{name}: expected {expected:?}, got {actual:?}");
 }
 
