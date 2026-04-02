@@ -1,3 +1,4 @@
+pub mod collect_reduce;
 pub mod process;
 pub mod unionfind;
 pub mod egraph;
@@ -110,7 +111,7 @@ pub fn solve_timed(input: &str, parallel: bool) -> Result<(SolveResult, SolveTim
 
         // --- Rebuild ---
         let rebuild_start = Instant::now();
-        eg.rebuild();
+        eg.parallel_rebuild();
         let rebuild_s = rebuild_start.elapsed().as_secs_f64();
 
         // --- Check disequalities ---

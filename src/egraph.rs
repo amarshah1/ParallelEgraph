@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use dashmap::DashSet;
+use std::collections::HashSet;
+use std::{collections::HashMap, sync::atomic::Ordering};
+use std::sync::atomic::AtomicBool;
 
 use crate::unionfind::ConcurrentUnionFind;
 
@@ -66,10 +69,10 @@ pub struct EGraph {
 
     // child_class -> [indices into nodes].
     // Built during add(), maintained (consolidated) during parallel_rebuild().
-    parent_index: Vec<Vec<usize>>,
+    parent_index: Vec<Vec<Id>>,
 
     // Per-class changed flags for parallel rebuild (indexed by class id)
-    changed: Vec<bool>,
+    changed: Vec<AtomicBool>,
 
     // --- Sequential mode structures ---
 
@@ -83,6 +86,8 @@ pub struct EGraph {
     // E-classes needing congruence repair (sequential mode)
     worklist: Vec<Id>,
 
+    predecessors_modified: DashSet<Id>,
+
     // --- Shared ---
 
     // Canonical e-node -> e-class id (used by add() for dedup in both modes)
@@ -90,19 +95,23 @@ pub struct EGraph {
 
     // Whether to use parallel (rayon) operations for batch merges
     parallel: bool,
+
+    size: usize,
 }
 
 impl EGraph {
     /// Create a new e-graph in sequential mode.
-    pub fn new() -> Self {
+    pub fn new(size: usize) -> Self {
         EGraph {
-            uf: ConcurrentUnionFind::new(),
+            size,
+            uf: ConcurrentUnionFind::with_size(size),
             nodes: Vec::new(),
             parent_index: Vec::new(),
             changed: Vec::new(),
             classes: HashMap::new(),
             parents: HashMap::new(),
             worklist: Vec::new(),
+            predecessors_modified: DashSet::new(),
             hashcons: HashMap::new(),
             parallel: false,
         }
@@ -110,15 +119,17 @@ impl EGraph {
 
     /// Create a new e-graph in parallel mode.
     /// Batch merges via `parallel_merge_all` will use rayon for parallelism.
-    pub fn new_parallel() -> Self {
+    pub fn new_parallel(size: usize) -> Self {
         EGraph {
-            uf: ConcurrentUnionFind::new(),
+            size,
+            uf: ConcurrentUnionFind::with_size(size),
             nodes: Vec::new(),
             parent_index: Vec::new(),
             changed: Vec::new(),
             classes: HashMap::new(),
             parents: HashMap::new(),
             worklist: Vec::new(),
+            predecessors_modified: DashSet::new(),
             hashcons: HashMap::new(),
             parallel: true,
         }
@@ -168,7 +179,7 @@ impl EGraph {
             }
             for &child in &canon.children {
                 let child_root = self.find(child) as usize;
-                self.parent_index[child_root].push(node_idx);
+                self.parent_index[child_root].push(node_idx as u32);
             }
         }
 
@@ -225,32 +236,22 @@ impl EGraph {
             return;
         }
 
-        // Phase 1: parallel UF unions (lock-free CAS)
-        {
-            let uf = &self.uf;
-            pairs.par_iter().for_each(|&(a, b)| {
-                uf.union(a, b);
-            });
-        }
+        pairs.par_iter().for_each(|&(a, b)| {
+            self.parallel_merge(a, b);
+        });
+    }
 
-        // Phase 2: consolidate parent_index entries under new roots + mark changed.
-        // After parallel unions, parent_index entries may be keyed under old
-        // (non-root) class IDs. Move them to the current root so the rebuild
-        // loop can find all parents of changed classes.
-        self.parent_index.resize_with(self.uf.len(), Vec::new);
-        self.changed.resize(self.uf.len(), false);
-        for &(a, b) in pairs {
-            let root = self.find(a) as usize;
-            if (a as usize) != root {
-                let entries = std::mem::take(&mut self.parent_index[a as usize]);
-                self.parent_index[root].extend(entries);
-            }
-            if (b as usize) != root {
-                let entries = std::mem::take(&mut self.parent_index[b as usize]);
-                self.parent_index[root].extend(entries);
-            }
-            self.changed[root] = true;
-        }
+    fn parallel_merge(&self, a: Id, b: Id) {
+        use rayon::prelude::*;
+        self.uf.union(a, b);
+        self.changed[a as usize].store(true, Ordering::Release);
+        self.changed[b as usize].store(true, Ordering::Release);
+        // self.parent_index[a as usize].par_iter().for_each(|&idx| {
+        //     self.predecessors_modified.insert(idx);
+        // });
+        // self.parent_index[a as usize].par_iter().for_each(|&idx| {
+        //     self.predecessors_modified.insert(idx);
+        // });
     }
 
     /// Batch-parallel congruence closure using the round-based algorithm.
@@ -262,112 +263,131 @@ impl EGraph {
     /// Each round: (1) frontier from parent_index, (2) parallel canonicalization,
     /// (3) parallel semisort by signature, (4) merge candidate extraction,
     /// (5) parallel merge application, (6) changed-flag + parent_index update.
-    fn parallel_rebuild(&mut self) {
+    pub fn parallel_rebuild(&mut self) {
         use rayon::prelude::*;
 
-        // Ensure parent_index and changed flags cover all class ids
-        self.parent_index.resize_with(self.uf.len(), Vec::new);
-        self.changed.resize(self.uf.len(), false);
-
+        
         loop {
-            // 1. GATHER FRONTIER [push from changed classes via parent_index]
-            //    O(frontier) — only visit parents of changed classes.
-            let mut frontier_indices: Vec<usize> = Vec::new();
-            for (class_id, &is_changed) in self.changed.iter().enumerate() {
-                if is_changed {
-                    frontier_indices.extend_from_slice(&self.parent_index[class_id]);
-                }
-            }
-            frontier_indices.sort_unstable();
-            frontier_indices.dedup();
-
-            if frontier_indices.is_empty() {
-                break;
-            }
-
-            // 2. CANONICALIZE [par_iter + map]
-            //    Parallel map: compute (canonical_signature, class_root).
-            //    Safe because find() is lock-free.
-            let uf = &self.uf;
-            let nodes = &self.nodes;
-            let mut canonicalized: Vec<(ENode, Id)> = frontier_indices
-                .par_iter()
-                .map(|&idx| {
-                    let (node, class_id) = &nodes[idx];
-                    let canon = ENode {
-                        op: node.op.clone(),
-                        children: node.children.iter().map(|&c| uf.find_root(c)).collect(),
-                    };
-                    (canon, uf.find_root(*class_id))
-                })
-                .collect();
-
-            // 3. GROUP BY SIGNATURE — SEMISORT [par_sort_unstable]
-            canonicalized.par_sort_unstable();
-
-            // 4. EMIT MERGE CANDIDATES [sequential scan over sorted groups]
-            //    O(frontier_size) — proportional to the parallel work already done.
-            let mut merge_pairs: Vec<(Id, Id)> = Vec::new();
-            let mut i = 0;
-            while i < canonicalized.len() {
-                // Find end of this group (consecutive equal signatures)
-                let mut j = i + 1;
-                while j < canonicalized.len() && canonicalized[j].0 == canonicalized[i].0 {
-                    j += 1;
-                }
-                // Emit merge pairs: chain the distinct classes in this group
-                let first_root = self.find(canonicalized[i].1);
-                for k in (i + 1)..j {
-                    let other_root = self.find(canonicalized[k].1);
-                    if other_root != first_root {
-                        merge_pairs.push((first_root, other_root));
+            // self.predecessors_modified.iter().for_each(|idx| {
+            //     self.changed[idx as usize].store(true, Ordering::Release);
+            // });
+            let predecessors = 
+                self.changed.par_iter().enumerate().filter_map(|(idx, b)| {
+                    if b.load(Ordering::Acquire) {
+                        self.changed[idx].store(false, Ordering::Release);
+                        Some(idx)
+                    } else {
+                        None
                     }
-                }
-                i = j;
-            }
+                }).collect::<Vec<_>>();
 
-            if merge_pairs.is_empty() {
-                break;
-            }
 
-            // 5. APPLY MERGES [par_iter + for_each]
-            //    Parallel union via lock-free CAS union-find.
-            let uf = &self.uf;
-            merge_pairs.par_iter().for_each(|&(a, b)| {
-                uf.union(a, b);
-            });
 
-            // 6. UPDATE CHANGED FLAGS + MERGE PARENT INDEX
-            //    Consolidate parent_index entries under the new root so
-            //    future rounds find all parents. Mark both sides changed.
-            self.changed.par_iter_mut().for_each(|c| *c = false);
-            for &(a, b) in &merge_pairs {
-                let root = self.uf.find_root(a) as usize;
-                if (a as usize) != root {
-                    let entries = std::mem::take(&mut self.parent_index[a as usize]);
-                    self.parent_index[root].extend(entries);
-                }
-                if (b as usize) != root {
-                    let entries = std::mem::take(&mut self.parent_index[b as usize]);
-                    self.parent_index[root].extend(entries);
-                }
-                self.changed[root] = true;
-            }
+            
+
         }
 
-        // Clear changed flags — no other cleanup needed.
-        // The union-find is the source of truth for class membership.
-        // nodes/parent_index remain valid (stale class_ids resolved via find()).
-        self.changed.iter_mut().for_each(|c| *c = false);
+
+
+        // Ensure parent_index and changed flags cover all class ids
+        // self.parent_index.resize_with(self.uf.len(), Vec::new);
+        // self.changed.resize(self.uf.len(), false);
+
+        // loop {
+        //     // 1. GATHER FRONTIER [push from changed classes via parent_index]
+        //     //    O(frontier) — only visit parents of changed classes.
+        //     let mut frontier_indices: Vec<usize> = Vec::new();
+        //     for (class_id, &is_changed) in self.changed.iter().enumerate() {
+        //         if is_changed {
+        //             frontier_indices.extend_from_slice(&self.parent_index[class_id]);
+        //         }
+        //     }
+        //     frontier_indices.sort_unstable();
+        //     frontier_indices.dedup();
+
+        //     if frontier_indices.is_empty() {
+        //         break;
+        //     }
+
+        //     // 2. CANONICALIZE [par_iter + map]
+        //     //    Parallel map: compute (canonical_signature, class_root).
+        //     //    Safe because find() is lock-free.
+        //     let uf = &self.uf;
+        //     let nodes = &self.nodes;
+        //     let mut canonicalized: Vec<(ENode, Id)> = frontier_indices
+        //         .par_iter()
+        //         .map(|&idx| {
+        //             let (node, class_id) = &nodes[idx];
+        //             let canon = ENode {
+        //                 op: node.op.clone(),
+        //                 children: node.children.iter().map(|&c| uf.find_root(c)).collect(),
+        //             };
+        //             (canon, uf.find_root(*class_id))
+        //         })
+        //         .collect();
+
+        //     // 3. GROUP BY SIGNATURE — SEMISORT [par_sort_unstable]
+        //     canonicalized.par_sort_unstable();
+
+        //     // 4. EMIT MERGE CANDIDATES [sequential scan over sorted groups]
+        //     //    O(frontier_size) — proportional to the parallel work already done.
+        //     let mut merge_pairs: Vec<(Id, Id)> = Vec::new();
+        //     let mut i = 0;
+        //     while i < canonicalized.len() {
+        //         // Find end of this group (consecutive equal signatures)
+        //         let mut j = i + 1;
+        //         while j < canonicalized.len() && canonicalized[j].0 == canonicalized[i].0 {
+        //             j += 1;
+        //         }
+        //         // Emit merge pairs: chain the distinct classes in this group
+        //         let first_root = self.find(canonicalized[i].1);
+        //         for k in (i + 1)..j {
+        //             let other_root = self.find(canonicalized[k].1);
+        //             if other_root != first_root {
+        //                 merge_pairs.push((first_root, other_root));
+        //             }
+        //         }
+        //         i = j;
+        //     }
+
+        //     if merge_pairs.is_empty() {
+        //         break;
+        //     }
+
+        //     // 5. APPLY MERGES [par_iter + for_each]
+        //     //    Parallel union via lock-free CAS union-find.
+        //     let uf = &self.uf;
+        //     merge_pairs.par_iter().for_each(|&(a, b)| {
+        //         uf.union(a, b);
+        //     });
+
+        //     // 6. UPDATE CHANGED FLAGS + MERGE PARENT INDEX
+        //     //    Consolidate parent_index entries under the new root so
+        //     //    future rounds find all parents. Mark both sides changed.
+        //     self.changed.par_iter_mut().for_each(|c| *c = false);
+        //     for &(a, b) in &merge_pairs {
+        //         let root = self.uf.find_root(a) as usize;
+        //         if (a as usize) != root {
+        //             let entries = std::mem::take(&mut self.parent_index[a as usize]);
+        //             self.parent_index[root].extend(entries);
+        //         }
+        //         if (b as usize) != root {
+        //             let entries = std::mem::take(&mut self.parent_index[b as usize]);
+        //             self.parent_index[root].extend(entries);
+        //         }
+        //         self.changed[root] = true;
+        //     }
+        // }
+
+        // // Clear changed flags — no other cleanup needed.
+        // // The union-find is the source of truth for class membership.
+        // // nodes/parent_index remain valid (stale class_ids resolved via find()).
+        // self.changed.iter_mut().for_each(|c| *c = false);
     }
 
     /// Restore the congruence invariant after merges.
     /// Dispatches to `parallel_rebuild` in parallel mode.
     pub fn rebuild(&mut self) {
-        if self.parallel {
-            self.parallel_rebuild();
-            return;
-        }
         while !self.worklist.is_empty() {
             let todo: Vec<Id> = std::mem::take(&mut self.worklist);
             for id in todo {
