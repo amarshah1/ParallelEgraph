@@ -633,6 +633,60 @@ fn experiment_union_find() {
     table.print();
 }
 
+/// Experiment 5: semi_sort size x threads matrix.
+///
+/// For each size, sweep thread counts. Skips low thread counts for large
+/// sizes to keep runtime manageable. Reports time and per-size speedup.
+fn experiment_size_x_threads() {
+    println!();
+    println!("=== semi_sort: size x threads (uniform) ===");
+
+    let max_t = available_threads();
+    let sizes: Vec<(usize, usize, usize)> = vec![
+        // (n_pairs, uf_size, min_threads)
+        (1_000_000, 100_000, 1),
+        (5_000_000, 500_000, 1),
+        (10_000_000, 1_000_000, 2),
+        (50_000_000, 5_000_000, 4),
+        (100_000_000, 10_000_000, 8),
+    ];
+
+    let mut table = Table::new(&[
+        "pairs", "uf_size", "threads", "semi_ms", "Mpair/s", "speedup_vs_min", "ms/Mpair",
+    ]);
+
+    for &(n_pairs, uf_size, min_t) in &sizes {
+        let pairs = generate_union_pairs(n_pairs, uf_size, &Distribution::Uniform, 42);
+        let thread_list: Vec<usize> = thread_counts(max_t)
+            .into_iter()
+            .filter(|&t| t >= min_t)
+            .collect();
+        let mut baseline = Duration::MAX;
+
+        for &threads in &thread_list {
+            let dur = bench_cr_union_find(&pairs, uf_size, threads);
+            if threads == *thread_list.first().unwrap() {
+                baseline = dur;
+            }
+
+            let tp = n_pairs as f64 / dur.as_secs_f64() / 1e6;
+            let speedup = baseline.as_secs_f64() / dur.as_secs_f64();
+            let ms_per_mpair = dur.as_secs_f64() * 1000.0 / (n_pairs as f64 / 1e6);
+
+            table.add_row(&[
+                format!("{}", n_pairs),
+                format!("{}", uf_size),
+                format!("{}", threads),
+                format!("{:.2}", dur.as_secs_f64() * 1000.0),
+                format!("{:.1}", tp),
+                format!("{:.2}x", speedup),
+                format!("{:.3}", ms_per_mpair),
+            ]);
+        }
+    }
+    table.print();
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -652,11 +706,13 @@ fn main() {
         Some("size-scaling") | Some("size_scaling") => experiment_size_scaling(),
         Some("distribution") => experiment_distribution(),
         Some("union-find") | Some("union_find") => experiment_union_find(),
+        Some("size-x-threads") | Some("size_x_threads") => experiment_size_x_threads(),
         _ => {
             experiment_thread_scaling();
             experiment_size_scaling();
             experiment_distribution();
             experiment_union_find();
+            experiment_size_x_threads();
         }
     }
     println!();
