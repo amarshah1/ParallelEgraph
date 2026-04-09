@@ -588,45 +588,47 @@ fn experiment_union_find() {
     println!("=== Union-Find: semi_sort vs par_sort vs sequential ===");
 
     let max_t = available_threads();
-    let configs: Vec<(&str, usize, usize, Distribution)> = vec![
+    let threads = max_t;
+    let sizes: Vec<(&str, usize, usize, Distribution)> = vec![
         ("uniform_1M", 1_000_000, 100_000, Distribution::Uniform),
         ("uniform_5M", 5_000_000, 500_000, Distribution::Uniform),
+        ("uniform_10M", 10_000_000, 1_000_000, Distribution::Uniform),
+        ("uniform_50M", 50_000_000, 5_000_000, Distribution::Uniform),
         ("uniform_100M", 100_000_000, 10_000_000, Distribution::Uniform),
         ("zipf_1M", 1_000_000, 100_000, Distribution::Zipfian(0.99)),
         ("zipf_5M", 5_000_000, 500_000, Distribution::Zipfian(0.99)),
+        ("zipf_10M", 10_000_000, 1_000_000, Distribution::Zipfian(0.99)),
+        ("zipf_50M", 50_000_000, 5_000_000, Distribution::Zipfian(0.99)),
         ("zipf_100M", 100_000_000, 10_000_000, Distribution::Zipfian(0.99)),
     ];
 
     let mut table = Table::new(&[
-        "config", "dist", "threads",
-        "semi_ms", "psort_ms", "seq_ms",
-        "semi_vs_seq", "psort_vs_seq", "semi_vs_psort",
+        "config", "pairs", "uf_size", "dist", "threads",
+        "semi_ms", "psort_ms", "semi_Mpair/s", "psort_Mpair/s", "semi_vs_psort",
     ]);
 
-    for (name, n_pairs, uf_size, dist) in &configs {
+    for (name, n_pairs, uf_size, dist) in &sizes {
         let pairs = generate_union_pairs(*n_pairs, *uf_size, dist, 42);
-        let seq_dur = bench_seq_union(&pairs, *uf_size);
 
-        for &threads in &thread_counts(max_t) {
-            let semi_dur = bench_cr_union_find(&pairs, *uf_size, threads);
-            let psort_dur = bench_cr_par_sort_union_find(&pairs, *uf_size, threads);
+        let semi_dur = bench_cr_union_find(&pairs, *uf_size, threads);
+        let psort_dur = bench_cr_par_sort_union_find(&pairs, *uf_size, threads);
 
-            let semi_vs_seq = seq_dur.as_secs_f64() / semi_dur.as_secs_f64();
-            let psort_vs_seq = seq_dur.as_secs_f64() / psort_dur.as_secs_f64();
-            let semi_vs_psort = psort_dur.as_secs_f64() / semi_dur.as_secs_f64();
+        let semi_tp = *n_pairs as f64 / semi_dur.as_secs_f64() / 1e6;
+        let psort_tp = *n_pairs as f64 / psort_dur.as_secs_f64() / 1e6;
+        let semi_vs_psort = psort_dur.as_secs_f64() / semi_dur.as_secs_f64();
 
-            table.add_row(&[
-                name.to_string(),
-                format!("{}", dist),
-                format!("{}", threads),
-                format!("{:.2}", semi_dur.as_secs_f64() * 1000.0),
-                format!("{:.2}", psort_dur.as_secs_f64() * 1000.0),
-                format!("{:.2}", seq_dur.as_secs_f64() * 1000.0),
-                format!("{:.2}x", semi_vs_seq),
-                format!("{:.2}x", psort_vs_seq),
-                format!("{:.2}x", semi_vs_psort),
-            ]);
-        }
+        table.add_row(&[
+            name.to_string(),
+            format!("{}", n_pairs),
+            format!("{}", uf_size),
+            format!("{}", dist),
+            format!("{}", threads),
+            format!("{:.2}", semi_dur.as_secs_f64() * 1000.0),
+            format!("{:.2}", psort_dur.as_secs_f64() * 1000.0),
+            format!("{:.1}", semi_tp),
+            format!("{:.1}", psort_tp),
+            format!("{:.2}x", semi_vs_psort),
+        ]);
     }
     table.print();
 }
