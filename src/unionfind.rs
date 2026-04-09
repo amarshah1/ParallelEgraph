@@ -36,21 +36,22 @@ impl ConcurrentUnionFind {
     pub fn with_size(size: usize) -> Self {
         ConcurrentUnionFind { data: (0..size).map(|_| AtomicU32::new(make_rank(0))).collect() }
     }
-    // pub fn new() -> Self {
-    //     ConcurrentUnionFind { data: Vec::new() }
-    // }
+
+    pub fn new() -> Self {
+        ConcurrentUnionFind { data: Vec::new() }
+    }
 
     pub fn len(&self) -> usize {
         self.data.len()
     }
 
-    // /// Create a new singleton set with rank 0. Returns its id.
-    // /// Must be called single-threaded (during the "add" phase).
-    // pub fn make_set(&mut self) -> u32 {
-    //     let id = self.data.len() as u32;
-    //     self.data.push(AtomicU32::new(make_rank(0)));
-    //     id
-    // }
+    /// Create a new singleton set with rank 0. Returns its id.
+    /// Must be called single-threaded (during the "add" phase).
+    pub fn make_set(&mut self) -> u32 {
+        let id = self.data.len() as u32;
+        self.data.push(AtomicU32::new(make_rank(0)));
+        id
+    }
 
     /// Find the root of `u` and its rank, with path compression via CAS.
     ///

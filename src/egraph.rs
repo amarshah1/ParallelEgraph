@@ -1,5 +1,4 @@
 use dashmap::DashSet;
-use std::collections::HashSet;
 use std::{collections::HashMap, sync::atomic::Ordering};
 use std::sync::atomic::AtomicBool;
 
@@ -100,11 +99,20 @@ pub struct EGraph {
 }
 
 impl EGraph {
-    /// Create a new e-graph in sequential mode.
-    pub fn new(size: usize) -> Self {
+    /// Create a new e-graph in sequential mode (growable via `add`).
+    pub fn new() -> Self {
+        Self::new_with_size(0, false)
+    }
+
+    /// Create a new e-graph in sequential mode with a pre-allocated union-find.
+    pub fn new_sized(size: usize) -> Self {
+        Self::new_with_size(size, false)
+    }
+
+    fn new_with_size(size: usize, parallel: bool) -> Self {
         EGraph {
             size,
-            uf: ConcurrentUnionFind::with_size(size),
+            uf: if size > 0 { ConcurrentUnionFind::with_size(size) } else { ConcurrentUnionFind::new() },
             nodes: Vec::new(),
             parent_index: Vec::new(),
             changed: Vec::new(),
@@ -113,26 +121,18 @@ impl EGraph {
             worklist: Vec::new(),
             predecessors_modified: DashSet::new(),
             hashcons: HashMap::new(),
-            parallel: false,
+            parallel,
         }
     }
 
-    /// Create a new e-graph in parallel mode.
-    /// Batch merges via `parallel_merge_all` will use rayon for parallelism.
-    pub fn new_parallel(size: usize) -> Self {
-        EGraph {
-            size,
-            uf: ConcurrentUnionFind::with_size(size),
-            nodes: Vec::new(),
-            parent_index: Vec::new(),
-            changed: Vec::new(),
-            classes: HashMap::new(),
-            parents: HashMap::new(),
-            worklist: Vec::new(),
-            predecessors_modified: DashSet::new(),
-            hashcons: HashMap::new(),
-            parallel: true,
-        }
+    /// Create a new e-graph in parallel mode (growable via `add`).
+    pub fn new_parallel() -> Self {
+        Self::new_with_size(0, true)
+    }
+
+    /// Create a new e-graph in parallel mode with a pre-allocated union-find.
+    pub fn new_parallel_sized(size: usize) -> Self {
+        Self::new_with_size(size, true)
     }
 
     pub fn is_parallel(&self) -> bool {
@@ -242,7 +242,6 @@ impl EGraph {
     }
 
     fn parallel_merge(&self, a: Id, b: Id) {
-        use rayon::prelude::*;
         self.uf.union(a, b);
         self.changed[a as usize].store(true, Ordering::Release);
         self.changed[b as usize].store(true, Ordering::Release);

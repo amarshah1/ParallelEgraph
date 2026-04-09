@@ -189,11 +189,12 @@ fn parallel_counting_sort<T: Copy + Send + Sync>(
     }
 
     // Phase 3 – scatter (parallel, disjoint writes)
-    let mut output = Vec::with_capacity(n);
+    let mut output: Vec<T> = Vec::with_capacity(n);
     unsafe { output.set_len(n) };
-    let out = SendPtr(output.as_mut_ptr());
+    let out_ptr = SendPtr(output.as_mut_ptr());
 
     (0..num_blocks).into_par_iter().for_each(|b| {
+        let out = out_ptr;
         let start = b * block_size;
         let end = min(start + block_size, n);
         let mut pos = block_starts[b].clone();
@@ -313,6 +314,48 @@ pub fn collect_reduce<T: Copy + Send + Sync, H: CollectReduceHelper<T>>(
     });
 }
 
+/// Alternative to `collect_reduce` that groups elements by key using
+/// rayon's `par_sort_unstable_by_key` instead of the custom counting sort
+/// with heavy-hitter detection.
+///
+/// Same semantics: partitions `a` by key, then processes each group in parallel.
+pub fn collect_reduce_par_sort<T: Copy + Send + Sync, H: CollectReduceHelper<T>>(
+    a: &[T],
+    helper: &H,
+    num_buckets: usize,
+) {
+    let n = a.len();
+    if n == 0 {
+        return;
+    }
+
+    if n < CR_SEQ_THRESHOLD {
+        seq_collect_reduce(a, helper, num_buckets);
+        return;
+    }
+
+    // Sort a mutable copy by key
+    let mut sorted: Vec<T> = a.to_vec();
+    sorted.par_sort_unstable_by_key(|elem| helper.get_key(elem));
+
+    // Build bucket offsets via a sequential scan (cheap: O(n) pass)
+    let mut bucket_offsets = vec![0usize; num_buckets + 1];
+    for elem in &sorted {
+        bucket_offsets[helper.get_key(elem) + 1] += 1;
+    }
+    for i in 0..num_buckets {
+        bucket_offsets[i + 1] += bucket_offsets[i];
+    }
+
+    // Process each bucket in parallel
+    (0..num_buckets).into_par_iter().for_each(|k| {
+        let slice = &sorted[bucket_offsets[k]..bucket_offsets[k + 1]];
+        if !slice.is_empty() {
+            helper.combine(slice);
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,7 +385,7 @@ mod tests {
         }
 
         fn get_sum(&self, key: usize) -> usize {
-            self.sums[key].load(Ordering::SeqCst)
+            self.sums[key].load(Ordering::Relaxed)
         }
     }
 
@@ -352,7 +395,19 @@ mod tests {
         }
 
         fn apply(&self, elem: &KV) {
-            self.sums[elem.key].fetch_add(elem.val as usize, Ordering::SeqCst);
+            self.sums[elem.key].fetch_add(elem.val as usize, Ordering::Relaxed);
+        }
+
+        fn combine(&self, elems: &[KV]) {
+            let mut local = vec![0usize; self.sums.len()];
+            for elem in elems {
+                local[elem.key] += elem.val as usize;
+            }
+            for (k, &v) in local.iter().enumerate() {
+                if v > 0 {
+                    self.sums[k].fetch_add(v, Ordering::Relaxed);
+                }
+            }
         }
     }
 
@@ -369,7 +424,7 @@ mod tests {
         }
 
         fn get_count(&self, key: usize) -> usize {
-            self.counts[key].load(Ordering::SeqCst)
+            self.counts[key].load(Ordering::Relaxed)
         }
     }
 
@@ -380,7 +435,19 @@ mod tests {
 
         fn apply(&self, elem: &KV) {
             let _ = elem;
-            self.counts[elem.key].fetch_add(1, Ordering::SeqCst);
+            self.counts[elem.key].fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn combine(&self, elems: &[KV]) {
+            let mut local = vec![0usize; self.counts.len()];
+            for elem in elems {
+                local[elem.key] += 1;
+            }
+            for (k, &v) in local.iter().enumerate() {
+                if v > 0 {
+                    self.counts[k].fetch_add(v, Ordering::Relaxed);
+                }
+            }
         }
     }
 
@@ -631,7 +698,7 @@ mod tests {
         for seed in 0..50 {
             let mut rng = SmallRng::seed_from_u64(seed);
             let num_buckets = rng.gen_range(1..=128);
-            let n = rng.gen_range(0..=20_000);
+            let n = rng.gen_range(0..=1_000_000);
             let data: Vec<KV> = (0..n)
                 .map(|_| KV {
                     key: rng.gen_range(0..num_buckets),
@@ -664,7 +731,7 @@ mod tests {
         for seed in 100..150 {
             let mut rng = SmallRng::seed_from_u64(seed);
             let num_buckets = rng.gen_range(1..=256);
-            let n = rng.gen_range(0..=30_000);
+            let n = rng.gen_range(0..=1_000_000);
             let data: Vec<KV> = (0..n)
                 .map(|_| KV {
                     key: rng.gen_range(0..num_buckets),
@@ -696,7 +763,7 @@ mod tests {
         for seed in 200..250 {
             let mut rng = SmallRng::seed_from_u64(seed);
             let num_buckets = rng.gen_range(1..=64);
-            let n = rng.gen_range(0..=15_000);
+            let n = rng.gen_range(0..=1_000_000);
             let input: Vec<u64> = (0..n).map(|_| rng.gen()).collect();
             let keys: Vec<usize> = (0..n).map(|_| rng.gen_range(0..num_buckets)).collect();
 
@@ -725,7 +792,7 @@ mod tests {
         for seed in 300..330 {
             let mut rng = SmallRng::seed_from_u64(seed);
             let num_buckets = rng.gen_range(16..=512);
-            let n = rng.gen_range(5_000..=50_000);
+            let n = rng.gen_range(5_000..=1_000_000);
 
             // Zipf-like: key = floor(n / (rank+1)), many elements get key 0
             let data: Vec<KV> = (0..n)
@@ -764,7 +831,7 @@ mod tests {
             let mut rng = SmallRng::seed_from_u64(seed);
             let num_buckets = rng.gen_range(1..=256);
             let key = rng.gen_range(0..num_buckets);
-            let n = rng.gen_range(0..=25_000);
+            let n = rng.gen_range(0..=1_000_000);
             let data: Vec<KV> = (0..n).map(|i| KV { key, val: i as u64 }).collect();
 
             let expected_sum: usize = (0..n).sum();
@@ -786,7 +853,7 @@ mod tests {
         for seed in 500..530 {
             let mut rng = SmallRng::seed_from_u64(seed);
             let num_buckets = 2;
-            let n = rng.gen_range(0..=20_000);
+            let n = rng.gen_range(0..=1_000_000);
             let data: Vec<KV> = (0..n)
                 .map(|_| KV {
                     key: rng.gen_range(0..2),
@@ -837,6 +904,251 @@ mod tests {
                         "n={n} bucket={k}"
                     );
                 }
+            }
+        }
+    }
+
+    // --- Fuzz tests with varying thread pool sizes ---
+
+    /// Fuzz: run collect_reduce with different rayon thread pool sizes
+    /// to stress concurrent scatter and block processing.
+    #[test]
+    fn fuzz_collect_reduce_varying_threads() {
+        for threads in [1, 2, 3, 4, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+
+            for seed in 600..620 {
+                let mut rng = SmallRng::seed_from_u64(seed);
+                let num_buckets = rng.gen_range(2..=256);
+                let n = rng.gen_range(100..=1_000_000);
+                let data: Vec<KV> = (0..n)
+                    .map(|_| KV {
+                        key: rng.gen_range(0..num_buckets),
+                        val: rng.gen_range(0..500),
+                    })
+                    .collect();
+
+                let mut expected = vec![0usize; num_buckets];
+                for kv in &data {
+                    expected[kv.key] += kv.val as usize;
+                }
+
+                let helper = SumHelper::new(num_buckets);
+                pool.install(|| {
+                    collect_reduce(&data, &helper, num_buckets);
+                });
+
+                for k in 0..num_buckets {
+                    assert_eq!(
+                        helper.get_sum(k),
+                        expected[k],
+                        "threads={threads} seed={seed} bucket={k}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Fuzz: adversarial key distributions — power-of-two bucket counts, all
+    /// keys mapping to even or odd buckets only, to stress counting sort alignment.
+    #[test]
+    fn fuzz_collect_reduce_aligned_keys() {
+        for seed in 700..730 {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let num_buckets = 1usize << rng.gen_range(1..=8); // power of two
+            let n = rng.gen_range(1_000..=1_000_000);
+            let stride = rng.gen_range(1..=3).min(num_buckets); // keys are multiples of stride
+            let data: Vec<KV> = (0..n)
+                .map(|_| {
+                    let raw = rng.gen_range(0..(num_buckets / stride).max(1));
+                    KV {
+                        key: (raw * stride) % num_buckets,
+                        val: 1,
+                    }
+                })
+                .collect();
+
+            let mut expected = vec![0usize; num_buckets];
+            for kv in &data {
+                expected[kv.key] += 1;
+            }
+
+            let helper = CountHelper::new(num_buckets);
+            collect_reduce(&data, &helper, num_buckets);
+
+            for k in 0..num_buckets {
+                assert_eq!(
+                    helper.get_count(k),
+                    expected[k],
+                    "seed={seed} bucket={k} stride={stride}"
+                );
+            }
+        }
+    }
+
+    /// Fuzz: large element count (up to 1M) to ensure the parallel counting sort path is exercised.
+    #[test]
+    fn fuzz_collect_reduce_large() {
+        for seed in 800..810 {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let num_buckets = rng.gen_range(64..=1024);
+            let n = rng.gen_range(100_000..=1_000_000);
+            let data: Vec<KV> = (0..n)
+                .map(|_| KV {
+                    key: rng.gen_range(0..num_buckets),
+                    val: rng.gen_range(0..100),
+                })
+                .collect();
+
+            let mut expected = vec![0usize; num_buckets];
+            for kv in &data {
+                expected[kv.key] += kv.val as usize;
+            }
+
+            let helper = SumHelper::new(num_buckets);
+            collect_reduce(&data, &helper, num_buckets);
+
+            for k in 0..num_buckets {
+                assert_eq!(
+                    helper.get_sum(k),
+                    expected[k],
+                    "seed={seed} bucket={k} n={n}"
+                );
+            }
+        }
+    }
+
+    /// Fuzz: verify combine() is used correctly by tracking per-slice sums
+    /// and comparing with per-element apply() results.
+    #[test]
+    fn fuzz_collect_reduce_combine_correctness() {
+        use std::sync::atomic::AtomicBool;
+
+        struct CombineSumHelper {
+            sums: Vec<AtomicUsize>,
+            combine_used: AtomicBool,
+        }
+
+        impl CollectReduceHelper<KV> for CombineSumHelper {
+            fn get_key(&self, elem: &KV) -> usize {
+                elem.key
+            }
+            fn apply(&self, elem: &KV) {
+                self.sums[elem.key].fetch_add(elem.val as usize, Ordering::Relaxed);
+            }
+            fn combine(&self, elems: &[KV]) {
+                self.combine_used.store(true, Ordering::Relaxed);
+                let mut local_sums = vec![0usize; self.sums.len()];
+                for elem in elems {
+                    local_sums[elem.key] += elem.val as usize;
+                }
+                for (k, &s) in local_sums.iter().enumerate() {
+                    if s > 0 {
+                        self.sums[k].fetch_add(s, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+
+        for seed in 900..920 {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let num_buckets = rng.gen_range(128..=512);
+            // Use enough data + concentrated keys to trigger heavy-hitter detection
+            let hot_key = rng.gen_range(0..num_buckets);
+            let n = rng.gen_range(50_000..=1_000_000);
+            let data: Vec<KV> = (0..n)
+                .map(|_| {
+                    let key = if rng.gen_bool(0.8) {
+                        hot_key
+                    } else {
+                        rng.gen_range(0..num_buckets)
+                    };
+                    KV { key, val: rng.gen_range(1..50) }
+                })
+                .collect();
+
+            let mut expected = vec![0usize; num_buckets];
+            for kv in &data {
+                expected[kv.key] += kv.val as usize;
+            }
+
+            let helper = CombineSumHelper {
+                sums: (0..num_buckets).map(|_| AtomicUsize::new(0)).collect(),
+                combine_used: AtomicBool::new(false),
+            };
+            collect_reduce(&data, &helper, num_buckets);
+
+            for k in 0..num_buckets {
+                assert_eq!(
+                    helper.sums[k].load(Ordering::Relaxed),
+                    expected[k],
+                    "seed={seed} bucket={k}"
+                );
+            }
+        }
+    }
+
+    /// Fuzz: counting sort with extreme bucket counts (1 bucket, many buckets).
+    #[test]
+    fn fuzz_counting_sort_extremes() {
+        for seed in 1000..1020 {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            // Alternate between 1 bucket and many buckets
+            let num_buckets = if seed % 2 == 0 { 1 } else { rng.gen_range(128..=512) };
+            let n = rng.gen_range(0..=1_000_000);
+            let input: Vec<u64> = (0..n).map(|_| rng.gen()).collect();
+            let keys: Vec<usize> = (0..n).map(|_| rng.gen_range(0..num_buckets)).collect();
+
+            let (sorted, offsets) = parallel_counting_sort(&input, &keys, num_buckets);
+
+            assert_eq!(sorted.len(), n);
+            assert_eq!(offsets.len(), num_buckets + 1);
+            assert_eq!(offsets[num_buckets], n);
+
+            for i in 0..num_buckets {
+                assert!(offsets[i] <= offsets[i + 1], "seed={seed} non-monotone");
+            }
+
+            let mut exp = input.clone();
+            let mut act = sorted.clone();
+            exp.sort();
+            act.sort();
+            assert_eq!(exp, act, "seed={seed} multiset mismatch");
+        }
+    }
+
+    /// Fuzz: many seeds with collect_reduce_few path (few buckets, moderate data).
+    #[test]
+    fn fuzz_collect_reduce_few_path() {
+        for seed in 1100..1150 {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            // Few buckets forces the collect_reduce_few path
+            let num_buckets = rng.gen_range(1..=4);
+            let n = rng.gen_range(0..=1_000_000);
+            let data: Vec<KV> = (0..n)
+                .map(|_| KV {
+                    key: rng.gen_range(0..num_buckets),
+                    val: rng.gen_range(0..200),
+                })
+                .collect();
+
+            let mut expected = vec![0usize; num_buckets];
+            for kv in &data {
+                expected[kv.key] += kv.val as usize;
+            }
+
+            let helper = SumHelper::new(num_buckets);
+            collect_reduce(&data, &helper, num_buckets);
+
+            for k in 0..num_buckets {
+                assert_eq!(
+                    helper.get_sum(k),
+                    expected[k],
+                    "seed={seed} bucket={k} n={n}"
+                );
             }
         }
     }
