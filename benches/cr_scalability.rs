@@ -642,20 +642,36 @@ fn experiment_size_x_threads() {
     println!("=== semi_sort: size x threads (uniform) ===");
 
     let max_t = available_threads();
-    let sizes: Vec<(usize, usize, usize)> = vec![
-        // (n_pairs, uf_size, min_threads)
-        (1_000_000, 100_000, 1),
-        (5_000_000, 500_000, 1),
-        (10_000_000, 1_000_000, 2),
-        (50_000_000, 5_000_000, 4),
-        (100_000_000, 10_000_000, 8),
+
+    // Pairs of (n_pairs, uf_size). min_threads is computed dynamically so
+    // that the slowest single-config runtime stays roughly constant across
+    // sizes: we allow 1 thread for the smallest size and scale min_threads
+    // linearly with n_pairs so that n_pairs/min_threads ≈ constant.
+    let sizes: Vec<(usize, usize)> = vec![
+        (1_000_000, 100_000),
+        (5_000_000, 500_000),
+        (10_000_000, 1_000_000),
+        (50_000_000, 5_000_000),
+        (100_000_000, 10_000_000),
     ];
+    let base_pairs = sizes[0].0;
+    // On a 12-core machine this gives min_threads = [1,1,1,1,8].
+    // On a 144-core machine: [1,1,1,4,8] — still conservative.
+    let compute_min_threads = |n_pairs: usize| -> usize {
+        // How many threads needed so work-per-thread ≈ base_pairs
+        let ratio = n_pairs / base_pairs; // 1, 5, 10, 50, 100
+        // We want the slowest thread count to do at most base_pairs work,
+        // accounting for TRIALS runs + warmup.
+        let raw = ratio / (max_t / 4).max(1);
+        raw.max(1)
+    };
 
     let mut table = Table::new(&[
         "pairs", "uf_size", "threads", "semi_ms", "Mpair/s", "speedup_vs_min", "ms/Mpair",
     ]);
 
-    for &(n_pairs, uf_size, min_t) in &sizes {
+    for &(n_pairs, uf_size) in &sizes {
+        let min_t = compute_min_threads(n_pairs);
         let pairs = generate_union_pairs(n_pairs, uf_size, &Distribution::Uniform, 42);
         let thread_list: Vec<usize> = thread_counts(max_t)
             .into_iter()
