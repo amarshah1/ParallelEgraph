@@ -591,8 +591,10 @@ fn experiment_union_find() {
     let configs: Vec<(&str, usize, usize, Distribution)> = vec![
         ("uniform_1M", 1_000_000, 100_000, Distribution::Uniform),
         ("uniform_5M", 5_000_000, 500_000, Distribution::Uniform),
+        ("uniform_100M", 100_000_000, 10_000_000, Distribution::Uniform),
         ("zipf_1M", 1_000_000, 100_000, Distribution::Zipfian(0.99)),
         ("zipf_5M", 5_000_000, 500_000, Distribution::Zipfian(0.99)),
+        ("zipf_100M", 100_000_000, 10_000_000, Distribution::Zipfian(0.99)),
     ];
 
     let mut table = Table::new(&[
