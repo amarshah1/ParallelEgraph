@@ -91,21 +91,6 @@ fn bench_nelson(w: Workload) -> Vec<f64> {
     times
 }
 
-fn bench_dst(w: Workload) -> Vec<f64> {
-    for _ in 0..WARMUP {
-        let (mut eg, eqs) = build(w);
-        eg.sequential_close_dst(&eqs);
-    }
-    let mut times = Vec::with_capacity(TRIALS);
-    for _ in 0..TRIALS {
-        let (mut eg, eqs) = build(w);
-        let t = Instant::now();
-        eg.sequential_close_dst(&eqs);
-        times.push(t.elapsed().as_secs_f64() * 1000.0);
-    }
-    times
-}
-
 fn bench_parallel<F>(pool: &ThreadPool, w: Workload, close: F) -> Vec<f64>
 where
     F: Fn(&mut EGraph, &[(u32, u32)]) + Sync,
@@ -136,38 +121,32 @@ fn main() {
         TRIALS, WARMUP, max_threads
     );
     println!(
-        "{:<8} {:>8} {:>10} {:>9} | {:>11} | {:>11} {:>11} | {:>11} {:>11}",
+        "{:<8} {:>8} {:>10} {:>9} | {:>11} | {:>11} {:>11}",
         "name",
         "leaves",
         "nodes",
         "merges",
         "nelson_seq",
-        "dst_seq",
-        "dst_spd",
         "par_close",
         "par_spd",
     );
 
     for &w in WORKLOADS {
         let nel = bench_nelson(w);
-        let dst = bench_dst(w);
         let par = bench_parallel(&pool_par, w, |eg, u| eg.parallel_close(u));
 
         let mn = median(&nel);
-        let md = median(&dst);
         let mp = median(&par);
         println!(
-            "{:<8} {:>8} {:>10} {:>9} | {:>9.2}ms | {:>9.2}ms {:>9.2}x | {:>9.2}ms {:>9.2}x",
+            "{:<8} {:>8} {:>10} {:>9} | {:>9.2}ms | {:>9.2}ms {:>9.2}x",
             w.name,
             w.n_leaves,
             w.n_nodes,
             w.n_merges,
             mn,
-            md,
-            mn / md,
             mp,
             mn / mp,
         );
-        let _ = (min_f(&nel), min_f(&dst), min_f(&par));
+        let _ = (min_f(&nel), min_f(&par));
     }
 }
