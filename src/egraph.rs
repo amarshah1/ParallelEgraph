@@ -1,8 +1,133 @@
 use dashmap::DashSet;
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::{collections::HashMap, sync::atomic::Ordering};
 use std::sync::atomic::AtomicBool;
 
-use crate::unionfind::ConcurrentUnionFind;
+use crate::unionfind::{ConcurrentUnionFind, SequentialUnionFind};
+
+#[inline]
+fn sig_hash(node: &ENode, uf: &ConcurrentUnionFind) -> u64 {
+    let mut h = DefaultHasher::new();
+    node.op.hash(&mut h);
+    for &c in &node.children {
+        uf.find_root(c).hash(&mut h);
+    }
+    h.finish()
+}
+
+#[inline]
+fn sig_hash_seq(node: &ENode, uf: &mut SequentialUnionFind) -> u64 {
+    let mut h = DefaultHasher::new();
+    node.op.hash(&mut h);
+    for &c in &node.children {
+        uf.find_root(c).hash(&mut h);
+    }
+    h.finish()
+}
+
+#[inline]
+fn sig_hash2_seq(node: &ENode, uf: &mut SequentialUnionFind) -> (u64, u64) {
+    let mut h1 = DefaultHasher::new();
+    let mut h2 = DefaultHasher::new();
+    h2.write_u64(0x9E3779B97F4A7C15);
+    node.op.hash(&mut h1);
+    node.op.hash(&mut h2);
+    for &c in &node.children {
+        let r = uf.find_root(c);
+        r.hash(&mut h1);
+        r.hash(&mut h2);
+    }
+    (h1.finish(), h2.finish())
+}
+
+#[inline]
+fn sig_hash2(node: &ENode, uf: &ConcurrentUnionFind) -> (u64, u64) {
+    let mut h1 = DefaultHasher::new();
+    let mut h2 = DefaultHasher::new();
+    h2.write_u64(0x9E3779B97F4A7C15);
+    node.op.hash(&mut h1);
+    node.op.hash(&mut h2);
+    for &c in &node.children {
+        let r = uf.find_root(c);
+        r.hash(&mut h1);
+        r.hash(&mut h2);
+    }
+    (h1.finish(), h2.finish())
+}
+
+#[inline]
+fn sig_cmp(
+    ia: u32,
+    ib: u32,
+    uf: &ConcurrentUnionFind,
+    nodes: &[(ENode, Id)],
+) -> CmpOrdering {
+    let (na, _) = &nodes[ia as usize];
+    let (nb, _) = &nodes[ib as usize];
+    match na.op.cmp(&nb.op) {
+        CmpOrdering::Equal => {}
+        o => return o,
+    }
+    match na.children.len().cmp(&nb.children.len()) {
+        CmpOrdering::Equal => {}
+        o => return o,
+    }
+    for (&ca, &cb) in na.children.iter().zip(&nb.children) {
+        let ra = uf.find_root(ca);
+        let rb = uf.find_root(cb);
+        match ra.cmp(&rb) {
+            CmpOrdering::Equal => continue,
+            o => return o,
+        }
+    }
+    CmpOrdering::Equal
+}
+
+#[inline]
+fn sigs_equal(
+    ia: u32,
+    ib: u32,
+    uf: &ConcurrentUnionFind,
+    nodes: &[(ENode, Id)],
+) -> bool {
+    let (na, _) = &nodes[ia as usize];
+    let (nb, _) = &nodes[ib as usize];
+    if na.op != nb.op {
+        return false;
+    }
+    if na.children.len() != nb.children.len() {
+        return false;
+    }
+    na.children
+        .iter()
+        .zip(&nb.children)
+        .all(|(&ca, &cb)| uf.find_root(ca) == uf.find_root(cb))
+}
+
+#[inline]
+fn sigs_equal_seq(
+    ia: u32,
+    ib: u32,
+    uf: &mut SequentialUnionFind,
+    nodes: &[(ENode, Id)],
+) -> bool {
+    let (na, _) = &nodes[ia as usize];
+    let (nb, _) = &nodes[ib as usize];
+    if na.op != nb.op {
+        return false;
+    }
+    if na.children.len() != nb.children.len() {
+        return false;
+    }
+    for (&ca, &cb) in na.children.iter().zip(&nb.children) {
+        if uf.find_root(ca) != uf.find_root(cb) {
+            return false;
+        }
+    }
+    true
+}
 
 pub type Id = u32;
 
@@ -236,6 +361,12 @@ impl EGraph {
             return;
         }
 
+        let n_classes = self.uf.len();
+        self.grow_changed_to(n_classes);
+        if self.parent_index.len() < n_classes {
+            self.parent_index.resize_with(n_classes, Vec::new);
+        }
+
         pairs.par_iter().for_each(|&(a, b)| {
             self.parallel_merge(a, b);
         });
@@ -245,12 +376,325 @@ impl EGraph {
         self.uf.union(a, b);
         self.changed[a as usize].store(true, Ordering::Release);
         self.changed[b as usize].store(true, Ordering::Release);
-        // self.parent_index[a as usize].par_iter().for_each(|&idx| {
-        //     self.predecessors_modified.insert(idx);
-        // });
-        // self.parent_index[a as usize].par_iter().for_each(|&idx| {
-        //     self.predecessors_modified.insert(idx);
-        // });
+    }
+
+    fn grow_changed_to(&mut self, n_classes: usize) {
+        use rayon::prelude::*;
+        let need = n_classes.saturating_sub(self.changed.len());
+        if need > 0 {
+            self.changed.par_extend(
+                (0..need).into_par_iter().map(|_| AtomicBool::new(false)),
+            );
+        }
+    }
+
+    /// Sequential Nelson-style congruence closure with a signature table.
+    ///
+    /// Each round pops a changed class `c` from the worklist, drains
+    /// `parent_index[c]`, and for each parent `p` computes `sig_hash(p)` with
+    /// current roots. A `HashMap<u64, Vec<node_idx>>` table is kept across
+    /// rounds: lookups walk the bucket with `sigs_equal` to filter hash
+    /// collisions; on match, merge the two classes and push both endpoints;
+    /// otherwise append `p` to the bucket.
+    ///
+    /// Runs against a local `SequentialUnionFind` (no atomic CAS) to isolate
+    /// algorithmic cost from concurrency overhead. The final partition is
+    /// replayed into `self.uf` so `EGraph::find()` reflects the closure.
+    pub fn sequential_close_nelson(&mut self, initial_unions: &[(Id, Id)]) {
+        let n_classes = self.uf.len();
+        if self.parent_index.len() < n_classes {
+            self.parent_index.resize_with(n_classes, Vec::new);
+        }
+
+        let mut uf = SequentialUnionFind::with_size(n_classes);
+        for c in 0..n_classes as Id {
+            let r = self.uf.find_root(c);
+            if r != c {
+                uf.union(c, r);
+            }
+        }
+
+        let mut work: Vec<Id> = Vec::with_capacity(initial_unions.len() * 2);
+        for &(a, b) in initial_unions {
+            let ra = uf.find_root(a);
+            let rb = uf.find_root(b);
+            if ra != rb {
+                uf.union(ra, rb);
+                work.push(ra);
+                work.push(rb);
+            }
+        }
+
+        let mut sig_table: HashMap<u64, Vec<u32>> = HashMap::new();
+
+        while let Some(c) = work.pop() {
+            if (c as usize) >= self.parent_index.len() {
+                continue;
+            }
+            let frontier: Vec<u32> = std::mem::take(&mut self.parent_index[c as usize]);
+            if frontier.is_empty() {
+                continue;
+            }
+            for ni in frontier {
+                let (node, my_class_raw) = &self.nodes[ni as usize];
+                let h = sig_hash_seq(node, &mut uf);
+                let my_class = uf.find_root(*my_class_raw);
+
+                let bucket = sig_table.entry(h).or_default();
+                let mut match_ni: Option<u32> = None;
+                for &o in bucket.iter() {
+                    if sigs_equal_seq(ni, o, &mut uf, &self.nodes) {
+                        match_ni = Some(o);
+                        break;
+                    }
+                }
+
+                match match_ni {
+                    Some(o) => {
+                        let other_class_raw = self.nodes[o as usize].1;
+                        let other_class = uf.find_root(other_class_raw);
+                        if my_class != other_class {
+                            uf.union(my_class, other_class);
+                            work.push(my_class);
+                            work.push(other_class);
+                        }
+                    }
+                    None => {
+                        bucket.push(ni);
+                    }
+                }
+            }
+        }
+
+        for c in 0..n_classes as Id {
+            let r = uf.find_root(c);
+            if r != c {
+                self.uf.union(c, r);
+            }
+        }
+    }
+
+    /// Downey-Sethi-Tarjan 1980 sequential congruence closure.
+    ///
+    /// From "Variations on the Common Subexpression Problem" (JACM, 1980).
+    /// Maintains a signature table `sig -> node_idx` that is kept
+    /// *consistent with current roots* by explicitly removing stale entries
+    /// before each union and re-inserting the affected predecessors with
+    /// their updated signatures. Each re-insertion either matches an
+    /// existing canonical node (→ schedule a merge) or takes its place.
+    ///
+    /// Per-representative predecessor lists are concatenated on union, as in
+    /// Nelson-Oppen, but merge candidates are discovered via the sig table
+    /// instead of a Pu × Pv cross-scan, giving near-linear amortized cost.
+    ///
+    /// Signatures are 128-bit hashes `(h1, h2)` of `(op, find_roots(children))`,
+    /// keyed in the `HashMap` directly. Collisions at 128 bits are
+    /// astronomically unlikely on realistic workloads; a collision would
+    /// cause an unsound merge, not a miss.
+    pub fn sequential_close_dst(&mut self, initial_unions: &[(Id, Id)]) {
+        let n_classes = self.uf.len();
+        if self.parent_index.len() < n_classes {
+            self.parent_index.resize_with(n_classes, Vec::new);
+        }
+
+        let mut uf = SequentialUnionFind::with_size(n_classes);
+        for c in 0..n_classes as Id {
+            let r = self.uf.find_root(c);
+            if r != c {
+                uf.union(c, r);
+            }
+        }
+
+        // Seed preds-per-root.
+        let mut preds: HashMap<Id, Vec<u32>> = HashMap::new();
+        for c in 0..n_classes as Id {
+            let slot = &self.parent_index[c as usize];
+            if slot.is_empty() {
+                continue;
+            }
+            let root = uf.find_root(c);
+            preds.entry(root).or_default().extend_from_slice(slot);
+        }
+
+        // sig -> canonical node idx. sig = sig_hash2_seq(node, uf).
+        let mut sig_table: HashMap<(u64, u64), u32> =
+            HashMap::with_capacity(self.nodes.len());
+        let mut pending: Vec<(Id, Id)> = initial_unions.to_vec();
+
+        // Populate sig_table; schedule merges for any pre-existing duplicates.
+        for ni in 0..self.nodes.len() as u32 {
+            let sig = sig_hash2_seq(&self.nodes[ni as usize].0, &mut uf);
+            match sig_table.get(&sig).copied() {
+                Some(q) => {
+                    let cp = uf.find_root(self.nodes[ni as usize].1);
+                    let cq = uf.find_root(self.nodes[q as usize].1);
+                    if cp != cq {
+                        pending.push((cp, cq));
+                    }
+                }
+                None => {
+                    sig_table.insert(sig, ni);
+                }
+            }
+        }
+
+        while let Some((u, v)) = pending.pop() {
+            let ru = uf.find_root(u);
+            let rv = uf.find_root(v);
+            if ru == rv {
+                continue;
+            }
+
+            let pu = preds.remove(&ru).unwrap_or_default();
+            let pv = preds.remove(&rv).unwrap_or_default();
+
+            // Weighted union: only the LOSER's find_root changes, so only
+            // its preds need their sigs re-keyed. Winner preds keep the
+            // same sigs and stay in sig_table untouched.
+            let loser_root = uf.predict_loser(ru, rv);
+            let (loser_preds, winner_preds) = if loser_root == ru {
+                (pu, pv)
+            } else {
+                (pv, pu)
+            };
+
+            // Evict old sigs for loser preds (pre-union).
+            for &p in &loser_preds {
+                let old_sig = sig_hash2_seq(&self.nodes[p as usize].0, &mut uf);
+                if sig_table.get(&old_sig).copied() == Some(p) {
+                    sig_table.remove(&old_sig);
+                }
+            }
+
+            uf.union(ru, rv);
+            let new_root = uf.find_root(ru);
+
+            // Re-insert loser preds with new sigs.
+            for &p in &loser_preds {
+                let new_sig = sig_hash2_seq(&self.nodes[p as usize].0, &mut uf);
+                match sig_table.get(&new_sig).copied() {
+                    Some(q) if q != p => {
+                        let cp = uf.find_root(self.nodes[p as usize].1);
+                        let cq = uf.find_root(self.nodes[q as usize].1);
+                        if cp != cq {
+                            pending.push((cp, cq));
+                        }
+                    }
+                    _ => {
+                        sig_table.insert(new_sig, p);
+                    }
+                }
+            }
+
+            let mut merged = winner_preds;
+            merged.extend(loser_preds);
+            preds.insert(new_root, merged);
+        }
+
+        for c in 0..n_classes as Id {
+            let r = uf.find_root(c);
+            if r != c {
+                self.uf.union(c, r);
+            }
+        }
+    }
+
+    /// Batch-parallel congruence closure.
+    ///
+    /// Applies `initial_unions`, then iterates rounds to fixpoint. Each
+    /// round runs 3 parallel phases: (1) canonicalize + compute 128-bit
+    /// snapshot signature over the frontier, (2) global `par_sort_unstable`
+    /// on `(h1, h2, idx)`, (3) `par_windows(2)` scan that applies unions on
+    /// adjacent matching signatures and accumulates next-round endpoints.
+    ///
+    /// No AtomicBool change-flag scan: next-round endpoints are collected
+    /// directly from the scan via `filter_map().flat_map_iter(...)`. The
+    /// frontier is gathered by draining `parent_index[c]` for each endpoint
+    /// in `work` via `mem::take` (serial, O(|work|) small Vec moves).
+    ///
+    /// Signatures use two independent 64-bit hashes (h1/h2) computed once per
+    /// round. Per §4.1-4.3 of the algorithm spec, any merge missed due to
+    /// stale `find_root` reads during concurrent union application is
+    /// recovered in a later round.
+    pub fn parallel_close(&mut self, initial_unions: &[(Id, Id)]) {
+        use rayon::prelude::*;
+        use rayon::slice::ParallelSlice;
+
+        if self.parent_index.len() < self.uf.len() {
+            self.parent_index.resize_with(self.uf.len(), Vec::new);
+        }
+
+        {
+            let uf = &self.uf;
+            initial_unions.par_iter().for_each(|&(a, b)| {
+                uf.union(a, b);
+            });
+        }
+        let mut work: Vec<u32> = initial_unions
+            .iter()
+            .flat_map(|&(a, b)| [a, b])
+            .collect();
+
+        while !work.is_empty() {
+            let parent_index = &self.parent_index;
+            let pi_len = parent_index.len();
+            let frontier: Vec<u32> = work
+                .par_iter()
+                .filter(|&&c| (c as usize) < pi_len)
+                .flat_map_iter(|&c| parent_index[c as usize].iter().copied())
+                .collect();
+            if frontier.is_empty() {
+                break;
+            }
+
+            let uf = &self.uf;
+            let nodes = &self.nodes;
+
+            let mut canon: Vec<(u64, u64, u32)> = frontier
+                .par_iter()
+                .map(|&idx| {
+                    let (node, _) = &nodes[idx as usize];
+                    let (h1, h2) = sig_hash2(node, uf);
+                    (h1, h2, idx)
+                })
+                .collect();
+
+            canon.par_sort_unstable();
+
+            let mut next_work: Vec<u32> = canon
+                .par_windows(2)
+                .filter_map(|w| {
+                    let (h1a, h2a, ia) = w[0];
+                    let (h1b, h2b, ib) = w[1];
+                    if h1a != h1b || h2a != h2b {
+                        return None;
+                    }
+                    // Exact equality check (§4.5): guard against hash collisions.
+                    if !sigs_equal(ia, ib, uf, nodes) {
+                        return None;
+                    }
+                    let ca = nodes[ia as usize].1;
+                    let cb = nodes[ib as usize].1;
+                    let ra = uf.find_root(ca);
+                    let rb = uf.find_root(cb);
+                    if ra != rb {
+                        uf.union(ra, rb);
+                        Some((ra, rb))
+                    } else {
+                        None
+                    }
+                })
+                .flat_map_iter(|(a, b)| [a, b].into_iter())
+                .collect();
+            next_work.par_sort_unstable();
+            next_work.dedup();
+            work = next_work;
+        }
+    }
+
+    /// Default parallel rebuild: semisort-based grouping.
+    pub fn parallel_rebuild(&mut self) {
+        self.parallel_rebuild_semisort();
     }
 
     /// Batch-parallel congruence closure using the round-based algorithm.
@@ -262,131 +706,210 @@ impl EGraph {
     /// Each round: (1) frontier from parent_index, (2) parallel canonicalization,
     /// (3) parallel semisort by signature, (4) merge candidate extraction,
     /// (5) parallel merge application, (6) changed-flag + parent_index update.
-    pub fn parallel_rebuild(&mut self) {
+    pub fn parallel_rebuild_semisort(&mut self) {
         use rayon::prelude::*;
 
-        
-        loop {
-            // self.predecessors_modified.iter().for_each(|idx| {
-            //     self.changed[idx as usize].store(true, Ordering::Release);
-            // });
-            let predecessors = 
-                self.changed.par_iter().enumerate().filter_map(|(idx, b)| {
-                    if b.load(Ordering::Acquire) {
-                        self.changed[idx].store(false, Ordering::Release);
-                        Some(idx)
-                    } else {
-                        None
-                    }
-                }).collect::<Vec<_>>();
-
-
-
-            
-
+        let n_classes = self.uf.len();
+        self.grow_changed_to(n_classes);
+        if self.parent_index.len() < n_classes {
+            self.parent_index.resize_with(n_classes, Vec::new);
         }
 
+        loop {
+            let changed_ref = &self.changed;
+            let changed_classes: Vec<usize> = changed_ref
+                .par_iter()
+                .enumerate()
+                .filter_map(|(idx, flag)| {
+                    if flag.swap(false, Ordering::AcqRel) { Some(idx) } else { None }
+                })
+                .collect();
 
+            if changed_classes.is_empty() {
+                break;
+            }
 
-        // Ensure parent_index and changed flags cover all class ids
-        // self.parent_index.resize_with(self.uf.len(), Vec::new);
-        // self.changed.resize(self.uf.len(), false);
+            let parent_index = &self.parent_index;
+            let frontier: Vec<u32> = changed_classes
+                .par_iter()
+                .flat_map(|&c| parent_index[c].par_iter().copied())
+                .collect();
 
-        // loop {
-        //     // 1. GATHER FRONTIER [push from changed classes via parent_index]
-        //     //    O(frontier) — only visit parents of changed classes.
-        //     let mut frontier_indices: Vec<usize> = Vec::new();
-        //     for (class_id, &is_changed) in self.changed.iter().enumerate() {
-        //         if is_changed {
-        //             frontier_indices.extend_from_slice(&self.parent_index[class_id]);
-        //         }
-        //     }
-        //     frontier_indices.sort_unstable();
-        //     frontier_indices.dedup();
+            if frontier.is_empty() {
+                break;
+            }
 
-        //     if frontier_indices.is_empty() {
-        //         break;
-        //     }
+            let uf = &self.uf;
+            let nodes = &self.nodes;
+            let canon: Vec<(u64, u32, Id)> = frontier
+                .par_iter()
+                .map(|&idx| {
+                    let (node, class_id) = &nodes[idx as usize];
+                    (sig_hash(node, uf), idx, uf.find_root(*class_id))
+                })
+                .collect();
 
-        //     // 2. CANONICALIZE [par_iter + map]
-        //     //    Parallel map: compute (canonical_signature, class_root).
-        //     //    Safe because find() is lock-free.
-        //     let uf = &self.uf;
-        //     let nodes = &self.nodes;
-        //     let mut canonicalized: Vec<(ENode, Id)> = frontier_indices
-        //         .par_iter()
-        //         .map(|&idx| {
-        //             let (node, class_id) = &nodes[idx];
-        //             let canon = ENode {
-        //                 op: node.op.clone(),
-        //                 children: node.children.iter().map(|&c| uf.find_root(c)).collect(),
-        //             };
-        //             (canon, uf.find_root(*class_id))
-        //         })
-        //         .collect();
+            let n = canon.len();
+            let num_threads = rayon::current_num_threads();
+            let num_buckets = ((n / 64).max(num_threads * 4))
+                .next_power_of_two()
+                .max(1);
+            let mask = (num_buckets - 1) as u64;
+            let keys: Vec<usize> = canon
+                .par_iter()
+                .map(|&(h, _, _)| (h & mask) as usize)
+                .collect();
 
-        //     // 3. GROUP BY SIGNATURE — SEMISORT [par_sort_unstable]
-        //     canonicalized.par_sort_unstable();
+            let mut bucketed: Vec<(u64, u32, Id)> = Vec::new();
+            let mut bucket_offsets: Vec<usize> = Vec::new();
+            crate::collect_reduce::parallel_semisort(
+                &canon,
+                &keys,
+                num_buckets,
+                &mut bucketed,
+                &mut bucket_offsets,
+            );
 
-        //     // 4. EMIT MERGE CANDIDATES [sequential scan over sorted groups]
-        //     //    O(frontier_size) — proportional to the parallel work already done.
-        //     let mut merge_pairs: Vec<(Id, Id)> = Vec::new();
-        //     let mut i = 0;
-        //     while i < canonicalized.len() {
-        //         // Find end of this group (consecutive equal signatures)
-        //         let mut j = i + 1;
-        //         while j < canonicalized.len() && canonicalized[j].0 == canonicalized[i].0 {
-        //             j += 1;
-        //         }
-        //         // Emit merge pairs: chain the distinct classes in this group
-        //         let first_root = self.find(canonicalized[i].1);
-        //         for k in (i + 1)..j {
-        //             let other_root = self.find(canonicalized[k].1);
-        //             if other_root != first_root {
-        //                 merge_pairs.push((first_root, other_root));
-        //             }
-        //         }
-        //         i = j;
-        //     }
+            let bucketed_ref = &bucketed;
+            let offsets_ref = &bucket_offsets;
+            let merge_pairs: Vec<(Id, Id)> = (0..num_buckets)
+                .into_par_iter()
+                .flat_map_iter(|b| {
+                    let lo = offsets_ref[b];
+                    let hi = offsets_ref[b + 1];
+                    let mut local: Vec<(u64, u32, Id)> = bucketed_ref[lo..hi].to_vec();
+                    local.sort_unstable_by(|&(ha, ia, _), &(hb, ib, _)| {
+                        match ha.cmp(&hb) {
+                            CmpOrdering::Equal => sig_cmp(ia, ib, uf, nodes),
+                            other => other,
+                        }
+                    });
+                    let mut merges: Vec<(Id, Id)> = Vec::new();
+                    for i in 1..local.len() {
+                        let (h0, i0, a) = local[i - 1];
+                        let (h1, i1, b) = local[i];
+                        if h0 != h1 {
+                            continue;
+                        }
+                        if !sigs_equal(i0, i1, uf, nodes) {
+                            continue;
+                        }
+                        if a != b {
+                            merges.push((a, b));
+                        }
+                    }
+                    merges.into_iter()
+                })
+                .collect();
 
-        //     if merge_pairs.is_empty() {
-        //         break;
-        //     }
+            if merge_pairs.is_empty() {
+                break;
+            }
 
-        //     // 5. APPLY MERGES [par_iter + for_each]
-        //     //    Parallel union via lock-free CAS union-find.
-        //     let uf = &self.uf;
-        //     merge_pairs.par_iter().for_each(|&(a, b)| {
-        //         uf.union(a, b);
-        //     });
+            merge_pairs.par_iter().for_each(|&(a, b)| {
+                uf.union(a, b);
+            });
 
-        //     // 6. UPDATE CHANGED FLAGS + MERGE PARENT INDEX
-        //     //    Consolidate parent_index entries under the new root so
-        //     //    future rounds find all parents. Mark both sides changed.
-        //     self.changed.par_iter_mut().for_each(|c| *c = false);
-        //     for &(a, b) in &merge_pairs {
-        //         let root = self.uf.find_root(a) as usize;
-        //         if (a as usize) != root {
-        //             let entries = std::mem::take(&mut self.parent_index[a as usize]);
-        //             self.parent_index[root].extend(entries);
-        //         }
-        //         if (b as usize) != root {
-        //             let entries = std::mem::take(&mut self.parent_index[b as usize]);
-        //             self.parent_index[root].extend(entries);
-        //         }
-        //         self.changed[root] = true;
-        //     }
-        // }
+            let changed = &self.changed;
+            merge_pairs.par_iter().for_each(|&(a, b)| {
+                changed[a as usize].store(true, Ordering::Release);
+                changed[b as usize].store(true, Ordering::Release);
+            });
+        }
+    }
 
-        // // Clear changed flags — no other cleanup needed.
-        // // The union-find is the source of truth for class membership.
-        // // nodes/parent_index remain valid (stale class_ids resolved via find()).
-        // self.changed.iter_mut().for_each(|c| *c = false);
+    /// Alternative parallel rebuild using a single global parallel sort
+    /// on hash-keyed signatures. Same correctness as the semisort variant,
+    /// but no bucket-partitioned grouping step.
+    pub fn parallel_rebuild_sort(&mut self) {
+        use rayon::prelude::*;
+
+        let n_classes = self.uf.len();
+        self.grow_changed_to(n_classes);
+        if self.parent_index.len() < n_classes {
+            self.parent_index.resize_with(n_classes, Vec::new);
+        }
+
+        loop {
+            let changed_ref = &self.changed;
+            let changed_classes: Vec<usize> = changed_ref
+                .par_iter()
+                .enumerate()
+                .filter_map(|(idx, flag)| {
+                    if flag.swap(false, Ordering::AcqRel) { Some(idx) } else { None }
+                })
+                .collect();
+
+            if changed_classes.is_empty() {
+                break;
+            }
+
+            let parent_index = &self.parent_index;
+            let frontier: Vec<u32> = changed_classes
+                .par_iter()
+                .flat_map(|&c| parent_index[c].par_iter().copied())
+                .collect();
+
+            if frontier.is_empty() {
+                break;
+            }
+
+            let uf = &self.uf;
+            let nodes = &self.nodes;
+            let mut canon: Vec<(u64, u32, Id)> = frontier
+                .par_iter()
+                .map(|&idx| {
+                    let (node, class_id) = &nodes[idx as usize];
+                    (sig_hash(node, uf), idx, uf.find_root(*class_id))
+                })
+                .collect();
+
+            canon.par_sort_unstable_by(|&(ha, ia, _), &(hb, ib, _)| {
+                match ha.cmp(&hb) {
+                    CmpOrdering::Equal => sig_cmp(ia, ib, uf, nodes),
+                    other => other,
+                }
+            });
+
+            let n = canon.len();
+            let merge_pairs: Vec<(Id, Id)> = (1..n)
+                .into_par_iter()
+                .filter_map(|i| {
+                    let (h0, i0, a) = canon[i - 1];
+                    let (h1, i1, b) = canon[i];
+                    if h0 != h1 {
+                        return None;
+                    }
+                    if !sigs_equal(i0, i1, uf, nodes) {
+                        return None;
+                    }
+                    if a != b { Some((a, b)) } else { None }
+                })
+                .collect();
+
+            if merge_pairs.is_empty() {
+                break;
+            }
+
+            merge_pairs.par_iter().for_each(|&(a, b)| {
+                uf.union(a, b);
+            });
+
+            let changed = &self.changed;
+            merge_pairs.par_iter().for_each(|&(a, b)| {
+                changed[a as usize].store(true, Ordering::Release);
+                changed[b as usize].store(true, Ordering::Release);
+            });
+        }
     }
 
     /// Restore the congruence invariant after merges.
     /// Dispatches to `parallel_rebuild` in parallel mode.
     pub fn rebuild(&mut self) {
+        if self.parallel {
+            self.parallel_rebuild();
+            return;
+        }
         while !self.worklist.is_empty() {
             let todo: Vec<Id> = std::mem::take(&mut self.worklist);
             for id in todo {

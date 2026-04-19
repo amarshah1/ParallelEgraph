@@ -19,7 +19,11 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use parallel_egraph::collect_reduce::{collect_reduce, collect_reduce_par_sort, CollectReduceHelper};
+use parallel_egraph::collect_reduce::{
+    collect_reduce, collect_reduce_par_sort, collect_reduce_par_sort_with_scratch,
+    collect_reduce_radix, collect_reduce_radix_with_scratch, collect_reduce_with_scratch,
+    CollectReduceHelper, CrScratch,
+};
 use parallel_egraph::unionfind::ConcurrentUnionFind;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -30,6 +34,22 @@ use rand::{Rng, SeedableRng};
 
 const TRIALS: usize = 5;
 const WARMUP_TRIALS: usize = 1;
+
+/// Size-adaptive trial count. Small inputs run more trials so fixed-cost
+/// overheads (rayon spawn, first-touch page faults, allocator warm-up)
+/// fall into the noise under best-of-K.
+fn trials_for(n: usize) -> usize {
+    match n {
+        n if n <= 1_000_000 => 50,
+        n if n <= 5_000_000 => 20,
+        n if n <= 20_000_000 => 10,
+        _ => TRIALS,
+    }
+}
+
+fn warmups_for(n: usize) -> usize {
+    if n <= 5_000_000 { 5 } else { WARMUP_TRIALS }
+}
 
 // ---------------------------------------------------------------------------
 // Test element and helpers
@@ -79,6 +99,72 @@ impl CollectReduceHelper<KV> for SumHelper {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// No-contention helper: each element writes to a distinct output slot.
+// `elem.val` is populated as a unique index in [0, n), so apply/combine
+// perform only disjoint raw writes — no atomics, no shared cache lines.
+// Isolates sort+iterate throughput from any concurrent-data-structure cost.
+// ---------------------------------------------------------------------------
+
+#[derive(Copy, Clone)]
+struct SendPtr(*mut u64);
+unsafe impl Send for SendPtr {}
+unsafe impl Sync for SendPtr {}
+
+struct PerSlotHelper {
+    out: SendPtr,
+    len: usize,
+}
+
+impl PerSlotHelper {
+    fn new(n: usize) -> (Self, Vec<u64>) {
+        let mut buf: Vec<u64> = vec![0; n];
+        let ptr = SendPtr(buf.as_mut_ptr());
+        (PerSlotHelper { out: ptr, len: n }, buf)
+    }
+}
+
+impl CollectReduceHelper<KV> for PerSlotHelper {
+    fn get_key(&self, elem: &KV) -> usize {
+        elem.key
+    }
+
+    fn apply(&self, elem: &KV) {
+        let idx = elem.val as usize;
+        debug_assert!(idx < self.len);
+        unsafe { std::ptr::write(self.out.0.add(idx), elem.val) };
+    }
+
+    fn combine(&self, elems: &[KV]) {
+        for e in elems {
+            self.apply(e);
+        }
+    }
+}
+
+/// Generate data where `val` is a unique index in [0, n) so PerSlotHelper
+/// writes never collide. Keys still drawn from the requested distribution.
+fn generate_data_unique_val(
+    n: usize,
+    num_buckets: usize,
+    dist: &Distribution,
+    seed: u64,
+) -> Vec<KV> {
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let keys: Vec<usize> = match dist {
+        Distribution::Uniform => (0..n).map(|_| rng.gen_range(0..num_buckets)).collect(),
+        Distribution::Zipfian(z) => {
+            let zipf = Zipfian::new(num_buckets as u32, *z);
+            (0..n).map(|_| zipf.next(&mut rng) as usize).collect()
+        }
+        Distribution::SingleKey(k) => vec![*k; n],
+    };
+    keys.into_iter()
+        .enumerate()
+        .map(|(i, key)| KV { key, val: i as u64 })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -520,6 +606,38 @@ fn bench_cr_union_find(
     best
 }
 
+/// Benchmark: collect_reduce_radix driving union-find operations.
+fn bench_cr_radix_union_find(
+    pairs: &[UnionPair],
+    uf_size: usize,
+    threads: usize,
+) -> Duration {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .unwrap();
+
+    // Warmup
+    for _ in 0..WARMUP_TRIALS {
+        let uf = ConcurrentUnionFind::with_size(uf_size);
+        let helper = UnionHelper { uf: &uf };
+        pool.install(|| collect_reduce_radix(pairs, &helper, uf_size));
+    }
+
+    let mut best = Duration::MAX;
+    for _ in 0..TRIALS {
+        let uf = ConcurrentUnionFind::with_size(uf_size);
+        let helper = UnionHelper { uf: &uf };
+        let start = Instant::now();
+        pool.install(|| collect_reduce_radix(pairs, &helper, uf_size));
+        let elapsed = start.elapsed();
+        if elapsed < best {
+            best = elapsed;
+        }
+    }
+    best
+}
+
 /// Benchmark: collect_reduce_par_sort driving union-find operations.
 fn bench_cr_par_sort_union_find(
     pairs: &[UnionPair],
@@ -544,6 +662,113 @@ fn bench_cr_par_sort_union_find(
         let helper = UnionHelper { uf: &uf };
         let start = Instant::now();
         pool.install(|| collect_reduce_par_sort(pairs, &helper, uf_size));
+        let elapsed = start.elapsed();
+        if elapsed < best {
+            best = elapsed;
+        }
+    }
+    best
+}
+
+/// Scratch-hoisted variant: semi_sort with pre-allocated CrScratch.
+/// Adaptive trial count so small inputs get more samples.
+fn bench_cr_union_find_hot(
+    pairs: &[UnionPair],
+    uf_size: usize,
+    threads: usize,
+) -> Duration {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .unwrap();
+    let n = pairs.len();
+    let warmups = warmups_for(n);
+    let trials = trials_for(n);
+
+    let mut scratch: CrScratch<UnionPair> = CrScratch::new();
+
+    for _ in 0..warmups {
+        let uf = ConcurrentUnionFind::with_size(uf_size);
+        let helper = UnionHelper { uf: &uf };
+        pool.install(|| collect_reduce_with_scratch(pairs, &helper, uf_size, &mut scratch));
+    }
+
+    let mut best = Duration::MAX;
+    for _ in 0..trials {
+        let uf = ConcurrentUnionFind::with_size(uf_size);
+        let helper = UnionHelper { uf: &uf };
+        let start = Instant::now();
+        pool.install(|| collect_reduce_with_scratch(pairs, &helper, uf_size, &mut scratch));
+        let elapsed = start.elapsed();
+        if elapsed < best {
+            best = elapsed;
+        }
+    }
+    best
+}
+
+fn bench_cr_radix_union_find_hot(
+    pairs: &[UnionPair],
+    uf_size: usize,
+    threads: usize,
+) -> Duration {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .unwrap();
+    let n = pairs.len();
+    let warmups = warmups_for(n);
+    let trials = trials_for(n);
+
+    let mut scratch: CrScratch<UnionPair> = CrScratch::new();
+
+    for _ in 0..warmups {
+        let uf = ConcurrentUnionFind::with_size(uf_size);
+        let helper = UnionHelper { uf: &uf };
+        pool.install(|| collect_reduce_radix_with_scratch(pairs, &helper, uf_size, &mut scratch));
+    }
+
+    let mut best = Duration::MAX;
+    for _ in 0..trials {
+        let uf = ConcurrentUnionFind::with_size(uf_size);
+        let helper = UnionHelper { uf: &uf };
+        let start = Instant::now();
+        pool.install(|| collect_reduce_radix_with_scratch(pairs, &helper, uf_size, &mut scratch));
+        let elapsed = start.elapsed();
+        if elapsed < best {
+            best = elapsed;
+        }
+    }
+    best
+}
+
+fn bench_cr_par_sort_union_find_hot(
+    pairs: &[UnionPair],
+    uf_size: usize,
+    threads: usize,
+) -> Duration {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .unwrap();
+    let n = pairs.len();
+    let warmups = warmups_for(n);
+    let trials = trials_for(n);
+
+    let mut scratch: CrScratch<UnionPair> = CrScratch::new();
+
+    for _ in 0..warmups {
+        let uf = ConcurrentUnionFind::with_size(uf_size);
+        let helper = UnionHelper { uf: &uf };
+        pool.install(|| collect_reduce_par_sort_with_scratch(pairs, &helper, uf_size, &mut scratch));
+    }
+
+    let mut best = Duration::MAX;
+    for _ in 0..trials {
+        let uf = ConcurrentUnionFind::with_size(uf_size);
+        let helper = UnionHelper { uf: &uf };
+        let start = Instant::now();
+        pool.install(|| collect_reduce_par_sort_with_scratch(pairs, &helper, uf_size, &mut scratch));
         let elapsed = start.elapsed();
         if elapsed < best {
             best = elapsed;
@@ -604,18 +829,22 @@ fn experiment_union_find() {
 
     let mut table = Table::new(&[
         "config", "pairs", "uf_size", "dist", "threads",
-        "semi_ms", "psort_ms", "semi_Mpair/s", "psort_Mpair/s", "semi_vs_psort",
+        "semi_ms", "radix_ms", "psort_ms",
+        "semi_Mp/s", "radix_Mp/s", "psort_Mp/s",
+        "radix_vs_semi",
     ]);
 
     for (name, n_pairs, uf_size, dist) in &sizes {
         let pairs = generate_union_pairs(*n_pairs, *uf_size, dist, 42);
 
         let semi_dur = bench_cr_union_find(&pairs, *uf_size, threads);
+        let radix_dur = bench_cr_radix_union_find(&pairs, *uf_size, threads);
         let psort_dur = bench_cr_par_sort_union_find(&pairs, *uf_size, threads);
 
         let semi_tp = *n_pairs as f64 / semi_dur.as_secs_f64() / 1e6;
+        let radix_tp = *n_pairs as f64 / radix_dur.as_secs_f64() / 1e6;
         let psort_tp = *n_pairs as f64 / psort_dur.as_secs_f64() / 1e6;
-        let semi_vs_psort = psort_dur.as_secs_f64() / semi_dur.as_secs_f64();
+        let radix_vs_semi = semi_dur.as_secs_f64() / radix_dur.as_secs_f64();
 
         table.add_row(&[
             name.to_string(),
@@ -624,10 +853,12 @@ fn experiment_union_find() {
             format!("{}", dist),
             format!("{}", threads),
             format!("{:.2}", semi_dur.as_secs_f64() * 1000.0),
+            format!("{:.2}", radix_dur.as_secs_f64() * 1000.0),
             format!("{:.2}", psort_dur.as_secs_f64() * 1000.0),
             format!("{:.1}", semi_tp),
+            format!("{:.1}", radix_tp),
             format!("{:.1}", psort_tp),
-            format!("{:.2}x", semi_vs_psort),
+            format!("{:.2}x", radix_vs_semi),
         ]);
     }
     table.print();
@@ -639,7 +870,7 @@ fn experiment_union_find() {
 /// sizes to keep runtime manageable. Reports time and per-size speedup.
 fn experiment_size_x_threads() {
     println!();
-    println!("=== semi_sort: size x threads (uniform) ===");
+    println!("=== semi_sort vs radix: size x threads (uniform, scratch reused, adaptive trials) ===");
 
     let max_t = available_threads();
 
@@ -651,23 +882,21 @@ fn experiment_size_x_threads() {
         (1_000_000, 100_000),
         (5_000_000, 500_000),
         (10_000_000, 1_000_000),
-        (50_000_000, 5_000_000),
-        (100_000_000, 10_000_000),
     ];
-    let base_pairs = sizes[0].0;
-    // On a 12-core machine this gives min_threads = [1,1,1,1,8].
-    // On a 144-core machine: [1,1,1,4,8] — still conservative.
+    // Budget-based: estimate single-threaded wall time and only require more
+    // threads when it would exceed 15 seconds. Assumes ~75 M pairs/sec at 1T.
+    let runs = (TRIALS + WARMUP_TRIALS) as f64;
     let compute_min_threads = |n_pairs: usize| -> usize {
-        // How many threads needed so work-per-thread ≈ base_pairs
-        let ratio = n_pairs / base_pairs; // 1, 5, 10, 50, 100
-        // We want the slowest thread count to do at most base_pairs work,
-        // accounting for TRIALS runs + warmup.
-        let raw = ratio / (max_t / 4).max(1);
-        raw.max(1)
+        let secs_at_1t = (n_pairs as f64 / 75e6) * runs;
+        (secs_at_1t / 15.0).ceil().max(1.0) as usize
     };
 
     let mut table = Table::new(&[
-        "pairs", "uf_size", "threads", "semi_ms", "Mpair/s", "speedup_vs_min", "ms/Mpair",
+        "pairs", "uf_size", "threads",
+        "semi_ms", "radix_ms",
+        "semi_Mp/s", "radix_Mp/s",
+        "semi_spd", "radix_spd",
+        "radix_vs_semi",
     ]);
 
     for &(n_pairs, uf_size) in &sizes {
@@ -677,30 +906,142 @@ fn experiment_size_x_threads() {
             .into_iter()
             .filter(|&t| t >= min_t)
             .collect();
-        let mut baseline = Duration::MAX;
+        let mut semi_baseline = Duration::MAX;
+        let mut radix_baseline = Duration::MAX;
 
         for &threads in &thread_list {
-            let dur = bench_cr_union_find(&pairs, uf_size, threads);
+            let semi_dur = bench_cr_union_find_hot(&pairs, uf_size, threads);
+            let radix_dur = bench_cr_radix_union_find_hot(&pairs, uf_size, threads);
             if threads == *thread_list.first().unwrap() {
-                baseline = dur;
+                semi_baseline = semi_dur;
+                radix_baseline = radix_dur;
             }
 
-            let tp = n_pairs as f64 / dur.as_secs_f64() / 1e6;
-            let speedup = baseline.as_secs_f64() / dur.as_secs_f64();
-            let ms_per_mpair = dur.as_secs_f64() * 1000.0 / (n_pairs as f64 / 1e6);
+            let semi_tp = n_pairs as f64 / semi_dur.as_secs_f64() / 1e6;
+            let radix_tp = n_pairs as f64 / radix_dur.as_secs_f64() / 1e6;
+            let semi_spd = semi_baseline.as_secs_f64() / semi_dur.as_secs_f64();
+            let radix_spd = radix_baseline.as_secs_f64() / radix_dur.as_secs_f64();
+            let radix_vs_semi = semi_dur.as_secs_f64() / radix_dur.as_secs_f64();
 
             table.add_row(&[
                 format!("{}", n_pairs),
                 format!("{}", uf_size),
                 format!("{}", threads),
-                format!("{:.2}", dur.as_secs_f64() * 1000.0),
-                format!("{:.1}", tp),
-                format!("{:.2}x", speedup),
-                format!("{:.3}", ms_per_mpair),
+                format!("{:.2}", semi_dur.as_secs_f64() * 1000.0),
+                format!("{:.2}", radix_dur.as_secs_f64() * 1000.0),
+                format!("{:.1}", semi_tp),
+                format!("{:.1}", radix_tp),
+                format!("{:.2}x", semi_spd),
+                format!("{:.2}x", radix_spd),
+                format!("{:.2}x", radix_vs_semi),
             ]);
         }
     }
     table.print();
+}
+
+/// Benchmark a single (variant, thread-count, size) point with the
+/// no-contention helper. `variant` picks the collect_reduce entry point.
+fn bench_no_contention(
+    data: &[KV],
+    num_buckets: usize,
+    threads: usize,
+    variant: &str,
+) -> Duration {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .unwrap();
+
+    let n = data.len();
+    let run = |helper: &PerSlotHelper| match variant {
+        "semi" => collect_reduce(data, helper, num_buckets),
+        "radix" => collect_reduce_radix(data, helper, num_buckets),
+        "psort" => collect_reduce_par_sort(data, helper, num_buckets),
+        _ => unreachable!(),
+    };
+
+    // Warmup
+    for _ in 0..WARMUP_TRIALS {
+        let (helper, _buf) = PerSlotHelper::new(n);
+        pool.install(|| run(&helper));
+    }
+
+    let mut best = Duration::MAX;
+    for _ in 0..TRIALS {
+        let (helper, _buf) = PerSlotHelper::new(n);
+        let start = Instant::now();
+        pool.install(|| run(&helper));
+        let elapsed = start.elapsed();
+        if elapsed < best {
+            best = elapsed;
+        }
+    }
+    best
+}
+
+/// Experiment: scaling of each sort variant with thread count, measured with
+/// a no-contention helper (each element writes to a distinct output slot).
+/// Isolates the sort-primitive's own parallel scalability from UF CAS cost.
+fn experiment_no_contention_scaling() {
+    println!();
+    println!("=== No-Contention Scaling (per-slot writes, unique idx) ===");
+
+    let max_t = available_threads();
+
+    // (n, num_buckets). Keep num_buckets moderate so semi_sort takes the
+    // main path (not collect_reduce_few) and radix has work to do.
+    let sizes: Vec<(usize, usize)> = vec![
+        (1_000_000, 1_000_000),
+        (10_000_000, 1_000_000),
+        (100_000_000, 10_000_000),
+    ];
+
+    for &(n, num_buckets) in &sizes {
+        println!();
+        println!("-- n = {}, num_buckets = {}, dist = uniform --", n, num_buckets);
+        let data = generate_data_unique_val(n, num_buckets, &Distribution::Uniform, 42);
+
+        let mut table = Table::new(&[
+            "threads",
+            "semi_ms", "semi_Mp/s", "semi_speedup",
+            "radix_ms", "radix_Mp/s", "radix_speedup",
+            "psort_ms", "psort_Mp/s", "psort_speedup",
+        ]);
+
+        let mut semi_base = Duration::MAX;
+        let mut radix_base = Duration::MAX;
+        let mut psort_base = Duration::MAX;
+
+        for &threads in &thread_counts(max_t) {
+            let semi = bench_no_contention(&data, num_buckets, threads, "semi");
+            let radix = bench_no_contention(&data, num_buckets, threads, "radix");
+            let psort = bench_no_contention(&data, num_buckets, threads, "psort");
+
+            if threads == 1 {
+                semi_base = semi;
+                radix_base = radix;
+                psort_base = psort;
+            }
+
+            let mp = |d: Duration| n as f64 / d.as_secs_f64() / 1e6;
+            let sp = |base: Duration, d: Duration| base.as_secs_f64() / d.as_secs_f64();
+
+            table.add_row(&[
+                format!("{}", threads),
+                format!("{:.2}", semi.as_secs_f64() * 1000.0),
+                format!("{:.1}", mp(semi)),
+                format!("{:.2}x", sp(semi_base, semi)),
+                format!("{:.2}", radix.as_secs_f64() * 1000.0),
+                format!("{:.1}", mp(radix)),
+                format!("{:.2}x", sp(radix_base, radix)),
+                format!("{:.2}", psort.as_secs_f64() * 1000.0),
+                format!("{:.1}", mp(psort)),
+                format!("{:.2}x", sp(psort_base, psort)),
+            ]);
+        }
+        table.print();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -723,6 +1064,7 @@ fn main() {
         Some("distribution") => experiment_distribution(),
         Some("union-find") | Some("union_find") => experiment_union_find(),
         Some("size-x-threads") | Some("size_x_threads") => experiment_size_x_threads(),
+        Some("no-contention") | Some("no_contention") => experiment_no_contention_scaling(),
         _ => {
             experiment_thread_scaling();
             experiment_size_scaling();

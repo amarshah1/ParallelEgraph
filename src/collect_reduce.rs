@@ -53,8 +53,11 @@ fn log2_up(n: usize) -> usize {
 
 // ---- Raw-pointer Send wrapper for parallel scatter ----
 
-#[derive(Copy, Clone)]
 struct SendPtr<T>(*mut T);
+impl<T> Copy for SendPtr<T> {}
+impl<T> Clone for SendPtr<T> {
+    fn clone(&self) -> Self { *self }
+}
 unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
 
@@ -315,6 +318,67 @@ pub fn collect_reduce<T: Copy + Send + Sync, H: CollectReduceHelper<T>>(
 }
 
 /// Alternative to `collect_reduce` that groups elements by key using
+/// voracious's parallel radix sort on a packed `(key, idx)` u64.
+///
+/// Same semantics as `collect_reduce`: partitions `a` by key, then processes
+/// each group in parallel. Requires keys to fit in u32 and `a.len() <= u32::MAX`.
+pub fn collect_reduce_radix<T: Copy + Send + Sync, H: CollectReduceHelper<T>>(
+    a: &[T],
+    helper: &H,
+    num_buckets: usize,
+) {
+    use voracious_radix_sort::RadixSort;
+
+    let n = a.len();
+    if n == 0 {
+        return;
+    }
+
+    if n < CR_SEQ_THRESHOLD {
+        seq_collect_reduce(a, helper, num_buckets);
+        return;
+    }
+
+    debug_assert!(num_buckets <= u32::MAX as usize);
+    debug_assert!(n <= u32::MAX as usize);
+
+    // Pack (key, idx) into u64: high 32 bits = key, low 32 bits = original index.
+    // Radix-sorting by the whole u64 groups by key and, within a group, by idx.
+    let mut packed: Vec<u64> = (0..n)
+        .into_par_iter()
+        .map(|i| ((helper.get_key(&a[i]) as u64) << 32) | (i as u64))
+        .collect();
+
+    // Parallel radix sort
+    packed.voracious_mt_sort(rayon::current_num_threads());
+
+    // Build bucket offsets via a sequential scan over sorted keys (cheap: O(n) pass)
+    let mut bucket_offsets = vec![0usize; num_buckets + 1];
+    for &p in &packed {
+        let k = (p >> 32) as usize;
+        bucket_offsets[k + 1] += 1;
+    }
+    for i in 0..num_buckets {
+        bucket_offsets[i + 1] += bucket_offsets[i];
+    }
+
+    // Process each bucket in parallel — reconstruct the slice on the fly.
+    (0..num_buckets).into_par_iter().for_each(|k| {
+        let lo = bucket_offsets[k];
+        let hi = bucket_offsets[k + 1];
+        if lo == hi {
+            return;
+        }
+        // Materialize the bucket's elements in sorted-idx order.
+        let slice: Vec<T> = packed[lo..hi]
+            .iter()
+            .map(|&p| a[(p as u32) as usize])
+            .collect();
+        helper.combine(&slice);
+    });
+}
+
+/// Alternative to `collect_reduce` that groups elements by key using
 /// rayon's `par_sort_unstable_by_key` instead of the custom counting sort
 /// with heavy-hitter detection.
 ///
@@ -350,6 +414,379 @@ pub fn collect_reduce_par_sort<T: Copy + Send + Sync, H: CollectReduceHelper<T>>
     // Process each bucket in parallel
     (0..num_buckets).into_par_iter().for_each(|k| {
         let slice = &sorted[bucket_offsets[k]..bucket_offsets[k + 1]];
+        if !slice.is_empty() {
+            helper.combine(slice);
+        }
+    });
+}
+
+// ---- Scratch-buffer variants (avoid per-call heap allocations) ----
+
+/// Reusable scratch buffers for `*_with_scratch` variants. Reusing a single
+/// `CrScratch` across calls hoists the large per-call heap allocations
+/// (`keys`, `output`, `packed`, `bucket_offsets`) out of the hot path.
+pub struct CrScratch<T> {
+    pub keys: Vec<usize>,
+    pub output: Vec<T>,
+    pub packed: Vec<u64>,
+    pub bucket_offsets: Vec<usize>,
+}
+
+impl<T> CrScratch<T> {
+    pub fn new() -> Self {
+        CrScratch {
+            keys: Vec::new(),
+            output: Vec::new(),
+            packed: Vec::new(),
+            bucket_offsets: Vec::new(),
+        }
+    }
+}
+
+impl<T> Default for CrScratch<T> {
+    fn default() -> Self { Self::new() }
+}
+
+/// Parallel fill: overwrites every index in `[0, n)` with `f(i)`.
+/// Reuses `buf`'s capacity; only reallocates when n exceeds current capacity.
+fn par_fill_with<T, F>(buf: &mut Vec<T>, n: usize, f: F)
+where
+    T: Send,
+    F: Fn(usize) -> T + Sync,
+{
+    buf.clear();
+    buf.reserve(n);
+    // SAFETY: every index in [0, n) is overwritten by the parallel writes
+    // below before anyone reads.
+    unsafe { buf.set_len(n); }
+    let ptr = SendPtr(buf.as_mut_ptr());
+    (0..n).into_par_iter().for_each(|i| {
+        let p = ptr;
+        unsafe { std::ptr::write(p.0.add(i), f(i)); }
+    });
+}
+
+/// Parallel in-place inclusive prefix sum. After the call,
+/// `values[i] = sum(original values[0..=i])`.
+/// The internal combine step operates on `rayon::current_num_threads()`
+/// chunk totals — never on input-scale data.
+fn par_prefix_sum_inplace(values: &mut [usize]) {
+    let n = values.len();
+    if n <= 1 { return; }
+    let num_threads = rayon::current_num_threads().max(1);
+    let chunk_size = ((n + num_threads - 1) / num_threads).max(1);
+
+    let chunk_totals: Vec<usize> = values
+        .par_chunks_mut(chunk_size)
+        .map(|chunk| {
+            let mut acc = 0usize;
+            for v in chunk.iter_mut() {
+                acc += *v;
+                *v = acc;
+            }
+            acc
+        })
+        .collect();
+
+    if chunk_totals.len() <= 1 { return; }
+
+    // Exclusive prefix of chunk totals → carries. O(num_threads) — not a scan of input.
+    let mut carries: Vec<usize> = Vec::with_capacity(chunk_totals.len());
+    {
+        let mut c = 0usize;
+        for &t in &chunk_totals {
+            carries.push(c);
+            c += t;
+        }
+    }
+
+    values
+        .par_chunks_mut(chunk_size)
+        .zip(carries.into_par_iter())
+        .for_each(|(chunk, carry)| {
+            if carry == 0 { return; }
+            for v in chunk.iter_mut() { *v += carry; }
+        });
+}
+
+/// Build bucket offsets for already-sorted data via parallel binary search.
+/// Produces `bucket_offsets[0..=num_buckets]` where
+/// `bucket_offsets[k] = first index i with key_at(i) >= k`
+/// (equivalently, the exclusive cumulative count of keys < k).
+///
+/// No sequential O(n) scan: each offset is located by one parallel binary
+/// search of depth O(log n).
+fn par_sorted_bucket_offsets<K>(
+    n: usize,
+    num_buckets: usize,
+    key_at: K,
+    bucket_offsets: &mut Vec<usize>,
+) where
+    K: Fn(usize) -> usize + Sync,
+{
+    bucket_offsets.clear();
+    bucket_offsets.resize(num_buckets + 1, 0);
+    if n == 0 { return; }
+    bucket_offsets[num_buckets] = n;
+
+    bucket_offsets[1..num_buckets]
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(idx, off)| {
+            let k = idx + 1;
+            let mut lo = 0usize;
+            let mut hi = n;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if key_at(mid) < k { lo = mid + 1; } else { hi = mid; }
+            }
+            *off = lo;
+        });
+}
+
+/// Parallel semisort: partition `input` by `keys[i]` into `num_buckets` groups.
+///
+/// After return, `output[bucket_offsets[k]..bucket_offsets[k+1]]` contains
+/// every element `input[i]` with `keys[i] == k`. Order within a bucket is
+/// unspecified. This is a true semisort — equal keys are adjacent but there
+/// is no total order.
+pub fn parallel_semisort<T: Copy + Send + Sync>(
+    input: &[T],
+    keys: &[usize],
+    num_buckets: usize,
+    output: &mut Vec<T>,
+    bucket_offsets: &mut Vec<usize>,
+) {
+    parallel_counting_sort_into(input, keys, num_buckets, output, bucket_offsets);
+}
+
+fn parallel_counting_sort_into<T: Copy + Send + Sync>(
+    input: &[T],
+    keys: &[usize],
+    num_buckets: usize,
+    output: &mut Vec<T>,
+    bucket_offsets: &mut Vec<usize>,
+) {
+    let n = input.len();
+    let num_blocks = min(rayon::current_num_threads(), 1 + n / 2048).max(1);
+    let block_size = (n + num_blocks - 1) / num_blocks;
+
+    // Phase 1: local counts per block, parallel.
+    let local_counts: Vec<Vec<usize>> = (0..num_blocks)
+        .into_par_iter()
+        .map(|b| {
+            let start = b * block_size;
+            let end = min(start + block_size, n);
+            let mut c = vec![0usize; num_buckets];
+            for i in start..end {
+                c[keys[i]] += 1;
+            }
+            c
+        })
+        .collect();
+
+    // Phase 2a: total counts per bucket (parallel reduce across blocks).
+    let mut total_counts = vec![0usize; num_buckets];
+    total_counts
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(k, t)| {
+            let mut sum = 0usize;
+            for b in 0..num_blocks {
+                sum += local_counts[b][k];
+            }
+            *t = sum;
+        });
+
+    // Phase 2b: exclusive prefix of bucket totals → bucket_offsets[0..=num_buckets].
+    bucket_offsets.clear();
+    bucket_offsets.reserve(num_buckets + 1);
+    bucket_offsets.push(0);
+    bucket_offsets.extend(total_counts.iter().copied());
+    par_prefix_sum_inplace(bucket_offsets);
+
+    // Phase 2c: per-bucket exclusive prefix over blocks → block_starts in flat
+    // transposed layout [k * num_blocks + b], so each bucket writes a contiguous
+    // stripe independently. Parallel over buckets.
+    let mut block_starts_flat: Vec<usize> = vec![0usize; num_buckets * num_blocks];
+    block_starts_flat
+        .par_chunks_mut(num_blocks)
+        .enumerate()
+        .for_each(|(k, stripe)| {
+            let mut acc = bucket_offsets[k];
+            for b in 0..num_blocks {
+                stripe[b] = acc;
+                acc += local_counts[b][k];
+            }
+        });
+
+    // Phase 3: scatter (parallel, disjoint writes).
+    output.clear();
+    output.reserve(n);
+    // SAFETY: every index in [0, n) is written by the parallel scatter below.
+    unsafe { output.set_len(n); }
+    let out_ptr = SendPtr(output.as_mut_ptr());
+    let bs = &block_starts_flat;
+
+    (0..num_blocks).into_par_iter().for_each(|b| {
+        let out = out_ptr;
+        // Gather this block's write positions from the flat transposed layout.
+        let mut pos: Vec<usize> = (0..num_buckets)
+            .map(|k| bs[k * num_blocks + b])
+            .collect();
+        let start = b * block_size;
+        let end = min(start + block_size, n);
+        for i in start..end {
+            let k = keys[i];
+            unsafe { std::ptr::write(out.0.add(pos[k]), input[i]) };
+            pos[k] += 1;
+        }
+    });
+}
+
+/// `collect_reduce` with externally-provided scratch buffers.
+pub fn collect_reduce_with_scratch<T: Copy + Send + Sync, H: CollectReduceHelper<T>>(
+    a: &[T],
+    helper: &H,
+    num_buckets: usize,
+    scratch: &mut CrScratch<T>,
+) {
+    let n = a.len();
+    if n == 0 { return; }
+
+    let cache_per_thread: usize = 1_000_000;
+    let bits = log2_up(1 + (2 * size_of::<T>() * n) / cache_per_thread).max(4);
+    let num_blocks = 1usize << bits;
+
+    if num_buckets <= 4 * num_blocks || n < CR_SEQ_THRESHOLD {
+        collect_reduce_few(a, helper, num_buckets);
+        return;
+    }
+
+    let gb = GetBucket::new(a, helper, bits);
+
+    par_fill_with(&mut scratch.keys, n, |i| gb.bucket(helper, &a[i]));
+
+    parallel_counting_sort_into(
+        a,
+        &scratch.keys,
+        num_blocks,
+        &mut scratch.output,
+        &mut scratch.bucket_offsets,
+    );
+
+    let sorted = &scratch.output;
+    let bucket_offsets = &scratch.bucket_offsets;
+    (0..num_blocks).into_par_iter().for_each(|i| {
+        let slice = &sorted[bucket_offsets[i]..bucket_offsets[i + 1]];
+        if slice.is_empty() {
+            return;
+        }
+        if i < gb.heavy_hitters {
+            helper.combine(slice);
+        } else {
+            for elem in slice {
+                debug_assert!(helper.get_key(elem) < num_buckets);
+                helper.apply(elem);
+            }
+        }
+    });
+}
+
+/// `collect_reduce_par_sort` with externally-provided scratch buffers.
+/// Uses `scratch.output` as the sort buffer and `scratch.bucket_offsets` for
+/// group boundaries.
+pub fn collect_reduce_par_sort_with_scratch<
+    T: Copy + Send + Sync,
+    H: CollectReduceHelper<T>,
+>(
+    a: &[T],
+    helper: &H,
+    num_buckets: usize,
+    scratch: &mut CrScratch<T>,
+) {
+    let n = a.len();
+    if n == 0 { return; }
+
+    if n < CR_SEQ_THRESHOLD {
+        seq_collect_reduce(a, helper, num_buckets);
+        return;
+    }
+
+    let sorted = &mut scratch.output;
+    sorted.clear();
+    sorted.reserve(n);
+    sorted.extend_from_slice(a);
+    sorted.par_sort_unstable_by_key(|elem| helper.get_key(elem));
+
+    // Parallel binary-search per bucket — no O(n) scan over sorted.
+    par_sorted_bucket_offsets(
+        n,
+        num_buckets,
+        |i| helper.get_key(&sorted[i]),
+        &mut scratch.bucket_offsets,
+    );
+
+    let sorted_ref: &[T] = sorted;
+    let offsets_ref: &[usize] = &scratch.bucket_offsets;
+    (0..num_buckets).into_par_iter().for_each(|k| {
+        let slice = &sorted_ref[offsets_ref[k]..offsets_ref[k + 1]];
+        if !slice.is_empty() {
+            helper.combine(slice);
+        }
+    });
+}
+
+/// `collect_reduce_radix` with externally-provided scratch buffers.
+/// Uses `scratch.packed` for the (key,idx) packed u64 array and
+/// `scratch.bucket_offsets` for bucket boundaries.
+pub fn collect_reduce_radix_with_scratch<
+    T: Copy + Send + Sync,
+    H: CollectReduceHelper<T>,
+>(
+    a: &[T],
+    helper: &H,
+    num_buckets: usize,
+    scratch: &mut CrScratch<T>,
+) {
+    use voracious_radix_sort::RadixSort;
+
+    let n = a.len();
+    if n == 0 { return; }
+
+    if n < CR_SEQ_THRESHOLD {
+        seq_collect_reduce(a, helper, num_buckets);
+        return;
+    }
+
+    debug_assert!(num_buckets <= u32::MAX as usize);
+    debug_assert!(n <= u32::MAX as usize);
+
+    par_fill_with(&mut scratch.packed, n, |i| {
+        ((helper.get_key(&a[i]) as u64) << 32) | (i as u64)
+    });
+
+    scratch.packed.voracious_mt_sort(rayon::current_num_threads());
+
+    // Materialize sorted T from packed (one parallel pass, reusing scratch.output).
+    // Split-borrow disjoint fields of scratch so the closure can read packed
+    // while we write output.
+    let CrScratch { packed, output, bucket_offsets, .. } = &mut *scratch;
+    let packed_ref: &[u64] = packed;
+    par_fill_with(output, n, |i| a[(packed_ref[i] as u32) as usize]);
+
+    // Parallel binary-search per bucket — no O(n) scan over packed.
+    par_sorted_bucket_offsets(
+        n,
+        num_buckets,
+        |i| (packed_ref[i] >> 32) as usize,
+        bucket_offsets,
+    );
+
+    let sorted_ref: &[T] = output;
+    let offsets_ref: &[usize] = bucket_offsets;
+    (0..num_buckets).into_par_iter().for_each(|k| {
+        let slice = &sorted_ref[offsets_ref[k]..offsets_ref[k + 1]];
         if !slice.is_empty() {
             helper.combine(slice);
         }

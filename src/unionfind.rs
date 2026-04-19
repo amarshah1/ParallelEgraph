@@ -163,6 +163,77 @@ impl ConcurrentUnionFind {
     }
 }
 
+/// Plain sequential union-find with rank + path compression.
+///
+/// No atomics. Used for the sequential Nelson-Oppen baseline so the
+/// comparison measures algorithmic work, not CAS overhead.
+pub struct SequentialUnionFind {
+    data: Vec<u32>,
+}
+
+impl SequentialUnionFind {
+    pub fn with_size(size: usize) -> Self {
+        SequentialUnionFind { data: vec![make_rank(0); size] }
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn find_root(&mut self, u: u32) -> u32 {
+        let p = self.data[u as usize];
+        if is_rank(p) {
+            return u;
+        }
+        let root = self.find_root(p);
+        if p != root {
+            self.data[u as usize] = root;
+        }
+        root
+    }
+
+    fn rank_of(&self, root: u32) -> u32 {
+        rank_value(self.data[root as usize])
+    }
+
+    /// Predict which of two current roots will lose the next `union(u, v)`
+    /// call (i.e., which becomes a child of the other). Mirrors the tiebreak
+    /// logic in `union`. Caller must pass roots (post `find_root`).
+    pub fn predict_loser(&self, ru: u32, rv: u32) -> u32 {
+        debug_assert!(ru != rv);
+        let rank_u = self.rank_of(ru);
+        let rank_v = self.rank_of(rv);
+        if rank_u < rank_v {
+            ru
+        } else if rank_u > rank_v {
+            rv
+        } else if ru < rv {
+            ru
+        } else {
+            rv
+        }
+    }
+
+    pub fn union(&mut self, u: u32, v: u32) {
+        let ru = self.find_root(u);
+        let rv = self.find_root(v);
+        if ru == rv {
+            return;
+        }
+        let rank_u = self.rank_of(ru);
+        let rank_v = self.rank_of(rv);
+        if rank_u < rank_v {
+            self.data[ru as usize] = rv;
+        } else if rank_u > rank_v {
+            self.data[rv as usize] = ru;
+        } else {
+            let (lo, hi) = if ru < rv { (ru, rv) } else { (rv, ru) };
+            self.data[lo as usize] = hi;
+            self.data[hi as usize] = make_rank(rank_u + 1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
