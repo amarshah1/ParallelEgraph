@@ -1,6 +1,6 @@
 use dashmap::DashSet;
+use rustc_hash::FxHasher;
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::{collections::HashMap, sync::atomic::Ordering};
 use std::sync::atomic::AtomicBool;
@@ -9,7 +9,7 @@ use crate::unionfind::{ConcurrentUnionFind, SequentialUnionFind};
 
 #[inline]
 fn sig_hash(node: &ENode, uf: &ConcurrentUnionFind) -> u64 {
-    let mut h = DefaultHasher::new();
+    let mut h = FxHasher::default();
     node.op.hash(&mut h);
     for &c in &node.children {
         uf.find_root(c).hash(&mut h);
@@ -19,7 +19,7 @@ fn sig_hash(node: &ENode, uf: &ConcurrentUnionFind) -> u64 {
 
 #[inline]
 fn sig_hash_seq(node: &ENode, uf: &mut SequentialUnionFind) -> u64 {
-    let mut h = DefaultHasher::new();
+    let mut h = FxHasher::default();
     node.op.hash(&mut h);
     for &c in &node.children {
         uf.find_root(c).hash(&mut h);
@@ -29,8 +29,8 @@ fn sig_hash_seq(node: &ENode, uf: &mut SequentialUnionFind) -> u64 {
 
 #[inline]
 fn sig_hash2_seq(node: &ENode, uf: &mut SequentialUnionFind) -> (u64, u64) {
-    let mut h1 = DefaultHasher::new();
-    let mut h2 = DefaultHasher::new();
+    let mut h1 = FxHasher::default();
+    let mut h2 = FxHasher::default();
     h2.write_u64(0x9E3779B97F4A7C15);
     node.op.hash(&mut h1);
     node.op.hash(&mut h2);
@@ -44,8 +44,8 @@ fn sig_hash2_seq(node: &ENode, uf: &mut SequentialUnionFind) -> (u64, u64) {
 
 #[inline]
 fn sig_hash2(node: &ENode, uf: &ConcurrentUnionFind) -> (u64, u64) {
-    let mut h1 = DefaultHasher::new();
-    let mut h2 = DefaultHasher::new();
+    let mut h1 = FxHasher::default();
+    let mut h2 = FxHasher::default();
     h2.write_u64(0x9E3779B97F4A7C15);
     node.op.hash(&mut h1);
     node.op.hash(&mut h2);
@@ -620,6 +620,9 @@ impl EGraph {
         use rayon::prelude::*;
         use rayon::slice::ParallelSlice;
 
+        // Set PE_TRACE=1 to emit per-round phase timings to stderr.
+        let trace = std::env::var_os("PE_TRACE").is_some();
+
         if self.parent_index.len() < self.uf.len() {
             self.parent_index.resize_with(self.uf.len(), Vec::new);
         }
@@ -635,7 +638,12 @@ impl EGraph {
             .flat_map(|&(a, b)| [a, b])
             .collect();
 
+        let mut round = 0usize;
         while !work.is_empty() {
+            let t_round = std::time::Instant::now();
+            let work_len = work.len();
+
+            let t0 = std::time::Instant::now();
             let parent_index = &self.parent_index;
             let pi_len = parent_index.len();
             let frontier: Vec<u32> = work
@@ -643,33 +651,47 @@ impl EGraph {
                 .filter(|&&c| (c as usize) < pi_len)
                 .flat_map_iter(|&c| parent_index[c as usize].iter().copied())
                 .collect();
+            let t_frontier = t0.elapsed().as_secs_f64() * 1000.0;
             if frontier.is_empty() {
+                if trace {
+                    eprintln!(
+                        "[pe] round={:>3} work={:>9} frontier=0 (break)",
+                        round, work_len,
+                    );
+                }
                 break;
             }
+            let frontier_len = frontier.len();
 
             let uf = &self.uf;
             let nodes = &self.nodes;
 
-            let mut canon: Vec<(u64, u64, u32)> = frontier
+            let t0 = std::time::Instant::now();
+            // Single 64-bit hash. §4.5 `sigs_equal` resolves collisions on the
+            // rare pair that hash-matches; 64-bit collision rate on 4M items is
+            // ~10^-6 pairs, so this adds negligible extra UF traffic.
+            let mut canon: Vec<(u64, u32)> = frontier
                 .par_iter()
                 .map(|&idx| {
                     let (node, _) = &nodes[idx as usize];
-                    let (h1, h2) = sig_hash2(node, uf);
-                    (h1, h2, idx)
+                    (sig_hash(node, uf), idx)
                 })
                 .collect();
+            let t_canon = t0.elapsed().as_secs_f64() * 1000.0;
 
+            let t0 = std::time::Instant::now();
             canon.par_sort_unstable();
+            let t_sort = t0.elapsed().as_secs_f64() * 1000.0;
 
+            let t0 = std::time::Instant::now();
             let mut next_work: Vec<u32> = canon
                 .par_windows(2)
                 .filter_map(|w| {
-                    let (h1a, h2a, ia) = w[0];
-                    let (h1b, h2b, ib) = w[1];
-                    if h1a != h1b || h2a != h2b {
+                    let (ha, ia) = w[0];
+                    let (hb, ib) = w[1];
+                    if ha != hb {
                         return None;
                     }
-                    // Exact equality check (§4.5): guard against hash collisions.
                     if !sigs_equal(ia, ib, uf, nodes) {
                         return None;
                     }
@@ -686,9 +708,35 @@ impl EGraph {
                 })
                 .flat_map_iter(|(a, b)| [a, b].into_iter())
                 .collect();
+            let t_scan = t0.elapsed().as_secs_f64() * 1000.0;
+
+            // Parallel sort + parallel dedup. Sequential `.dedup()` would be a
+            // scaling bottleneck at high thread counts.
+            let t0 = std::time::Instant::now();
             next_work.par_sort_unstable();
-            next_work.dedup();
+            let deduped: Vec<u32> = next_work
+                .par_iter()
+                .enumerate()
+                .filter_map(|(i, &x)| {
+                    if i == 0 || next_work[i - 1] != x { Some(x) } else { None }
+                })
+                .collect();
+            next_work = deduped;
+            let t_dedup = t0.elapsed().as_secs_f64() * 1000.0;
+
+            let next_len = next_work.len();
+            if trace {
+                let total = t_round.elapsed().as_secs_f64() * 1000.0;
+                eprintln!(
+                    "[pe] round={:>3} work={:>9} front={:>9} next={:>9} | \
+                     front={:>6.2} canon={:>6.2} sort={:>6.2} scan={:>6.2} dedup={:>6.2} = {:>6.2}ms",
+                    round, work_len, frontier_len, next_len,
+                    t_frontier, t_canon, t_sort, t_scan, t_dedup, total,
+                );
+            }
+
             work = next_work;
+            round += 1;
         }
     }
 
