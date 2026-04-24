@@ -777,10 +777,25 @@ impl EGraph {
                 break;
             }
 
-            let parent_index = &self.parent_index;
-            let frontier: Vec<u32> = changed_classes
+            // Consolidate parent_index for changed classes: move entries from
+            // non-root classes into their canonical root so subsequent rounds
+            // pick up parents regardless of which class id was marked.
+            let uf_ref = &self.uf;
+            let roots_to_consolidate: Vec<usize> = changed_classes
                 .par_iter()
-                .flat_map(|&c| parent_index[c].par_iter().copied())
+                .map(|&c| uf_ref.find_root(c as Id) as usize)
+                .collect();
+            for (&c, &root) in changed_classes.iter().zip(&roots_to_consolidate) {
+                if c != root && c < self.parent_index.len() && root < self.parent_index.len() {
+                    let taken = std::mem::take(&mut self.parent_index[c]);
+                    self.parent_index[root].extend(taken);
+                }
+            }
+
+            let parent_index = &self.parent_index;
+            let frontier: Vec<u32> = roots_to_consolidate
+                .par_iter()
+                .flat_map(|&r| parent_index[r].par_iter().copied())
                 .collect();
 
             if frontier.is_empty() {
