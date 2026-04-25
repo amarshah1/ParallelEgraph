@@ -86,6 +86,38 @@ Four families are available, spanning O(n) to O(2^n) congruence counts:
 
 **Note on scaling limits:** The number of congruences discovered during congruence closure is bounded by the number of distinct e-nodes, which equals the number of distinct subterms in the formula. This means exponential congruences (exp family) necessarily require exponential formula size — there is no compact encoding that avoids this. For practical scaling, the polynomial families (grid, cube) are more useful. These could be generalized to a `power_k` family using a k-ary function to produce n^k congruences from n merges (e.g., k=4 for n⁴, k=5 for n⁵).
 
+## C++ / parlay port
+
+A 1:1 port of the e-graph core and all three BSP closure variants lives under
+[cpp/](cpp/), using parlay for parallel primitives. It exposes the same CLI
+(`cpp/build/parallel-egraph [--parallel] [--timing] <file.smt2>`) and the same
+`PE_REBUILD` env var (`semisort` default, `sort`, `close`).
+
+Build:
+
+```
+cmake -B cpp/build cpp && cmake --build cpp/build
+```
+
+Test (C++ unit + regression against every `tests/*.smt2`):
+
+```
+cd cpp/build && ctest --output-on-failure
+```
+
+Cross-validate Rust vs. C++ on every `.smt2` in `tests/` + `synthetic_benchmarks/`,
+in sequential and every parallel variant:
+
+```
+./cpp/scripts/cross_validate.sh
+```
+
+Benchmark (same 6 workloads as `cargo bench --bench rebuild_compare`):
+
+```
+./cpp/build/rebuild_compare_bench
+```
+
 ## TODOS
 
     - Come up with a scalable benchmark set that does not involve boolean connectives ✅

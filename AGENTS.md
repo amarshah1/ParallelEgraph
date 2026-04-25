@@ -127,6 +127,32 @@ Unit tests and regression tests now cover both sequential and parallel modes:
 
 All 32 tests pass, verifying correctness of the parallel rebuild implementation.
 
+## C++ port (cpp/)
+
+A 1:1 C++ port of the e-graph core, all three BSP closure variants, the
+Nelson-style sequential baseline, and the `rebuild_compare` benchmark lives
+under [cpp/](cpp/) and uses [parlaylib](https://github.com/cmuparlay/parlaylib)
+for parallel primitives. Build via CMake; parlay is pulled by FetchContent.
+
+Same API surface as the Rust side:
+- `cpp/build/parallel-egraph [--parallel] [--timing] [--profile-solve] <smt2>`.
+- `PE_REBUILD=semisort|sort|close` selects the parallel rebuild variant (same
+  env var as Rust).
+- `PE_TRACE=1` emits per-round phase timings to stderr from `parallel_close`.
+
+Cross-validation harness: `cpp/scripts/cross_validate.sh` runs every
+`tests/*.smt2` and `synthetic_benchmarks/*.smt2` on both binaries, in both
+sequential and each parallel variant, and diffs the sat/unsat output. Used as
+a soundness oracle during the port and should pass cleanly on every commit
+(144/144 as of last run).
+
+The C++ semisort uses `parlay::group_by_key` with a custom hash (`sig_hash`)
+and custom equality (`sigs_equal`), then a D&C union per same-sig group
+(`parlay::par_do`). This replaces the Rust `collect_reduce` semisort plus
+per-bucket `sort_unstable_by` — the parlay primitive handles the
+hash-distribute + exact-equality grouping in one call, and the D&C avoids the
+shared-endpoint contention of an adjacent-pair union scan.
+
 ## Likely next steps
 
 1. Benchmark parallel rebuild on synthetic benchmarks (cube_n80, exp_n20, etc.) to measure speedup vs sequential

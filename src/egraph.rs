@@ -644,9 +644,28 @@ impl EGraph {
             let work_len = work.len();
 
             let t0 = std::time::Instant::now();
+            // Consolidate parent_index for work classes: move entries from
+            // non-root classes into their canonical root so parents registered
+            // under a stale id are picked up via the current root. Same fix
+            // as parallel_rebuild_semisort at :780-795.
+            let uf_ref = &self.uf;
+            let pi_len_pre = self.parent_index.len();
+            let roots: Vec<u32> = work
+                .par_iter()
+                .map(|&c| uf_ref.find_root(c))
+                .collect();
+            for (&c, &root) in work.iter().zip(&roots) {
+                if c != root
+                    && (c as usize) < pi_len_pre
+                    && (root as usize) < pi_len_pre
+                {
+                    let taken = std::mem::take(&mut self.parent_index[c as usize]);
+                    self.parent_index[root as usize].extend(taken);
+                }
+            }
             let parent_index = &self.parent_index;
             let pi_len = parent_index.len();
-            let frontier: Vec<u32> = work
+            let frontier: Vec<u32> = roots
                 .par_iter()
                 .filter(|&&c| (c as usize) < pi_len)
                 .flat_map_iter(|&c| parent_index[c as usize].iter().copied())
@@ -742,7 +761,25 @@ impl EGraph {
 
     /// Default parallel rebuild: semisort-based grouping.
     pub fn parallel_rebuild(&mut self) {
-        self.parallel_rebuild_semisort();
+        match std::env::var("PE_REBUILD").as_deref() {
+            Ok("sort") => self.parallel_rebuild_sort(),
+            Ok("close") => {
+                // Use parallel_close with the initial worklist from changed flags.
+                use rayon::prelude::*;
+                let initial: Vec<(u32, u32)> = (0..self.uf.len() as u32)
+                    .into_par_iter()
+                    .filter_map(|c| {
+                        if self.changed[c as usize].swap(false, Ordering::AcqRel) {
+                            Some((c, c))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                self.parallel_close(&initial);
+            }
+            _ => self.parallel_rebuild_semisort(),
+        }
     }
 
     /// Batch-parallel congruence closure using the round-based algorithm.
@@ -756,6 +793,9 @@ impl EGraph {
     /// (5) parallel merge application, (6) changed-flag + parent_index update.
     pub fn parallel_rebuild_semisort(&mut self) {
         use rayon::prelude::*;
+
+        let trace = std::env::var_os("PE_TRACE").is_some();
+        let mut round = 0usize;
 
         let n_classes = self.uf.len();
         self.grow_changed_to(n_classes);
@@ -773,6 +813,12 @@ impl EGraph {
                 })
                 .collect();
 
+            if trace {
+                eprintln!(
+                    "[sem] round={:>3} changed_classes={}",
+                    round, changed_classes.len()
+                );
+            }
             if changed_classes.is_empty() {
                 break;
             }
@@ -865,6 +911,12 @@ impl EGraph {
                 })
                 .collect();
 
+            if trace {
+                eprintln!(
+                    "[sem] round={:>3} frontier={} merge_pairs={}",
+                    round, frontier.len(), merge_pairs.len()
+                );
+            }
             if merge_pairs.is_empty() {
                 break;
             }
@@ -878,6 +930,7 @@ impl EGraph {
                 changed[a as usize].store(true, Ordering::Release);
                 changed[b as usize].store(true, Ordering::Release);
             });
+            round += 1;
         }
     }
 
@@ -907,10 +960,24 @@ impl EGraph {
                 break;
             }
 
-            let parent_index = &self.parent_index;
-            let frontier: Vec<u32> = changed_classes
+            // Consolidate parent_index for changed classes (mirrors the fix
+            // in parallel_rebuild_semisort at :780-795).
+            let uf_ref = &self.uf;
+            let roots_to_consolidate: Vec<usize> = changed_classes
                 .par_iter()
-                .flat_map(|&c| parent_index[c].par_iter().copied())
+                .map(|&c| uf_ref.find_root(c as Id) as usize)
+                .collect();
+            for (&c, &root) in changed_classes.iter().zip(&roots_to_consolidate) {
+                if c != root && c < self.parent_index.len() && root < self.parent_index.len() {
+                    let taken = std::mem::take(&mut self.parent_index[c]);
+                    self.parent_index[root].extend(taken);
+                }
+            }
+
+            let parent_index = &self.parent_index;
+            let frontier: Vec<u32> = roots_to_consolidate
+                .par_iter()
+                .flat_map(|&r| parent_index[r].par_iter().copied())
                 .collect();
 
             if frontier.is_empty() {

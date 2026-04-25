@@ -50,6 +50,7 @@ smt2_test!(t13_diamond_unsat,            "13_diamond_unsat.smt2");
 smt2_test!(t14_diamond_sat,              "14_diamond_sat.smt2");
 smt2_test!(t15_stress_unsat,             "15_stress_unsat.smt2");
 smt2_test!(t16_stress_multiarg_sat,      "16_stress_multiarg_sat.smt2");
+smt2_test!(t17_aliased_named_unsat,      "17_aliased_named_unsat.smt2");
 
 // ---- Parallel mode regression tests ----
 
@@ -90,3 +91,4 @@ smt2_test_parallel!(p13_diamond_unsat,            "13_diamond_unsat.smt2");
 smt2_test_parallel!(p14_diamond_sat,              "14_diamond_sat.smt2");
 smt2_test_parallel!(p15_stress_unsat,             "15_stress_unsat.smt2");
 smt2_test_parallel!(p16_stress_multiarg_sat,      "16_stress_multiarg_sat.smt2");
+smt2_test_parallel!(p17_aliased_named_unsat,      "17_aliased_named_unsat.smt2");
