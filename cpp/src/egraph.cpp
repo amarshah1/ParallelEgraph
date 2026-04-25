@@ -439,8 +439,9 @@ void EGraph::parallel_rebuild_semisort() {
     parallel_consolidate(parent_index, changed_classes, roots);
 
     // 4. Dedup roots so the frontier doesn't double-iterate the same slot.
-    auto unique_roots = parlay::sort(roots);
-    unique_roots = parlay::unique(unique_roots);
+    // Hash-based dedup (no sort). Avoids inflating the frontier when the
+    // work list contains multiple class ids that share a current root.
+    auto unique_roots = parlay::remove_duplicates(roots);
 
     // 5. Frontier: flat_map root -> parent_index[root].
     auto frontier = parlay::flatten(parlay::map(unique_roots, [&](Id r) {
@@ -495,8 +496,9 @@ void EGraph::parallel_rebuild_sort() {
                              [&](Id c) { return uf.find_root(c); });
     parallel_consolidate(parent_index, changed_classes, roots);
 
-    auto unique_roots = parlay::sort(roots);
-    unique_roots = parlay::unique(unique_roots);
+    // Hash-based dedup (no sort). Avoids inflating the frontier when the
+    // work list contains multiple class ids that share a current root.
+    auto unique_roots = parlay::remove_duplicates(roots);
 
     auto frontier = parlay::flatten(parlay::map(unique_roots, [&](Id r) {
       if (r >= parent_index.size()) return parlay::sequence<std::uint32_t>{};
@@ -576,8 +578,9 @@ void EGraph::parallel_close(parlay::sequence<std::pair<Id, Id>> initial_unions) 
     parallel_consolidate(parent_index, work, roots);
 
     // 5. Dedup roots.
-    auto unique_roots = parlay::sort(roots);
-    unique_roots = parlay::unique(unique_roots);
+    // Hash-based dedup (no sort). Avoids inflating the frontier when the
+    // work list contains multiple class ids that share a current root.
+    auto unique_roots = parlay::remove_duplicates(roots);
 
     // 6. Frontier via flat_map.
     auto frontier = parlay::flatten(parlay::map(unique_roots, [&](Id r) {
