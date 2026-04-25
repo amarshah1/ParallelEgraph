@@ -273,16 +273,15 @@ void parallel_consolidate(
   // are isolated across groups. Inner parallel: precompute offsets via
   // parlay::scan, resize parent_index[r] once, then scatter each c's
   // entries into its pre-computed slot. No user-authored sequential loop.
+  // parent_index is sized to uf_ capacity at construction; class ids
+  // never exceed that, so the bounds checks present in earlier drafts are
+  // dead and have been removed.
   parlay::parallel_for(0, groups.size(), [&](std::size_t g) {
     Id r = groups[g].first;
     const auto& cs_for_r = groups[g].second;
-    if (r >= parent_index.size()) return;
 
-    // Per-c source sizes; zero for any c with no stored entries.
     auto sizes = parlay::tabulate(cs_for_r.size(), [&](std::size_t i) {
-      Id c = cs_for_r[i];
-      return (c < parent_index.size()) ? parent_index[c].size()
-                                        : std::size_t{0};
+      return parent_index[cs_for_r[i]].size();
     });
     auto scan_result = parlay::scan(sizes);        // (offsets, total)
     auto& offsets = scan_result.first;
@@ -292,14 +291,20 @@ void parallel_consolidate(
     std::size_t old_size = dst.size();
     dst.resize(old_size + total_new);
 
+    // Sequential cutoff for the inner copy: tiny src.size() doesn't
+    // benefit from forking, and many groups have parent_index entries of
+    // size 1–4. Threshold matches a typical parlay base-case.
+    constexpr std::size_t COPY_SEQ_CUTOFF = 1024;
     parlay::parallel_for(0, cs_for_r.size(), [&](std::size_t i) {
       Id c = cs_for_r[i];
-      if (c >= parent_index.size()) return;
       auto& src = parent_index[c];
       std::size_t ofs = old_size + offsets[i];
-      parlay::parallel_for(0, src.size(), [&](std::size_t j) {
-        dst[ofs + j] = src[j];
-      });
+      if (src.size() < COPY_SEQ_CUTOFF) {
+        for (std::size_t j = 0; j < src.size(); ++j) dst[ofs + j] = src[j];
+      } else {
+        parlay::parallel_for(0, src.size(),
+                             [&](std::size_t j) { dst[ofs + j] = src[j]; });
+      }
       src.clear();
     });
   });
@@ -316,12 +321,18 @@ struct CanonEntry {
 // parallel (parlay::par_do), then unions the two sub-representatives.
 // Span O(log n); contention is minimal because sibling recursive unions
 // target disjoint class ids.
+//
+// Below DNC_SEQ_CUTOFF, fall through to a sequential pairwise sweep —
+// par_do fork/join overhead dominates for tiny groups, which are common.
 template <typename Bucket>
 void dnc_union(Bucket& bucket, std::size_t lo, std::size_t hi,
                ConcurrentUnionFind& uf) {
+  constexpr std::size_t DNC_SEQ_CUTOFF = 16;
   if (hi - lo <= 1) return;
-  if (hi - lo == 2) {
-    uf.union_(bucket[lo].root, bucket[lo + 1].root);
+  if (hi - lo <= DNC_SEQ_CUTOFF) {
+    for (std::size_t i = lo + 1; i < hi; ++i) {
+      uf.union_(bucket[lo].root, bucket[i].root);
+    }
     return;
   }
   std::size_t mid = lo + (hi - lo) / 2;
@@ -445,7 +456,6 @@ void EGraph::parallel_rebuild_semisort() {
 
     // 5. Frontier: flat_map root -> parent_index[root].
     auto frontier = parlay::flatten(parlay::map(unique_roots, [&](Id r) {
-      if (r >= parent_index.size()) return parlay::sequence<std::uint32_t>{};
       return parlay::sequence<std::uint32_t>(std::begin(parent_index[r]),
                                              std::end(parent_index[r]));
     }));
@@ -501,7 +511,6 @@ void EGraph::parallel_rebuild_sort() {
     auto unique_roots = parlay::remove_duplicates(roots);
 
     auto frontier = parlay::flatten(parlay::map(unique_roots, [&](Id r) {
-      if (r >= parent_index.size()) return parlay::sequence<std::uint32_t>{};
       return parlay::sequence<std::uint32_t>(std::begin(parent_index[r]),
                                              std::end(parent_index[r]));
     }));
@@ -584,7 +593,6 @@ void EGraph::parallel_close(parlay::sequence<std::pair<Id, Id>> initial_unions) 
 
     // 6. Frontier via flat_map.
     auto frontier = parlay::flatten(parlay::map(unique_roots, [&](Id r) {
-      if (r >= parent_index.size()) return parlay::sequence<std::uint32_t>{};
       return parlay::sequence<std::uint32_t>(std::begin(parent_index[r]),
                                              std::end(parent_index[r]));
     }));
@@ -629,7 +637,8 @@ void EGraph::parallel_close(parlay::sequence<std::pair<Id, Id>> initial_unions) 
 void EGraph::sequential_close_nelson(
     const parlay::sequence<std::pair<Id, Id>>& initial_unions) {
   const std::size_t n_classes = uf_.len();
-  if (parent_index_.size() < n_classes) parent_index_.resize(n_classes);
+  // parent_index_ is sized to UF capacity at construction; n_classes is
+  // bounded by that, so the resize on legacy entry-points is dead.
 
   SequentialUnionFind uf(n_classes);
   // Copy existing uf_ partition into the local sequential UF.
@@ -656,7 +665,6 @@ void EGraph::sequential_close_nelson(
   while (!worklist.empty()) {
     Id c = worklist.back();
     worklist.pop_back();
-    if (c >= parent_index_.size()) continue;
 
     parlay::sequence<std::uint32_t> frontier = std::move(parent_index_[c]);
     parent_index_[c].clear();
