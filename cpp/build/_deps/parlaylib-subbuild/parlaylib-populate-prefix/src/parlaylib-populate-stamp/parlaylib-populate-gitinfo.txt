@@ -3,13 +3,13 @@
 # No other meaning or use of this file is supported.
 
 method=git
-command=/Applications/CMake.app/Contents/bin/cmake;-P;/Users/zacharykent/ParallelEgraph/cpp/build/_deps/parlaylib-subbuild/parlaylib-populate-prefix/tmp/parlaylib-populate-gitclone.cmake
-source_dir=/Users/zacharykent/ParallelEgraph/cpp/build/_deps/parlaylib-src
-work_dir=/Users/zacharykent/ParallelEgraph/cpp/build/_deps
+command=/opt/homebrew/bin/cmake;-DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE;-P;/Users/amarshah/Desktop/Classes/Spring_2026/parallel/project/ParallelEgraph/cpp/build/_deps/parlaylib-subbuild/parlaylib-populate-prefix/tmp/parlaylib-populate-gitclone.cmake
+source_dir=/Users/amarshah/Desktop/Classes/Spring_2026/parallel/project/ParallelEgraph/cpp/build/_deps/parlaylib-src
+work_dir=/Users/amarshah/Desktop/Classes/Spring_2026/parallel/project/ParallelEgraph/cpp/build/_deps
 repository=https://github.com/cmuparlay/parlaylib.git
 remote=origin
 init_submodules=TRUE
 recurse_submodules=--recursive
 submodules=
 CMP0097=NEW
-
+      

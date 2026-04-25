@@ -1,4 +1,4 @@
-# Install script for directory: /Users/zacharykent/ParallelEgraph/cpp/build/_deps/parlaylib-src
+# Install script for directory: /Users/amarshah/Desktop/Classes/Spring_2026/parallel/project/ParallelEgraph/cpp/build/_deps/parlaylib-src
 
 # Set the install prefix
 if(NOT DEFINED CMAKE_INSTALL_PREFIX)
@@ -32,16 +32,16 @@ if(NOT DEFINED CMAKE_CROSSCOMPILING)
   set(CMAKE_CROSSCOMPILING "FALSE")
 endif()
 
-# Set default install directory permissions.
+# Set path to fallback-tool for dependency-resolution.
 if(NOT DEFINED CMAKE_OBJDUMP)
-  set(CMAKE_OBJDUMP "/Library/Developer/CommandLineTools/usr/bin/objdump")
+  set(CMAKE_OBJDUMP "/usr/bin/objdump")
 endif()
 
 if(CMAKE_INSTALL_COMPONENT STREQUAL "Unspecified" OR NOT CMAKE_INSTALL_COMPONENT)
   if(EXISTS "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/share/parlay/cmake/ParlayTargets.cmake")
     file(DIFFERENT _cmake_export_file_changed FILES
          "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/share/parlay/cmake/ParlayTargets.cmake"
-         "/Users/zacharykent/ParallelEgraph/cpp/build/_deps/parlaylib-build/CMakeFiles/Export/7ffd784ba1085ea8c1a89af472a4fcd0/ParlayTargets.cmake")
+         "/Users/amarshah/Desktop/Classes/Spring_2026/parallel/project/ParallelEgraph/cpp/build/_deps/parlaylib-build/CMakeFiles/Export/7ffd784ba1085ea8c1a89af472a4fcd0/ParlayTargets.cmake")
     if(_cmake_export_file_changed)
       file(GLOB _cmake_old_config_files "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/share/parlay/cmake/ParlayTargets-*.cmake")
       if(_cmake_old_config_files)
@@ -54,22 +54,28 @@ if(CMAKE_INSTALL_COMPONENT STREQUAL "Unspecified" OR NOT CMAKE_INSTALL_COMPONENT
     endif()
     unset(_cmake_export_file_changed)
   endif()
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share/parlay/cmake" TYPE FILE FILES "/Users/zacharykent/ParallelEgraph/cpp/build/_deps/parlaylib-build/CMakeFiles/Export/7ffd784ba1085ea8c1a89af472a4fcd0/ParlayTargets.cmake")
+  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share/parlay/cmake" TYPE FILE FILES "/Users/amarshah/Desktop/Classes/Spring_2026/parallel/project/ParallelEgraph/cpp/build/_deps/parlaylib-build/CMakeFiles/Export/7ffd784ba1085ea8c1a89af472a4fcd0/ParlayTargets.cmake")
 endif()
 
 if(CMAKE_INSTALL_COMPONENT STREQUAL "Unspecified" OR NOT CMAKE_INSTALL_COMPONENT)
   file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share/parlay/cmake" TYPE FILE FILES
-    "/Users/zacharykent/ParallelEgraph/cpp/build/_deps/parlaylib-build/ParlayConfig.cmake"
-    "/Users/zacharykent/ParallelEgraph/cpp/build/_deps/parlaylib-build/ParlayConfigVersion.cmake"
+    "/Users/amarshah/Desktop/Classes/Spring_2026/parallel/project/ParallelEgraph/cpp/build/_deps/parlaylib-build/ParlayConfig.cmake"
+    "/Users/amarshah/Desktop/Classes/Spring_2026/parallel/project/ParallelEgraph/cpp/build/_deps/parlaylib-build/ParlayConfigVersion.cmake"
     )
 endif()
 
 if(CMAKE_INSTALL_COMPONENT STREQUAL "Unspecified" OR NOT CMAKE_INSTALL_COMPONENT)
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/include" TYPE DIRECTORY FILES "/Users/zacharykent/ParallelEgraph/cpp/build/_deps/parlaylib-src/include/parlay")
+  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/include" TYPE DIRECTORY FILES "/Users/amarshah/Desktop/Classes/Spring_2026/parallel/project/ParallelEgraph/cpp/build/_deps/parlaylib-src/include/parlay")
 endif()
 
 if(NOT CMAKE_INSTALL_LOCAL_ONLY)
   # Include the install script for the subdirectory.
-  include("/Users/zacharykent/ParallelEgraph/cpp/build/_deps/parlaylib-build/analysis/cmake_install.cmake")
+  include("/Users/amarshah/Desktop/Classes/Spring_2026/parallel/project/ParallelEgraph/cpp/build/_deps/parlaylib-build/analysis/cmake_install.cmake")
 endif()
 
+string(REPLACE ";" "\n" CMAKE_INSTALL_MANIFEST_CONTENT
+       "${CMAKE_INSTALL_MANIFEST_FILES}")
+if(CMAKE_INSTALL_LOCAL_ONLY)
+  file(WRITE "/Users/amarshah/Desktop/Classes/Spring_2026/parallel/project/ParallelEgraph/cpp/build/_deps/parlaylib-build/install_local_manifest.txt"
+     "${CMAKE_INSTALL_MANIFEST_CONTENT}")
+endif()
