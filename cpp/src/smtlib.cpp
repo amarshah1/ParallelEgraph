@@ -177,8 +177,13 @@ class Parser {
   Term parse_term() {
     if (cur_.kind == Token::Kind::Atom) {
       Term t;
-      t.kind = Term::Kind::Const;
-      t.op = cur_.text;
+      // Recognize the Boolean literals; everything else is a Const.
+      if (cur_.text == "true")       t.kind = Term::Kind::True;
+      else if (cur_.text == "false") t.kind = Term::Kind::False;
+      else {
+        t.kind = Term::Kind::Const;
+        t.op = cur_.text;
+      }
       advance();
       return t;
     }
@@ -187,13 +192,71 @@ class Parser {
     Term t;
     if (head == "=") {
       t.kind = Term::Kind::Eq;
-      // Must have exactly 2 args for QF_UF. Support binary only.
-      t.args.push_back(parse_term());
-      t.args.push_back(parse_term());
+      // SMT-LIB allows n-ary =, but for QF_UF we only need binary. If we
+      // ever see n>2 we left-fold into pairwise equalities under and.
+      std::vector<Term> args;
+      while (cur_.kind != Token::Kind::RParen) {
+        if (cur_.kind == Token::Kind::End) error("unterminated (= ...)");
+        args.push_back(parse_term());
+      }
+      if (args.size() < 2) error("(=) needs at least 2 args");
+      if (args.size() == 2) {
+        t.args = std::move(args);
+      } else {
+        // Desugar (= x1 x2 x3 ...) → (and (= x1 x2) (= x2 x3) ...).
+        t.kind = Term::Kind::And;
+        for (std::size_t i = 0; i + 1 < args.size(); ++i) {
+          Term eq;
+          eq.kind = Term::Kind::Eq;
+          eq.args = {args[i], args[i + 1]};
+          t.args.push_back(std::move(eq));
+        }
+      }
     } else if (head == "not") {
       t.kind = Term::Kind::Not;
       t.args.push_back(parse_term());
+    } else if (head == "and") {
+      t.kind = Term::Kind::And;
+      while (cur_.kind != Token::Kind::RParen) {
+        if (cur_.kind == Token::Kind::End) error("unterminated (and ...)");
+        t.args.push_back(parse_term());
+      }
+    } else if (head == "or") {
+      t.kind = Term::Kind::Or;
+      while (cur_.kind != Token::Kind::RParen) {
+        if (cur_.kind == Token::Kind::End) error("unterminated (or ...)");
+        t.args.push_back(parse_term());
+      }
+    } else if (head == "=>" || head == "implies") {
+      t.kind = Term::Kind::Implies;
+      while (cur_.kind != Token::Kind::RParen) {
+        if (cur_.kind == Token::Kind::End) error("unterminated (=> ...)");
+        t.args.push_back(parse_term());
+      }
+      if (t.args.size() < 2) error("(=>) needs at least 2 args");
+    } else if (head == "xor") {
+      t.kind = Term::Kind::Xor;
+      while (cur_.kind != Token::Kind::RParen) {
+        if (cur_.kind == Token::Kind::End) error("unterminated (xor ...)");
+        t.args.push_back(parse_term());
+      }
+      if (t.args.size() < 2) error("(xor) needs at least 2 args");
+    } else if (head == "ite") {
+      t.kind = Term::Kind::Ite;
+      t.args.push_back(parse_term());  // cond
+      t.args.push_back(parse_term());  // then
+      t.args.push_back(parse_term());  // else
+    } else if (head == "distinct") {
+      t.kind = Term::Kind::Distinct;
+      while (cur_.kind != Token::Kind::RParen) {
+        if (cur_.kind == Token::Kind::End) error("unterminated (distinct ...)");
+        t.args.push_back(parse_term());
+      }
+      if (t.args.size() < 2) error("(distinct) needs at least 2 args");
     } else {
+      // Function application f(args...). UF term (or, if appearing in a
+      // Boolean context, a Bool-typed UF predicate — we don't distinguish
+      // sorts at parse time; the encoder figures it out from context.)
       t.kind = Term::Kind::App;
       t.op = head;
       while (cur_.kind != Token::Kind::RParen) {
@@ -214,6 +277,32 @@ class Parser {
 Script parse_smtlib(const std::string& input) {
   Parser p(input);
   return p.parse_script();
+}
+
+namespace {
+
+// True if the term tree is "(= a b)" or "(not (= a b))" with no inner
+// Boolean structure beyond that. Anything else (and / or / nested =, etc.)
+// returns false.
+bool is_pure_assertion(const Term& t) {
+  if (t.kind == Term::Kind::Eq) {
+    return true;  // we allow UF terms as args; UF App's are fine
+  }
+  if (t.kind == Term::Kind::Not && t.args.size() == 1 &&
+      t.args[0].kind == Term::Kind::Eq) {
+    return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+bool is_pure_conjunctive(const Script& s) {
+  for (const auto& c : s.commands) {
+    if (c.kind != Command::Kind::Assert) continue;
+    if (!is_pure_assertion(c.term)) return false;
+  }
+  return true;
 }
 
 }  // namespace pe
