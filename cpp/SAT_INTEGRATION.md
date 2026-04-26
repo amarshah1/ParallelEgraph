@@ -197,19 +197,136 @@ These are out of scope for v1, but the design above leaves room for them:
 New (added by this change):
 
 - `cpp/include/parallel_egraph/sat_solve.hpp`
-- `cpp/src/sat_solve.cpp` — Tseitin + IPASIR-UP propagator + driver
+- `cpp/src/sat_solve.cpp` — Tseitin + IPASIR-UP propagator + driver +
+  ITE lifting pass (see "Implementation notes" below)
 - `cpp/SAT_INTEGRATION.md` — this doc
+- `cpp/tests/bool/*.smt2` — 17 Boolean-fragment regression cases
+  (one per connective, both `_sat` and `_unsat` variants)
+- `cpp/tests/bool_regression_test.cpp` — driver for the above
 - CaDiCaL FetchContent block in `cpp/CMakeLists.txt`
 
 Modified:
 
 - `cpp/include/parallel_egraph/smtlib.hpp` — `Term::Kind` gains the new
-  Boolean kinds; `Term::args` is the children for them too.
-- `cpp/src/smtlib.cpp` — parser handles the full Boolean fragment.
+  Boolean kinds; `is_pure_conjunctive` predicate exposed.
+- `cpp/src/smtlib.cpp` — parser handles the full Boolean fragment;
+  also supports SMT-LIB `let` via parse-time substitution (see notes).
 - `cpp/include/parallel_egraph/egraph.hpp` — `EGraph::clone()`.
 - `cpp/src/egraph.cpp` — `EGraph::clone()` impl.
+- `cpp/include/parallel_egraph/unionfind.hpp` and `cpp/src/unionfind.cpp`
+  — `ConcurrentUnionFind::copy_state_from(other)` (atomics aren't copy-
+  assignable, so cloning needs an explicit element-wise mirror).
 - `cpp/src/solve.cpp` — `solve_with_mode` dispatches into the SAT-driven
   pipeline. Old top-level-only path stays as a fast-path when the
-  formula has no Boolean structure (every assert is `=` or `not =`).
-- `cpp/src/main.cpp` — no flag changes; SAT mode is just the default for
-  any formula with Boolean structure.
+  formula has no Boolean structure (every assert is `=` or `not =`
+  *with pure UF args on both sides* — see "implementation notes" below).
+- `cpp/CMakeLists.txt` — adds C language, `kitten.c` (CaDiCaL's sub-
+  solver), and several CaDiCaL build patches (see notes).
+
+`cpp/src/main.cpp` is **not modified**: the SAT pipeline is invoked
+transparently through the unchanged `solve_with_mode`/`solve_timed` API.
+
+## Implementation notes (post-v1 design)
+
+This section records decisions made during implementation that diverged
+from or extended the original design above.
+
+### ITE lifting (UF-typed ite)
+
+The base Tseitin encoder only handles **Bool-typed** `ite`. UF-typed
+`ite` like `(= u (ite c v w))` requires lifting the `ite` out to Boolean
+position before clausification:
+
+```text
+C[ite c x y]   →   (ite c C[x] C[y])     (if C is Bool-typed context)
+                →   (and (=> c C[x]) (=> (not c) C[y]))   (otherwise)
+```
+
+The implementation in `sat_solve.cpp` is a single recursive walk
+(`split_uf` / `lift_in_bool`) that returns each UF subterm as a list of
+`(guard, value)` pairs. An `(= a b)` parent then becomes the disjunction
+of `(guard_a_i ∧ guard_b_j ∧ (val_a_i = val_b_j))` over all index pairs.
+Cartesian-product expansion handles `ite`s buried inside UF `App`s.
+Cost: exponential in the number of nested `ite`s within a single
+equality, but real benchmarks tend to nest shallowly.
+
+### `is_pure_assertion` requires pure UF args
+
+The dispatcher in `solve.cpp` routes pure-conjunctive QF_UF formulas to
+the legacy fast path. The legacy `add_term()` accepts only `Const` and
+`App` — so an assertion like `(= u (ite c v w))` (which is syntactically
+an `Eq` at top) had to be classified *non-pure* to avoid a segfault when
+it reached `add_term`. The current rule:
+
+> An assertion is pure iff it is `(= a b)` (binary) or `(not (= a b))`
+> AND both sides are recursively pure UF terms (no `ite`, no Bool ops,
+> no `let` references that resolved to anything but UF).
+
+### `let` support via parse-time substitution
+
+QF_UF benchmarks routinely use `let` to share subexpressions. Rather
+than introduce a new `Term::Kind`, the parser inlines bound names as it
+encounters them: a stack of `(name, Term)` frames is pushed for each
+`(let ((x e1) (y e2) ...) body)` and popped after the body is parsed.
+SMT-LIB `let` is parallel — `e2` is parsed in the *outer* scope, before
+the frame is pushed.
+
+Trade-off: each occurrence of a bound name produces a deep copy of its
+RHS in the AST. For benchmarks with many uses of a deeply-nested
+binding (e.g. the SMT-COMP `PEQ018_size7.smt2` where one assertion
+`let`s ~250 names sharing common subterms), this fans out into a tree
+of millions of nodes and the SAT path stalls. A future optimization
+would be to keep `let` as an explicit AST node and let the encoder
+hashcons duplicates downstream — but for the benchmarks we routinely
+care about, parse-time substitution is fine.
+
+### CaDiCaL build glue
+
+CaDiCaL ships with `./configure` + `makefile.in`, not CMake. We pull it
+via `FetchContent_MakeAvailable` and compile its sources directly. Three
+adjustments were necessary:
+
+1. **`build.hpp` synthesis.** CaDiCaL's `version.cpp` includes a
+   generated `build.hpp` defining `VERSION`, `IDENTIFIER`, etc. Our
+   CMakeLists writes one with the values from `VERSION` and CMake
+   variables.
+2. **macOS `closefrom(3)` patch.** `file.cpp` calls `::closefrom(3)`,
+   which is Linux/BSD-only. CMake patches the call site at configure
+   time (idempotent — re-running CMake just overwrites with the same
+   patch).
+3. **`kitten.c`.** CaDiCaL's `sweep` preprocessing uses kitten, a sister
+   solver written in C. The CMakeLists globs both `*.cpp` and `*.c`
+   from CaDiCaL's `src/` and the project enables both `C` and `CXX`.
+4. **Disable `factor` preprocessing.** CaDiCaL 3.x's `factor` pass
+   asserts that every variable is pre-declared. Setting
+   `solver.set("factor", 0)` skips that check; we don't gain anything
+   from `factor` on the small CNFs the encoder produces.
+
+### EGraph cloning
+
+`EGraph` contains `parlay::sequence<std::atomic<bool>>` (per-class
+"changed" flags) and `ConcurrentUnionFind` (vector of `atomic<u32>`).
+Atomics are non-copy-assignable, so `EGraph::clone()` cannot use the
+default copy constructor. Implementation:
+
+- `ConcurrentUnionFind::copy_state_from(other)` — element-wise atomic
+  load/store of `data_`, asserting `capacity` matches.
+- `EGraph::clone()` — constructs a fresh `EGraph` of the same capacity,
+  calls `copy_state_from`, copy-assigns the non-atomic containers
+  (`nodes_`, `parent_index_`, `classes_`, `parents_`, `worklist_`,
+  `hashcons_`), then mirrors the `changed_` atomics element-wise.
+
+Returns a `unique_ptr<EGraph>` because `EGraph` is non-movable.
+
+### Tests
+
+The `bool_regression` ctest target runs every `.smt2` in
+`cpp/tests/bool/` in both sequential and parallel modes, exercising
+each Boolean connective with matched `_sat`/`_unsat` cases:
+
+- `or`, `and`, `=>`, `xor` — standard Tseitin templates.
+- `ite_*` — Bool-typed and UF-typed (the latter exercises the lifting
+  pass; UF-typed ites buried inside `App` exercise Cartesian expansion).
+- `distinct` — desugared to ∧ of pairwise disequalities.
+
+17 cases × 2 modes = 34 sub-tests. Run with `ctest --test-dir cpp/build`.
