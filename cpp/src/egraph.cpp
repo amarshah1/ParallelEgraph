@@ -107,6 +107,28 @@ EGraph::EGraph(std::size_t capacity, bool parallel)
   for (auto& b : changed_) b.store(false, std::memory_order_relaxed);
 }
 
+// ---- clone ----------------------------------------------------------------
+// Produces an independent EGraph with identical state. Used by the SAT
+// integration to snapshot a search level. The atomic-bool / atomic-u32
+// fields cannot be copy-assigned, so we mirror their values element-wise.
+std::unique_ptr<EGraph> EGraph::clone() const {
+  auto out = std::make_unique<EGraph>(uf_.capacity(), parallel_);
+  out->uf_.copy_state_from(uf_);
+  out->nodes_ = nodes_;
+  out->parent_index_ = parent_index_;
+  // changed_ already has the right size from the ctor; copy values.
+  for (std::size_t i = 0; i < changed_.size(); ++i) {
+    out->changed_[i].store(changed_[i].load(std::memory_order_acquire),
+                           std::memory_order_release);
+  }
+  out->classes_ = classes_;
+  out->parents_ = parents_;
+  out->worklist_ = worklist_;
+  out->hashcons_ = hashcons_;
+  // parallel_ already set by ctor.
+  return out;
+}
+
 // ---- canonicalize ---------------------------------------------------------
 
 ENode EGraph::canonicalize(const ENode& node) {

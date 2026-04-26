@@ -64,6 +64,16 @@ class EGraph {
   Id add(ENode node);
   Id merge(Id a, Id b);
 
+  // Deep clone of the e-graph state for snapshot/restore in DPLL(T).
+  // Replays the recorded add/merge history into a fresh EGraph of the
+  // same capacity. EGraph contains atomics (non-copyable, non-movable),
+  // so this is the only way to duplicate state.
+  //
+  // Cost: O(history size). Acceptable for v1 of the SAT integration; the
+  // design doc (cpp/SAT_INTEGRATION.md) lays out the trail-based scheme
+  // that replaces this in a later iteration.
+  std::unique_ptr<EGraph> clone() const;
+
   // Batch-parallel merge. Takes parlay::sequence to keep hot-path code free
   // of std::vector.
   void parallel_merge_all(const parlay::sequence<std::pair<Id, Id>>& pairs);

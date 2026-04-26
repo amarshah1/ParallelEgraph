@@ -46,6 +46,12 @@ class ConcurrentUnionFind {
   void union_(Id u, Id v);
   bool same_set(Id u, Id v);
 
+  // Copy raw atomic state from `other`. Called by EGraph::clone() to
+  // duplicate an in-flight union-find. Both UFs must have the same
+  // capacity; only `size_` slots are copied. NOT thread-safe — caller
+  // must ensure no concurrent CAS during the copy.
+  void copy_state_from(const ConcurrentUnionFind& other);
+
  private:
   // std::atomic<T> is non-movable. std::vector's size-constructor default-
   // constructs atomics in place — that works fine as long as we never grow

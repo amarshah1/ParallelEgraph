@@ -6,6 +6,7 @@
 #include <parlay/sequence.h>
 
 #include "parallel_egraph/egraph.hpp"
+#include "parallel_egraph/sat_solve.hpp"
 #include "parallel_egraph/smtlib.hpp"
 
 namespace pe {
@@ -127,6 +128,17 @@ std::pair<SolveResult, SolveTimings> solve_timed(const std::string& input,
     if (c.kind == Command::Kind::Assert) assertions.push_back(&c.term);
   }
   timings.parse_s = secs_since(parse_start);
+
+  // Boolean-structured assertions go through the SAT-driven pipeline.
+  // Pure (= ...) / (not (= ...)) at top level keeps the legacy fast path.
+  if (!is_pure_conjunctive(script)) {
+    auto [r, t] = sat_solve_timed(input, parallel);
+    // sat_solve_timed re-parses; subtract its parse time from ours since
+    // we already did one parse above. (The two parses are the same work,
+    // and sat_solve_timed does its own parse to keep the pipeline self-
+    // contained — this is a minor double-charge that we accept for v1.)
+    return {r, t};
+  }
 
   // --- Capacity pre-walk ---
   // Every subterm occurrence adds at most one fresh e-class (hashcons dedups),

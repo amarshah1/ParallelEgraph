@@ -87,6 +87,16 @@ void ConcurrentUnionFind::union_(Id u, Id v) {
   }
 }
 
+void ConcurrentUnionFind::copy_state_from(const ConcurrentUnionFind& other) {
+  assert(data_.size() == other.data_.size() &&
+         "copy_state_from: capacity mismatch");
+  size_ = other.size_;
+  for (std::size_t i = 0; i < size_; ++i) {
+    data_[i].store(other.data_[i].load(std::memory_order_acquire),
+                   std::memory_order_release);
+  }
+}
+
 bool ConcurrentUnionFind::same_set(Id u, Id v) {
   for (;;) {
     auto [u_root, _ru] = find(u);
