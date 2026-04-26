@@ -32,14 +32,21 @@ TIMING_RE = re.compile(
 
 
 def build_our_solver(release: bool) -> str:
-    """Build our solver and return the binary path."""
-    cmd = ["cargo", "build"]
-    if release:
-        cmd.append("--release")
+    """Build the C++ solver via CMake and return the binary path."""
+    build_dir = os.path.join("cpp", "build")
+    if not os.path.isdir(build_dir):
+        build_type = "Release" if release else "Debug"
+        print(f"Configuring CMake ({build_type})...", flush=True)
+        subprocess.run(
+            ["cmake", "-B", build_dir, "-S", "cpp", f"-DCMAKE_BUILD_TYPE={build_type}"],
+            check=True, capture_output=True,
+        )
     print("Building solver...", flush=True)
-    subprocess.run(cmd, check=True, capture_output=True)
-    profile = "release" if release else "debug"
-    return os.path.join("target", profile, "parallel-egraph")
+    subprocess.run(
+        ["cmake", "--build", build_dir, "-j"],
+        check=True, capture_output=True,
+    )
+    return os.path.join(build_dir, "parallel-egraph")
 
 
 def parse_timing_line(stderr: str) -> dict | None:
