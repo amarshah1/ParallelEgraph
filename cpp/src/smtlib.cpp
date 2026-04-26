@@ -89,6 +89,24 @@ class Parser {
   }
 
  private:
+  // Lexical scope stack for `let`. Each frame is a single let's bindings;
+  // a Const atom is resolved by walking the stack top-down.
+  std::vector<std::vector<std::pair<std::string, Term>>> let_scopes_;
+
+  // Look up a name in the current scope chain. Returns a copy of the bound
+  // term if found, else nullopt.
+  std::optional<Term> resolve_let(const std::string& name) {
+    for (auto it = let_scopes_.rbegin(); it != let_scopes_.rend(); ++it) {
+      for (const auto& kv : *it) {
+        if (kv.first == name) return kv.second;
+      }
+    }
+    return std::nullopt;
+  }
+
+ public:
+
+ private:
   void advance() { cur_ = lexer_.next(); }
 
   [[noreturn]] void error(const std::string& msg) {
@@ -177,10 +195,14 @@ class Parser {
   Term parse_term() {
     if (cur_.kind == Token::Kind::Atom) {
       Term t;
-      // Recognize the Boolean literals; everything else is a Const.
+      // Recognize the Boolean literals; everything else is a Const,
+      // unless it's bound by an enclosing `let` — in which case we
+      // substitute the bound term in place.
       if (cur_.text == "true")       t.kind = Term::Kind::True;
       else if (cur_.text == "false") t.kind = Term::Kind::False;
-      else {
+      else if (auto bound = resolve_let(cur_.text); bound.has_value()) {
+        t = std::move(*bound);
+      } else {
         t.kind = Term::Kind::Const;
         t.op = cur_.text;
       }
@@ -190,7 +212,28 @@ class Parser {
     expect(Token::Kind::LParen, "'(' at term start");
     std::string head = expect_atom("term head");
     Term t;
-    if (head == "=") {
+    if (head == "let") {
+      // (let ((x1 e1) (x2 e2) ...) body)
+      // SMT-LIB `let` is parallel: each ei is parsed in the *outer*
+      // scope, then all bindings are pushed as one frame for the body.
+      expect(Token::Kind::LParen, "'(' for let binding list");
+      std::vector<std::pair<std::string, Term>> frame;
+      while (cur_.kind != Token::Kind::RParen) {
+        if (cur_.kind == Token::Kind::End) error("unterminated let bindings");
+        expect(Token::Kind::LParen, "'(' for binding");
+        std::string name = expect_atom("binding name");
+        Term value = parse_term();   // outer scope (frame not yet pushed)
+        expect(Token::Kind::RParen, "')' closing binding");
+        frame.emplace_back(std::move(name), std::move(value));
+      }
+      expect(Token::Kind::RParen, "')' closing binding list");
+      let_scopes_.push_back(std::move(frame));
+      Term body = parse_term();
+      let_scopes_.pop_back();
+      // Closing ')' of (let ...) is consumed below by the shared
+      // expect at the bottom of parse_term.
+      t = std::move(body);
+    } else if (head == "=") {
       t.kind = Term::Kind::Eq;
       // SMT-LIB allows n-ary =, but for QF_UF we only need binary. If we
       // ever see n>2 we left-fold into pairwise equalities under and.
@@ -281,15 +324,31 @@ Script parse_smtlib(const std::string& input) {
 
 namespace {
 
+// Returns true iff `t` is a pure UF term: only Const and App, no Boolean
+// kinds, no Eq, no Ite, etc. The legacy fast path requires this — its
+// add_term() asserts on anything else.
+bool is_pure_uf(const Term& t) {
+  if (t.kind == Term::Kind::Const) return true;
+  if (t.kind == Term::Kind::App) {
+    for (const auto& a : t.args) if (!is_pure_uf(a)) return false;
+    return true;
+  }
+  return false;
+}
+
 // True if the term tree is "(= a b)" or "(not (= a b))" with no inner
-// Boolean structure beyond that. Anything else (and / or / nested =, etc.)
-// returns false.
+// Boolean structure beyond that. Anything else (and / or / nested =, ite
+// inside an arg, etc.) returns false.
 bool is_pure_assertion(const Term& t) {
   if (t.kind == Term::Kind::Eq) {
-    return true;  // we allow UF terms as args; UF App's are fine
+    if (t.args.size() != 2) return false;
+    return is_pure_uf(t.args[0]) && is_pure_uf(t.args[1]);
   }
   if (t.kind == Term::Kind::Not && t.args.size() == 1 &&
-      t.args[0].kind == Term::Kind::Eq) {
+      t.args[0].kind == Term::Kind::Eq &&
+      t.args[0].args.size() == 2 &&
+      is_pure_uf(t.args[0].args[0]) &&
+      is_pure_uf(t.args[0].args[1])) {
     return true;
   }
   return false;

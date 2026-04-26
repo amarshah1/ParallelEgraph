@@ -129,3 +129,13 @@ target_compile_definitions(parallel_close_test PRIVATE
   SYNTHETIC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../synthetic_benchmarks"
 )
 add_test(NAME parallel_close COMMAND parallel_close_test)
+
+# Boolean-fragment regression: SAT-driven pipeline (CaDiCaL + UfPropagator).
+# One .smt2 per connective (or, and, =>, xor, ite (Bool), ite (UF), ite (UF
+# inside App), distinct) with matched _sat / _unsat cases.
+add_executable(bool_regression_test tests/bool_regression_test.cpp)
+target_link_libraries(bool_regression_test PRIVATE parallel_egraph_core)
+target_compile_definitions(bool_regression_test PRIVATE
+  BOOL_TESTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/bool"
+)
+add_test(NAME bool_regression COMMAND bool_regression_test)

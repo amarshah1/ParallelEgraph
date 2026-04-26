@@ -148,6 +148,279 @@ std::size_t count_subterms_total(const Term& t) {
 }
 
 // ---------------------------------------------------------------------------
+// ITE lifting
+// ---------------------------------------------------------------------------
+// QF_UF allows `(ite c x y)` to return a UF-sorted value, e.g.
+//
+//   (= u (ite (= a b) v w))
+//
+// The encoder only handles Bool-typed ite (Tseitin gates over Bool literals).
+// We preprocess by rewriting every assertion so that ite never appears as a
+// UF subterm — only at Boolean position. The transformation, applied
+// recursively to any UF subterm e:
+//
+//   if e = (ite c x y), where c is Bool and x,y are UF, and e occurs as a
+//   direct child of a UF-position (an = or App argument, or a child of
+//   another UF App), then "lift" the ite up one level so the parent
+//   becomes a Boolean ite.
+//
+// We fold lifting into a single recursive walk: lift_ites_in_uf returns a
+// pair (rewritten UF term with no top-level ite, plus a list of "guard
+// clauses" that must hold for the rewrite to be sound). For an Eq parent,
+// we fold the guards into a top-level (and ...). For a UF App parent, we
+// propagate the guards upward (the App becomes a guarded if/else over its
+// child's possible values).
+//
+// In practice, the only place ite appears in real benchmarks is at top of
+// an = arg, so the recursion stays shallow. The general implementation
+// below is correct even when ite appears nested deeply inside an App.
+
+namespace ite_lift {
+
+// Build helpers for constructing terms inline.
+Term mk_eq(Term a, Term b) {
+  Term t; t.kind = Term::Kind::Eq;
+  t.args.push_back(std::move(a)); t.args.push_back(std::move(b));
+  return t;
+}
+Term mk_not(Term a) {
+  Term t; t.kind = Term::Kind::Not; t.args.push_back(std::move(a));
+  return t;
+}
+Term mk_and(std::vector<Term> args) {
+  Term t; t.kind = Term::Kind::And; t.args = std::move(args);
+  return t;
+}
+Term mk_or(std::vector<Term> args) {
+  Term t; t.kind = Term::Kind::Or; t.args = std::move(args);
+  return t;
+}
+Term mk_ite(Term c, Term a, Term b) {
+  Term t; t.kind = Term::Kind::Ite;
+  t.args.push_back(std::move(c));
+  t.args.push_back(std::move(a));
+  t.args.push_back(std::move(b));
+  return t;
+}
+
+// Given a UF subterm that may contain ites, return an equivalent
+// representation as a list of (guard, value) pairs. The semantics: the term
+// equals `value_i` whenever `guard_i` is true; the guards are mutually
+// exclusive and exhaustive. For an ite-free term, the result is a single
+// pair (true, term).
+struct GuardedValue {
+  std::vector<Term> guards;  // each entry = a Boolean term (guard); empty = trivially true
+  std::vector<Term> values;  // matching UF terms, no ite at top
+};
+
+GuardedValue split_uf(const Term& t);
+
+// Compose two guards via logical and. Empty guard = true.
+Term and_guards(const std::vector<Term>& gs) {
+  std::vector<Term> nonempty;
+  for (const auto& g : gs) {
+    if (!(g.kind == Term::Kind::True)) nonempty.push_back(g);
+  }
+  if (nonempty.empty()) {
+    Term t; t.kind = Term::Kind::True; return t;
+  }
+  if (nonempty.size() == 1) return nonempty[0];
+  return mk_and(std::move(nonempty));
+}
+
+GuardedValue split_uf(const Term& t) {
+  // Bottom of recursion: leaves and ite-free Apps.
+  if (t.kind == Term::Kind::Const) {
+    GuardedValue gv;
+    Term tt; tt.kind = Term::Kind::True;
+    gv.guards.push_back(tt);
+    gv.values.push_back(t);
+    return gv;
+  }
+
+  if (t.kind == Term::Kind::Ite) {
+    // (ite c x y): split x and y, prepend c / ¬c to each branch's guards.
+    // c is a Bool — process via splits-on-bool below by lifting into Bool.
+    GuardedValue gx = split_uf(t.args[1]);
+    GuardedValue gy = split_uf(t.args[2]);
+    GuardedValue out;
+    for (std::size_t i = 0; i < gx.guards.size(); ++i) {
+      out.guards.push_back(mk_and({t.args[0], gx.guards[i]}));
+      out.values.push_back(std::move(gx.values[i]));
+    }
+    for (std::size_t i = 0; i < gy.guards.size(); ++i) {
+      out.guards.push_back(mk_and({mk_not(t.args[0]), gy.guards[i]}));
+      out.values.push_back(std::move(gy.values[i]));
+    }
+    return out;
+  }
+
+  if (t.kind == Term::Kind::App) {
+    // For an App f(x1, ..., xk), split each xi. Cartesian product across
+    // children: each combination gives one (guard, app) pair.
+    std::vector<GuardedValue> child_splits;
+    child_splits.reserve(t.args.size());
+    bool any_ite = false;
+    for (const auto& a : t.args) {
+      child_splits.push_back(split_uf(a));
+      if (child_splits.back().values.size() > 1) any_ite = true;
+    }
+    if (!any_ite) {
+      // No ites anywhere below; return as-is with a trivially-true guard.
+      GuardedValue gv;
+      Term tt; tt.kind = Term::Kind::True;
+      gv.guards.push_back(tt);
+      gv.values.push_back(t);
+      return gv;
+    }
+    // Cartesian-product expansion.
+    GuardedValue out;
+    std::vector<std::size_t> idx(t.args.size(), 0);
+    while (true) {
+      // Build app from current idx tuple.
+      std::vector<Term> branch_guards;
+      Term app; app.kind = Term::Kind::App; app.op = t.op;
+      for (std::size_t i = 0; i < t.args.size(); ++i) {
+        branch_guards.push_back(child_splits[i].guards[idx[i]]);
+        app.args.push_back(child_splits[i].values[idx[i]]);
+      }
+      out.guards.push_back(and_guards(branch_guards));
+      out.values.push_back(std::move(app));
+      // Increment idx (mixed-radix odometer).
+      std::size_t k = t.args.size();
+      while (k > 0) {
+        --k;
+        if (++idx[k] < child_splits[k].values.size()) break;
+        idx[k] = 0;
+        if (k == 0) goto done;
+      }
+    }
+    done:;
+    return out;
+  }
+
+  // Eq / Bool kinds shouldn't appear inside a UF term — caller error.
+  // Just return as opaque.
+  GuardedValue gv;
+  Term tt; tt.kind = Term::Kind::True;
+  gv.guards.push_back(tt);
+  gv.values.push_back(t);
+  return gv;
+}
+
+// Lift ites in a Bool-typed term: walks Boolean structure, and for each
+// UF term it encounters at an Eq/Distinct arg, expands the ite-tree.
+Term lift_in_bool(const Term& t);
+
+// Build (or guards.size==1 ? guards[0] : (or guards...)) for a fan-out of
+// possibilities; the disjunction OR'd over (guard ∧ rewritten-eq-on-value).
+Term lift_eq_sides(const Term& lhs, const Term& rhs) {
+  GuardedValue lg = split_uf(lhs);
+  GuardedValue rg = split_uf(rhs);
+  if (lg.values.size() == 1 && rg.values.size() == 1) {
+    // Neither side has an ite — return plain (= lhs rhs).
+    return mk_eq(lg.values[0], rg.values[0]);
+  }
+  // The equality holds iff there exist (i, j) such that guard_l[i] ∧
+  // guard_r[j] ∧ (val_l[i] = val_r[j]).
+  std::vector<Term> disj;
+  for (std::size_t i = 0; i < lg.values.size(); ++i) {
+    for (std::size_t j = 0; j < rg.values.size(); ++j) {
+      Term conj = mk_and({lg.guards[i], rg.guards[j],
+                          mk_eq(lg.values[i], rg.values[j])});
+      disj.push_back(std::move(conj));
+    }
+  }
+  if (disj.size() == 1) return disj[0];
+  return mk_or(std::move(disj));
+}
+
+Term lift_in_bool(const Term& t) {
+  switch (t.kind) {
+    case Term::Kind::True:
+    case Term::Kind::False:
+    case Term::Kind::Const:
+      return t;
+    case Term::Kind::Eq:
+      return lift_eq_sides(t.args[0], t.args[1]);
+    case Term::Kind::Distinct: {
+      // (distinct x1 ... xk) lifts to ∧_{i<j} ¬(lift_eq xi xj).
+      std::vector<Term> conjs;
+      for (std::size_t i = 0; i < t.args.size(); ++i) {
+        for (std::size_t j = i + 1; j < t.args.size(); ++j) {
+          conjs.push_back(mk_not(lift_eq_sides(t.args[i], t.args[j])));
+        }
+      }
+      if (conjs.size() == 1) return conjs[0];
+      return mk_and(std::move(conjs));
+    }
+    case Term::Kind::Not: {
+      Term out; out.kind = Term::Kind::Not;
+      out.args.push_back(lift_in_bool(t.args[0]));
+      return out;
+    }
+    case Term::Kind::Ite: {
+      // Bool-typed ite: lift each branch.
+      Term out; out.kind = Term::Kind::Ite;
+      for (const auto& a : t.args) out.args.push_back(lift_in_bool(a));
+      return out;
+    }
+    case Term::Kind::And:
+    case Term::Kind::Or:
+    case Term::Kind::Implies:
+    case Term::Kind::Xor: {
+      Term out; out.kind = t.kind; out.op = t.op;
+      for (const auto& a : t.args) out.args.push_back(lift_in_bool(a));
+      return out;
+    }
+    case Term::Kind::App:
+      // A Bool-typed UF predicate. Lift its UF args.
+      // Same Cartesian split as above, but we OR the disjunction of
+      // (guard ∧ predicate-on-value).
+      {
+        std::vector<GuardedValue> child_splits;
+        child_splits.reserve(t.args.size());
+        bool any_ite = false;
+        for (const auto& a : t.args) {
+          child_splits.push_back(split_uf(a));
+          if (child_splits.back().values.size() > 1) any_ite = true;
+        }
+        if (!any_ite) return t;
+        std::vector<Term> disj;
+        std::vector<std::size_t> idx(t.args.size(), 0);
+        while (true) {
+          std::vector<Term> guards;
+          Term pred; pred.kind = Term::Kind::App; pred.op = t.op;
+          for (std::size_t i = 0; i < t.args.size(); ++i) {
+            guards.push_back(child_splits[i].guards[idx[i]]);
+            pred.args.push_back(child_splits[i].values[idx[i]]);
+          }
+          disj.push_back(mk_and({and_guards(guards), pred}));
+          std::size_t k = t.args.size();
+          while (k > 0) {
+            --k;
+            if (++idx[k] < child_splits[k].values.size()) break;
+            idx[k] = 0;
+            if (k == 0) goto done2;
+          }
+        }
+        done2:;
+        if (disj.size() == 1) return disj[0];
+        return mk_or(std::move(disj));
+      }
+  }
+  return t;
+}
+
+}  // namespace ite_lift
+
+// Public entry point: rewrite an assertion so that no UF term contains an
+// ite at any depth. The encoder receives ite only in pure-Bool position.
+Term lift_ites(const Term& t) {
+  return ite_lift::lift_in_bool(t);
+}
+
+// ---------------------------------------------------------------------------
 // Encoder: builds CNF from the assertion list. Allocates a CaDiCaL var for
 // each distinct theory atom and for each Tseitin aux gate.
 // ---------------------------------------------------------------------------
@@ -564,23 +837,30 @@ std::pair<SolveResult, SolveTimings> sat_solve_timed(const std::string& input,
   }
   timings.parse_s = secs_since(parse_start);
 
+  // ---- ITE lifting ----
+  // Rewrite each assertion so that ite never returns a UF-sorted value.
+  // This is a no-op for assertions whose only ites are Bool-typed.
+  auto build_start = clk::now();
+  std::vector<Term> lifted;
+  lifted.reserve(assertions.size());
+  for (const Term* t : assertions) lifted.push_back(lift_ites(*t));
+
   // ---- Build EGraph ----
-  // Capacity: every subterm could become an e-class. Sum across all
-  // assertions for a safe upper bound.
+  // Capacity: every subterm could become an e-class. Sum across the
+  // *lifted* assertions for a safe upper bound (lifting can fan out).
   std::size_t capacity = 0;
-  for (const Term* t : assertions) capacity += count_subterms_total(*t);
+  for (const Term& t : lifted) capacity += count_subterms_total(t);
   if (capacity == 0) capacity = 1;
   auto eg = std::make_unique<EGraph>(capacity, parallel);
 
-  auto build_start = clk::now();
   // Preflight: walk each assertion and add every UF subterm to the e-graph.
   // This guarantees that by the time the encoder runs, every endpoint of
   // every (= ti tj) atom already has a stable e-class id.
-  for (const Term* t : assertions) preflight_add_uf(*eg, *t);
+  for (const Term& t : lifted) preflight_add_uf(*eg, t);
 
   // ---- Encode CNF ----
   Encoder enc(*eg);
-  for (const Term* t : assertions) enc.encode_assertion(*t);
+  for (const Term& t : lifted) enc.encode_assertion(t);
   timings.build_s = secs_since(build_start);
 
   // ---- Hand to CaDiCaL ----

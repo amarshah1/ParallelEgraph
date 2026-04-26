@@ -1,0 +1,7 @@
+(set-logic QF_UF)
+(declare-sort U 0)
+(declare-const a U) (declare-const b U) (declare-const u U) (declare-const v U) (declare-const w U)
+(assert (= u (ite (= a b) v w)))
+(assert (not (= a b)))
+(assert (not (= u v)))
+(check-sat)
