@@ -685,8 +685,9 @@ class UfPropagator : public CaDiCaL::ExternalPropagator {
         parallel_(parallel) {
     debug_ = std::getenv("PE_PROP_DEBUG") != nullptr;
     trace_ = std::getenv("PE_PROP_TRACE") != nullptr;
-    // Snapshot at level 0 is the propagator's "ground state" — what we
-    // restore to whenever CaDiCaL backtracks all the way out.
+    // The level-0 entry is always a real snapshot (the ground state). We
+    // need it as the fallback target for backtracks all the way out and
+    // as the seed value when restoring a higher level's nullptr entry.
     if (debug_) {
       auto t0 = std::chrono::steady_clock::now();
       snapshots_.push_back(current_->clone());
@@ -699,6 +700,7 @@ class UfPropagator : public CaDiCaL::ExternalPropagator {
     } else {
       snapshots_.push_back(current_->clone());
     }
+    dirty_ = false;
   }
 
   ~UfPropagator() {
@@ -742,6 +744,24 @@ class UfPropagator : public CaDiCaL::ExternalPropagator {
   void notify_new_decision_level() override {
     // CaDiCaL is about to make a new decision. Snapshot the e-graph as
     // it stands NOW so a future backtrack to this level can restore it.
+    //
+    // Optimization (dirty bit): if `current_` hasn't been mutated since
+    // the previous snapshot, we can push `nullptr` instead of cloning.
+    // On backtrack, a nullptr entry means "same state as the latest
+    // non-null snapshot below me," so the level-stack semantics are
+    // preserved without paying the per-decision clone cost.
+    if (!dirty_) {
+      // No theory atoms have been applied since the last snapshot —
+      // current_ is bitwise identical to the latest live snapshot.
+      snapshots_.push_back(nullptr);
+      if (debug_) decisions_++;
+      if (trace_)
+        std::fprintf(stderr,
+                     "[clone] (skip) decision  level=%zu  reuse\n",
+                     snapshots_.size() - 1);
+      return;
+    }
+    // current_ has been mutated since the last snapshot — must clone.
     if (debug_) {
       decisions_++;
       auto t0 = std::chrono::steady_clock::now();
@@ -757,35 +777,44 @@ class UfPropagator : public CaDiCaL::ExternalPropagator {
     } else {
       snapshots_.push_back(current_->clone());
     }
+    dirty_ = false;
   }
 
   void notify_backtrack(std::size_t level) override {
-    // CaDiCaL wants to be back at decision level `level`. Drop any
-    // higher-level snapshots and replace `current` with the saved one.
+    // CaDiCaL wants to be back at decision level `level`. Pop higher-
+    // level snapshots, then walk down to find the nearest non-null
+    // snapshot at or below `level` (entries may be nullptr if their
+    // level was entered without any theory mutation since the previous
+    // real snapshot). Clone that snapshot to seed current_.
+    std::size_t prev_level = snapshots_.size() - 1;
+    while (snapshots_.size() > level + 1) snapshots_.pop_back();
+    // Walk down to the nearest non-null entry. Level-0 is always a real
+    // snapshot, so this terminates.
+    std::size_t restore_idx = snapshots_.size() - 1;
+    while (restore_idx > 0 && snapshots_[restore_idx] == nullptr) {
+      --restore_idx;
+    }
+    auto& src = snapshots_[restore_idx];
     if (debug_) {
       backtracks_++;
-      std::size_t prev_level = snapshots_.size() - 1;
       auto t0 = std::chrono::steady_clock::now();
-      while (snapshots_.size() > level + 1) snapshots_.pop_back();
-      current_ = snapshots_.back()->clone();
+      current_ = src->clone();
       clone_calls_++;
-      while (diseq_levels_.size() > snapshots_.size() - 1) {
-        diseq_levels_.pop_back();
-      }
       double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
       clone_time_s_ += dt;
       if (trace_)
         std::fprintf(stderr,
-                     "[clone] #%llu backtrack %zu->%zu  %.3fms\n",
+                     "[clone] #%llu backtrack %zu->%zu (restore from %zu)  %.3fms\n",
                      (unsigned long long)clone_calls_, prev_level, level,
-                     dt * 1000.0);
+                     restore_idx, dt * 1000.0);
     } else {
-      while (snapshots_.size() > level + 1) snapshots_.pop_back();
-      current_ = snapshots_.back()->clone();
-      while (diseq_levels_.size() > snapshots_.size() - 1) {
-        diseq_levels_.pop_back();
-      }
+      current_ = src->clone();
     }
+    while (diseq_levels_.size() > snapshots_.size() - 1) {
+      diseq_levels_.pop_back();
+    }
+    // current_ now matches src exactly — no mutations since restoration.
+    dirty_ = false;
   }
 
   bool cb_check_found_model(const std::vector<int>& model) override {
@@ -808,37 +837,58 @@ class UfPropagator : public CaDiCaL::ExternalPropagator {
                      "[clone] #%llu check_model  %.3fms\n",
                      (unsigned long long)clone_calls_, dt * 1000.0);
     }
-    std::vector<std::pair<Id, Id>> pos_eqs;
-    std::vector<std::pair<Id, Id>> neg_eqs;
+    // Bucket the model into theory atoms with their (a, b) endpoints,
+    // *keeping the literal* so we can build a minimal conflict clause
+    // pointing back at the actual SAT vars.
+    struct EqLit  { int lit; Id a; Id b; };
+    struct DiseqLit { int lit; Id a; Id b; };
+    std::vector<EqLit>    pos_eqs;
+    std::vector<DiseqLit> neg_eqs;
     for (int lit : model) {
       int v = std::abs(lit);
       auto it = atom_endpoints_.find(v);
       if (it == atom_endpoints_.end()) continue;
       Id a = it->second.first, b = it->second.second;
-      if (lit > 0) pos_eqs.emplace_back(a, b);
-      else         neg_eqs.emplace_back(a, b);
+      if (lit > 0) pos_eqs.push_back({lit, a, b});
+      else         neg_eqs.push_back({lit, a, b});
     }
-    for (auto& [a, b] : pos_eqs) check_eg->merge(a, b);
+    for (auto& e : pos_eqs) check_eg->merge(e.a, e.b);
     auto t_rb = debug_ ? clk::now() : clk::time_point{};
     if (parallel_) check_eg->parallel_rebuild();
     else           check_eg->rebuild();
     if (debug_) rebuild_time_s_ += std::chrono::duration<double>(clk::now() - t_rb).count();
     bool ok = true;
-    for (auto& [a, b] : neg_eqs) {
-      if (check_eg->equiv(a, b)) {
-        conflict_clause_.clear();
-        for (int lit : model) {
-          int v = std::abs(lit);
-          if (atom_endpoints_.find(v) != atom_endpoints_.end()) {
-            conflict_clause_.push_back(-lit);
-          }
-        }
-        conflict_clause_.push_back(0);
-        conflict_pending_ = true;
-        if (debug_) conflicts_emitted_++;
-        ok = false;
-        break;
+    for (auto& d : neg_eqs) {
+      if (!check_eg->equiv(d.a, d.b)) continue;
+      // ----------------------------------------------------------------
+      // Theory conflict on disequality literal `d`. Build a minimal-ish
+      // conflict clause via *prefix replay*: starting from the level-0
+      // snapshot (which contains every UF subterm as a singleton class),
+      // re-apply the model's positive equality literals one by one.
+      // After each merge, run sequential rebuild and test whether
+      // find(d.a) == find(d.b). The first prefix that triggers
+      // congruence is the core; the conflict clause is
+      //     [¬d.lit, ¬e.lit for e in prefix].
+      // This is a sound (not minimum) explanation. Any smaller
+      // unsatisfiable core would also work; this is what cvc5 calls
+      // a "naïve but small" explanation, and is dramatically smaller
+      // than the previous implementation, which negated the *entire*
+      // theory-atom assignment.
+      // ----------------------------------------------------------------
+      auto explain_eg = snapshots_[0]->clone();  // ground state, no merges
+      conflict_clause_.clear();
+      conflict_clause_.push_back(-d.lit);
+      for (const auto& e : pos_eqs) {
+        explain_eg->merge(e.a, e.b);
+        explain_eg->rebuild();           // sequential rebuild — tiny per call
+        conflict_clause_.push_back(-e.lit);
+        if (explain_eg->equiv(d.a, d.b)) break;
       }
+      conflict_clause_.push_back(0);
+      conflict_pending_ = true;
+      if (debug_) conflicts_emitted_++;
+      ok = false;
+      break;
     }
     if (debug_) model_check_time_s_ += std::chrono::duration<double>(clk::now() - t0).count();
     return ok;
@@ -880,10 +930,13 @@ class UfPropagator : public CaDiCaL::ExternalPropagator {
     if (it == atom_endpoints_.end()) return;  // aux Tseitin var
     Id a = it->second.first, b = it->second.second;
     if (lit > 0) {
-      // Asserted equality: fold it into the current e-graph.
+      // Asserted equality: fold it into the current e-graph. Mark dirty
+      // so the next decision-level snapshot is taken for real.
       current_->merge(a, b);
+      dirty_ = true;
     } else {
       // Asserted disequality: stash for the final consistency check.
+      // Doesn't mutate current_, so dirty_ stays as is.
       while (diseq_levels_.size() < snapshots_.size()) {
         diseq_levels_.emplace_back();
       }
@@ -892,7 +945,16 @@ class UfPropagator : public CaDiCaL::ExternalPropagator {
   }
 
   std::unique_ptr<EGraph> current_;
+  // snapshots_[L] is either an owned EGraph snapshot taken at the start
+  // of decision level L, or nullptr meaning "current_ was bit-identical
+  // to the latest non-null snapshot below L when we entered L." On
+  // backtrack to level L we walk down to the nearest non-null entry
+  // and restore current_ from a clone of it.
   std::vector<std::unique_ptr<EGraph>> snapshots_;
+  // Dirty flag: true iff current_ has been mutated (a theory atom was
+  // applied) since the most recent snapshot was taken. Cleared on
+  // every snapshot push and on every backtrack-restore.
+  bool dirty_ = false;
   std::vector<std::vector<std::pair<Id, Id>>> diseq_levels_;
   std::unordered_map<int, std::pair<Id, Id>> atom_endpoints_;
   bool parallel_;
