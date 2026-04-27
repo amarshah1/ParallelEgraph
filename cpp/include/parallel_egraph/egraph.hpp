@@ -64,59 +64,6 @@ class EGraph {
   Id add(ENode node);
   Id merge(Id a, Id b);
 
-  // ---- Explanations via adjacency log ------------------------------------
-  // Opt-in proof-tracking: enable via `merge_with_reason` instead of
-  // `merge`. The default code path (merge / rebuild / parallel_rebuild)
-  // is unchanged and pays zero cost.
-  //
-  // ProofReason records why two classes were merged. Two kinds:
-  //   Asserted   — came from a SAT-side literal (`sat_lit`).
-  //   Congruence — produced by rebuild_with_reasons because two e-nodes
-  //                f(c1..ck) and f(c'1..c'k) had pairwise-congruent
-  //                children. The reason stores the *raw* child class
-  //                ids (NOT canonicalized — explain() does the
-  //                find()s itself), so explain() can recurse with
-  //                explain(children_a[i], children_b[i]) for each i.
-  struct ProofReason {
-    enum class Kind : std::uint8_t { Asserted = 1, Congruence = 2 };
-    Kind kind = Kind::Asserted;
-    int sat_lit = 0;                       // when kind == Asserted
-    std::vector<Id> children_a;            // when kind == Congruence
-    std::vector<Id> children_b;            // when kind == Congruence
-    static ProofReason asserted(int lit) {
-      ProofReason r; r.kind = Kind::Asserted; r.sat_lit = lit; return r;
-    }
-    static ProofReason congruence(std::vector<Id> ca, std::vector<Id> cb) {
-      ProofReason r; r.kind = Kind::Congruence;
-      r.children_a = std::move(ca);
-      r.children_b = std::move(cb);
-      return r;
-    }
-  };
-
-  // Sequential-only: like merge(a, b) but records the merge in the
-  // append-only `merge_log_` and updates `explain_adj_`. Each merge is
-  // O(1) extra work; no path-flipping needed.
-  Id merge_with_reason(Id a, Id b, ProofReason r);
-
-  // Sequential rebuild that records congruence reasons via
-  // merge_with_reason as it discovers them. Pair with merge_with_reason
-  // for asserted equalities to get a complete proof log.
-  void rebuild_with_reasons();
-
-  // Returns a small set of SAT literals whose conjunction forces a == b.
-  // Algorithm:
-  //   1. BFS over the adjacency log from `a` until reaching `b`.
-  //   2. Recursively expand each Congruence reason on the path into
-  //      proofs of its children's equalities.
-  //   3. Deduplicate the resulting flat list of asserted reasons by
-  //      replaying them through a fresh union-find: keep a reason iff
-  //      its two endpoints are not yet equivalent. The kept set is a
-  //      spanning forest of the conflict's relevant component.
-  // Precondition: a and b are in the same e-class. Output may be empty
-  // if a == b.
-  std::vector<int> explain(Id a, Id b);
-
   // Deep clone of the e-graph state for snapshot/restore in DPLL(T).
   // Replays the recorded add/merge history into a fresh EGraph of the
   // same capacity. EGraph contains atomics (non-copyable, non-movable),
@@ -182,21 +129,6 @@ class EGraph {
 
   // Shared: hashcons for dedup during add(). Sequential-only access.
   std::unordered_map<ENode, Id, ENodeHash> hashcons_;
-
-  // ---- Explanation log (adjacency-based) ---------------------------------
-  // Append-only log of merges. Populated by merge_with_reason; untouched
-  // by the existing default merge / rebuild / parallel_rebuild paths.
-  struct MergeEvent {
-    Id           a, b;        // class ids at time of merge (pre-find)
-    ProofReason  reason;
-  };
-  std::vector<MergeEvent> merge_log_;
-
-  // Per-class adjacency for explain BFS. explain_adj_[c] is a list of
-  // (neighbor class id, log event index) pairs. Maintained incrementally
-  // by merge_with_reason: each merge appends to the two endpoints.
-  // Sized lazily via add() (resized on each make_id).
-  std::vector<std::vector<std::pair<Id, std::uint32_t>>> explain_adj_;
 
   bool parallel_;
 };

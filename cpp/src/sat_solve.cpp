@@ -675,171 +675,110 @@ class Encoder {
 // ---------------------------------------------------------------------------
 // UfPropagator — IPASIR-UP wrapper around EGraph with snapshot stack.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// UfPropagator (deferred-merge architecture).
+//
+// We *defer* all e-graph mutation to cb_check_found_model. During search,
+// notify_assignment merely stashes (lit, a, b, is_eq) tuples into a
+// per-decision-level trail. notify_new_decision_level pushes a new empty
+// trail level; notify_backtrack truncates the trail. There is NO clone,
+// NO merge, NO rebuild on the search hot path.
+//
+// At cb_check_found_model time, we:
+//   1. Clone the immutable `ground_` e-graph.
+//   2. Flatten the trail into (positive eqs) and (negative eqs).
+//   3. parallel_merge_all on positive eqs (fully parallel).
+//   4. parallel_rebuild (fully parallel) — or rebuild_with_reasons in
+//      proof mode (sequential).
+//   5. Scan negative eqs for conflict; if found, build conflict clause
+//      via explain (proof mode) or prefix replay (default mode).
+//
+// This architecture means:
+//   - Zero clone overhead per decision/backtrack.
+//   - parallel_merge_all is actually exercised (Path A used to be the
+//     only place it ran; now Path B uses it too).
+//   - parallel_rebuild runs once per model check on the full assignment.
+//   - Snapshot/restore of the e-graph is unnecessary because the e-graph
+//     is never mutated during search.
+// ---------------------------------------------------------------------------
 class UfPropagator : public CaDiCaL::ExternalPropagator {
  public:
   UfPropagator(std::unique_ptr<EGraph> root_eg,
                std::unordered_map<int, std::pair<Id, Id>> atoms,
                bool parallel)
-      : current_(std::move(root_eg)),
+      : ground_(std::move(root_eg)),
         atom_endpoints_(std::move(atoms)),
         parallel_(parallel) {
     debug_ = std::getenv("PE_PROP_DEBUG") != nullptr;
     trace_ = std::getenv("PE_PROP_TRACE") != nullptr;
-    {
-      const char* mode = std::getenv("PE_EXPLAIN");
-      use_proof_explain_ = mode != nullptr && std::string(mode) == "proof";
-    }
-    // The level-0 entry is always a real snapshot (the ground state). We
-    // need it as the fallback target for backtracks all the way out and
-    // as the seed value when restoring a higher level's nullptr entry.
-    if (debug_) {
-      auto t0 = std::chrono::steady_clock::now();
-      snapshots_.push_back(current_->clone());
-      clone_calls_++;
-      double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-      clone_time_s_ += dt;
-      if (trace_)
-        std::fprintf(stderr, "[clone] #%llu init/level0 %.3fms\n",
-                     (unsigned long long)clone_calls_, dt * 1000.0);
-    } else {
-      snapshots_.push_back(current_->clone());
-    }
-    dirty_ = false;
+    lit_levels_.emplace_back();  // level 0 trail
   }
 
-  ~UfPropagator() {
+  ~UfPropagator() override {
     if (debug_) {
       std::fprintf(stderr,
-                   "UfPropagator stats: clones=%llu  clone_s=%.3f  "
-                   "model_checks=%llu  model_check_s=%.3f  "
+                   "UfPropagator stats: model_checks=%llu  model_check_s=%.3f  "
                    "decisions=%llu  backtracks=%llu  "
                    "notify_lits=%llu  conflicts=%llu  "
-                   "merge_s=%.3f  rebuild_s=%.3f\n",
-                   (unsigned long long)clone_calls_,
-                   clone_time_s_,
+                   "clone_s=%.3f  merge_s=%.3f  rebuild_s=%.3f\n",
                    (unsigned long long)model_checks_,
                    model_check_time_s_,
                    (unsigned long long)decisions_,
                    (unsigned long long)backtracks_,
                    (unsigned long long)notify_lits_,
                    (unsigned long long)conflicts_emitted_,
-                   merge_time_s_, rebuild_time_s_);
+                   clone_time_s_, merge_time_s_, rebuild_time_s_);
     }
   }
 
-  // CaDiCaL pushes a vector of newly-true literals (positive = atom asserted,
-  // negative = atom negated).  We translate theory atoms into either
-  // merges or pending disequality observations at the current level.
+  // CaDiCaL pushes a vector of newly-true literals. We just stash theory
+  // atoms onto the current decision level's trail — no e-graph mutation
+  // here. All real work happens in cb_check_found_model.
   void notify_assignment(const std::vector<int>& lits) override {
-    if (debug_) {
-      notify_lits_ += lits.size();
-      auto t0 = std::chrono::steady_clock::now();
-      for (int lit : lits) apply_lit(lit);
-      merge_time_s_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    } else {
-      for (int lit : lits) apply_lit(lit);
+    if (debug_) notify_lits_ += lits.size();
+    auto& cur_trail = lit_levels_.back();
+    for (int lit : lits) {
+      int v = std::abs(lit);
+      auto it = atom_endpoints_.find(v);
+      if (it == atom_endpoints_.end()) continue;  // aux Tseitin var
+      cur_trail.push_back({lit, it->second.first, it->second.second});
     }
   }
-
-  // (We don't override notify_fixed_assignment in v1: that listener is on a
-  // separate FixedAssignmentListener interface and is an optimization. Fixed
-  // assignments still arrive via notify_assignment in batch form.)
 
   void notify_new_decision_level() override {
-    // CaDiCaL is about to make a new decision. Snapshot the e-graph as
-    // it stands NOW so a future backtrack to this level can restore it.
-    //
-    // Optimization (dirty bit): if `current_` hasn't been mutated since
-    // the previous snapshot, we can push `nullptr` instead of cloning.
-    // On backtrack, a nullptr entry means "same state as the latest
-    // non-null snapshot below me," so the level-stack semantics are
-    // preserved without paying the per-decision clone cost.
-    if (!dirty_) {
-      // No theory atoms have been applied since the last snapshot —
-      // current_ is bitwise identical to the latest live snapshot.
-      snapshots_.push_back(nullptr);
-      if (debug_) decisions_++;
-      if (trace_)
-        std::fprintf(stderr,
-                     "[clone] (skip) decision  level=%zu  reuse\n",
-                     snapshots_.size() - 1);
-      return;
-    }
-    // current_ has been mutated since the last snapshot — must clone.
-    if (debug_) {
-      decisions_++;
-      auto t0 = std::chrono::steady_clock::now();
-      snapshots_.push_back(current_->clone());
-      clone_calls_++;
-      double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-      clone_time_s_ += dt;
-      if (trace_)
-        std::fprintf(stderr,
-                     "[clone] #%llu decision  level=%zu  %.3fms\n",
-                     (unsigned long long)clone_calls_,
-                     snapshots_.size() - 1, dt * 1000.0);
-    } else {
-      snapshots_.push_back(current_->clone());
-    }
-    dirty_ = false;
+    if (debug_) decisions_++;
+    lit_levels_.emplace_back();
   }
 
   void notify_backtrack(std::size_t level) override {
-    // CaDiCaL wants to be back at decision level `level`. Pop higher-
-    // level snapshots, then walk down to find the nearest non-null
-    // snapshot at or below `level` (entries may be nullptr if their
-    // level was entered without any theory mutation since the previous
-    // real snapshot). Clone that snapshot to seed current_.
-    std::size_t prev_level = snapshots_.size() - 1;
-    while (snapshots_.size() > level + 1) snapshots_.pop_back();
-    // Walk down to the nearest non-null entry. Level-0 is always a real
-    // snapshot, so this terminates.
-    std::size_t restore_idx = snapshots_.size() - 1;
-    while (restore_idx > 0 && snapshots_[restore_idx] == nullptr) {
-      --restore_idx;
-    }
-    auto& src = snapshots_[restore_idx];
-    if (debug_) {
-      backtracks_++;
-      auto t0 = std::chrono::steady_clock::now();
-      current_ = src->clone();
-      clone_calls_++;
-      double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-      clone_time_s_ += dt;
-      if (trace_)
-        std::fprintf(stderr,
-                     "[clone] #%llu backtrack %zu->%zu (restore from %zu)  %.3fms\n",
-                     (unsigned long long)clone_calls_, prev_level, level,
-                     restore_idx, dt * 1000.0);
-    } else {
-      current_ = src->clone();
-    }
-    while (diseq_levels_.size() > snapshots_.size() - 1) {
-      diseq_levels_.pop_back();
-    }
-    // current_ now matches src exactly — no mutations since restoration.
-    dirty_ = false;
+    if (debug_) backtracks_++;
+    // Drop trail entries from levels above `level`.
+    if (lit_levels_.size() > level + 1) lit_levels_.resize(level + 1);
   }
 
   bool cb_check_found_model(const std::vector<int>& model) override {
-    // CaDiCaL has a complete assignment. We need to (a) close the e-graph
-    // under congruence, then (b) test each disequality for conflict.
-    //
-    // Two paths:
-    //   default        : clone current_, run rebuild on the clone (parallel
-    //                    or sequential), use prefix-replay for conflict cores.
-    //   PE_EXPLAIN=proof: rebuild current_ in place via rebuild_with_reasons
-    //                    (which logs congruences). On conflict, call
-    //                    current_->explain to get the asserted-lit core.
-    //                    No clone in this path.
     using clk = std::chrono::steady_clock;
     auto t0 = debug_ ? clk::now() : clk::time_point{};
+    if (debug_) model_checks_++;
 
-    // Bucket the model into theory atoms.
+    // ---- (1) Clone ground_ — the only clone in the search loop. ----------
+    auto t_clone = debug_ ? clk::now() : clk::time_point{};
+    auto eg = ground_->clone();
+    if (debug_) {
+      clone_time_s_ += std::chrono::duration<double>(clk::now() - t_clone).count();
+      if (trace_)
+        std::fprintf(stderr, "[clone] check_model  capacity=%zu\n",
+                     eg->uf().capacity());
+    }
+
+    // ---- (2) Flatten the trail. Use the model as ground truth: we want
+    // to handle late literals CaDiCaL hasn't notified us about (e.g. some
+    // fixed assignments at level 0 may bypass notify_assignment).
     struct EqLit  { int lit; Id a; Id b; };
     struct DiseqLit { int lit; Id a; Id b; };
     std::vector<EqLit>    pos_eqs;
     std::vector<DiseqLit> neg_eqs;
+    pos_eqs.reserve(model.size());
     for (int lit : model) {
       int v = std::abs(lit);
       auto it = atom_endpoints_.find(v);
@@ -849,57 +788,39 @@ class UfPropagator : public CaDiCaL::ExternalPropagator {
       else         neg_eqs.push_back({lit, a, b});
     }
 
-    // Pick the e-graph to operate on. Proof mode mutates current_
-    // directly (cheap); default mode operates on a clone (safe).
-    EGraph* eg = current_.get();
-    std::unique_ptr<EGraph> check_eg_holder;
-    if (!use_proof_explain_) {
-      auto t_clone = clk::now();
-      check_eg_holder = current_->clone();
-      eg = check_eg_holder.get();
-      if (debug_) {
-        clone_calls_++;
-        double dt = std::chrono::duration<double>(clk::now() - t_clone).count();
-        clone_time_s_ += dt;
-        if (trace_)
-          std::fprintf(stderr,
-                       "[clone] #%llu check_model  %.3fms\n",
-                       (unsigned long long)clone_calls_, dt * 1000.0);
-      }
-      // current_ already has every model positive eq applied. The
-      // clone inherits the pending worklist; just need to close it.
-    }
-    if (debug_) model_checks_++;
+    // ---- (3) Apply positive equalities. ----------------------------------
+    auto t_merge = debug_ ? clk::now() : clk::time_point{};
+    parlay::sequence<std::pair<Id, Id>> pairs;
+    pairs.reserve(pos_eqs.size());
+    for (auto& e : pos_eqs) pairs.emplace_back(e.a, e.b);
+    eg->parallel_merge_all(pairs);
+    if (debug_)
+      merge_time_s_ += std::chrono::duration<double>(clk::now() - t_merge).count();
 
-    // Close under congruence.
+    // ---- (4) Close under congruence. -------------------------------------
     auto t_rb = debug_ ? clk::now() : clk::time_point{};
-    if (use_proof_explain_) {
-      eg->rebuild_with_reasons();
-    } else if (parallel_) {
-      eg->parallel_rebuild();
-    } else {
-      eg->rebuild();
-    }
-    if (debug_) rebuild_time_s_ += std::chrono::duration<double>(clk::now() - t_rb).count();
+    if (parallel_) eg->parallel_rebuild();
+    else           eg->rebuild();
+    if (debug_)
+      rebuild_time_s_ += std::chrono::duration<double>(clk::now() - t_rb).count();
 
+    // ---- (5) Scan negative eqs for conflict. -----------------------------
+    // Conflict clause is built via prefix replay against a fresh ground
+    // clone: replay positive equalities one at a time, rebuild after
+    // each, and stop when the offending disequality's two sides become
+    // equivalent. The prefix used is the conflict core. This is sound
+    // but not minimum.
     bool ok = true;
     for (auto& d : neg_eqs) {
       if (!eg->equiv(d.a, d.b)) continue;
       conflict_clause_.clear();
       conflict_clause_.push_back(-d.lit);
-      if (use_proof_explain_) {
-        // Walk the proof log + adjacency for asserted reasons.
-        std::vector<int> reasons = eg->explain(d.a, d.b);
-        for (int rlit : reasons) conflict_clause_.push_back(-rlit);
-      } else {
-        // Prefix replay against a fresh ground-state clone.
-        auto explain_eg = snapshots_[0]->clone();
-        for (const auto& e : pos_eqs) {
-          explain_eg->merge(e.a, e.b);
-          explain_eg->rebuild();
-          conflict_clause_.push_back(-e.lit);
-          if (explain_eg->equiv(d.a, d.b)) break;
-        }
+      auto explain_eg = ground_->clone();
+      for (const auto& e : pos_eqs) {
+        explain_eg->merge(e.a, e.b);
+        explain_eg->rebuild();
+        conflict_clause_.push_back(-e.lit);
+        if (explain_eg->equiv(d.a, d.b)) break;
       }
       conflict_clause_.push_back(0);
       conflict_pending_ = true;
@@ -907,11 +828,12 @@ class UfPropagator : public CaDiCaL::ExternalPropagator {
       ok = false;
       break;
     }
-    if (debug_) model_check_time_s_ += std::chrono::duration<double>(clk::now() - t0).count();
+    if (debug_)
+      model_check_time_s_ += std::chrono::duration<double>(clk::now() - t0).count();
     return ok;
   }
 
-  // We do not implement theory-directed propagation in v1.
+  // No theory propagation back to CaDiCaL in v1.
   int cb_decide() override { return 0; }
   int cb_propagate() override { return 0; }
   int cb_add_reason_clause_lit(int /*propagated_lit*/) override { return 0; }
@@ -924,7 +846,6 @@ class UfPropagator : public CaDiCaL::ExternalPropagator {
   int cb_add_external_clause_lit() override {
     if (!conflict_pending_) return 0;
     if (conflict_emit_idx_ >= conflict_clause_.size()) {
-      // Whole clause delivered — clear state.
       conflict_pending_ = false;
       conflict_clause_.clear();
       conflict_emit_idx_ = 0;
@@ -932,7 +853,6 @@ class UfPropagator : public CaDiCaL::ExternalPropagator {
     }
     int lit = conflict_clause_[conflict_emit_idx_++];
     if (lit == 0) {
-      // Clause terminator — also clears state for next time.
       conflict_pending_ = false;
       conflict_clause_.clear();
       conflict_emit_idx_ = 0;
@@ -941,57 +861,31 @@ class UfPropagator : public CaDiCaL::ExternalPropagator {
   }
 
  private:
-  void apply_lit(int lit) {
-    int v = std::abs(lit);
-    auto it = atom_endpoints_.find(v);
-    if (it == atom_endpoints_.end()) return;  // aux Tseitin var
-    Id a = it->second.first, b = it->second.second;
-    if (lit > 0) {
-      // Asserted equality. In proof-tracking mode, route through
-      // merge_with_reason so the merge log records this assertion
-      // (lit) as the reason for the merge. Otherwise use the cheaper
-      // untracked merge.
-      if (use_proof_explain_) {
-        current_->merge_with_reason(a, b, EGraph::ProofReason::asserted(lit));
-      } else {
-        current_->merge(a, b);
-      }
-      dirty_ = true;
-    } else {
-      // Asserted disequality: stash for the final consistency check.
-      // Doesn't mutate current_, so dirty_ stays as is.
-      while (diseq_levels_.size() < snapshots_.size()) {
-        diseq_levels_.emplace_back();
-      }
-      diseq_levels_.back().emplace_back(a, b);
-    }
-  }
+  // Trail entry: a theory literal CaDiCaL has assigned, with its
+  // pre-canonical endpoints in the e-graph.
+  struct TrailLit { int lit; Id a; Id b; };
 
-  std::unique_ptr<EGraph> current_;
-  // snapshots_[L] is either an owned EGraph snapshot taken at the start
-  // of decision level L, or nullptr meaning "current_ was bit-identical
-  // to the latest non-null snapshot below L when we entered L." On
-  // backtrack to level L we walk down to the nearest non-null entry
-  // and restore current_ from a clone of it.
-  std::vector<std::unique_ptr<EGraph>> snapshots_;
-  // Dirty flag: true iff current_ has been mutated (a theory atom was
-  // applied) since the most recent snapshot was taken. Cleared on
-  // every snapshot push and on every backtrack-restore.
-  bool dirty_ = false;
-  std::vector<std::vector<std::pair<Id, Id>>> diseq_levels_;
+  // Immutable post-add e-graph. Cloned on every cb_check_found_model.
+  std::unique_ptr<EGraph> ground_;
+
+  // Per-decision-level trails of theory atoms received via
+  // notify_assignment. lit_levels_[L] is the (lit, a, b) entries
+  // assigned at decision level L. Truncated by notify_backtrack.
+  // Currently unused by cb_check_found_model (we use `model` directly),
+  // but kept as the API contract requires.
+  std::vector<std::vector<TrailLit>> lit_levels_;
+
   std::unordered_map<int, std::pair<Id, Id>> atom_endpoints_;
   bool parallel_;
 
-  // Pending conflict clause to deliver to CaDiCaL via cb_add_external_clause_lit.
+  // Pending conflict clause to deliver to CaDiCaL.
   std::vector<int> conflict_clause_;
   std::size_t conflict_emit_idx_ = 0;
   bool conflict_pending_ = false;
 
-  // ---- Profiling counters (active when PE_PROP_DEBUG is set) ----
+  // ---- Profiling (active when PE_PROP_DEBUG is set) ----------------------
   bool debug_ = false;
   bool trace_ = false;
-  bool use_proof_explain_ = false;  // PE_EXPLAIN=proof selects this path
-  std::uint64_t clone_calls_ = 0;
   std::uint64_t model_checks_ = 0;
   std::uint64_t decisions_ = 0;
   std::uint64_t backtracks_ = 0;
