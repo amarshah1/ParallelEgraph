@@ -139,3 +139,8 @@ target_compile_definitions(bool_regression_test PRIVATE
   BOOL_TESTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/bool"
 )
 add_test(NAME bool_regression COMMAND bool_regression_test)
+
+# Concurrent append-only vector unit test.
+add_executable(concurrent_append_vec_test tests/concurrent_append_vec_test.cpp)
+target_link_libraries(concurrent_append_vec_test PRIVATE parallel_egraph_core)
+add_test(NAME concurrent_append_vec COMMAND concurrent_append_vec_test)
