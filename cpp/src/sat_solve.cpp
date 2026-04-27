@@ -683,16 +683,56 @@ class UfPropagator : public CaDiCaL::ExternalPropagator {
       : current_(std::move(root_eg)),
         atom_endpoints_(std::move(atoms)),
         parallel_(parallel) {
+    debug_ = std::getenv("PE_PROP_DEBUG") != nullptr;
+    trace_ = std::getenv("PE_PROP_TRACE") != nullptr;
     // Snapshot at level 0 is the propagator's "ground state" — what we
     // restore to whenever CaDiCaL backtracks all the way out.
-    snapshots_.push_back(current_->clone());
+    if (debug_) {
+      auto t0 = std::chrono::steady_clock::now();
+      snapshots_.push_back(current_->clone());
+      clone_calls_++;
+      double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      clone_time_s_ += dt;
+      if (trace_)
+        std::fprintf(stderr, "[clone] #%llu init/level0 %.3fms\n",
+                     (unsigned long long)clone_calls_, dt * 1000.0);
+    } else {
+      snapshots_.push_back(current_->clone());
+    }
+  }
+
+  ~UfPropagator() {
+    if (debug_) {
+      std::fprintf(stderr,
+                   "UfPropagator stats: clones=%llu  clone_s=%.3f  "
+                   "model_checks=%llu  model_check_s=%.3f  "
+                   "decisions=%llu  backtracks=%llu  "
+                   "notify_lits=%llu  conflicts=%llu  "
+                   "merge_s=%.3f  rebuild_s=%.3f\n",
+                   (unsigned long long)clone_calls_,
+                   clone_time_s_,
+                   (unsigned long long)model_checks_,
+                   model_check_time_s_,
+                   (unsigned long long)decisions_,
+                   (unsigned long long)backtracks_,
+                   (unsigned long long)notify_lits_,
+                   (unsigned long long)conflicts_emitted_,
+                   merge_time_s_, rebuild_time_s_);
+    }
   }
 
   // CaDiCaL pushes a vector of newly-true literals (positive = atom asserted,
   // negative = atom negated).  We translate theory atoms into either
   // merges or pending disequality observations at the current level.
   void notify_assignment(const std::vector<int>& lits) override {
-    for (int lit : lits) apply_lit(lit);
+    if (debug_) {
+      notify_lits_ += lits.size();
+      auto t0 = std::chrono::steady_clock::now();
+      for (int lit : lits) apply_lit(lit);
+      merge_time_s_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    } else {
+      for (int lit : lits) apply_lit(lit);
+    }
   }
 
   // (We don't override notify_fixed_assignment in v1: that listener is on a
@@ -702,17 +742,49 @@ class UfPropagator : public CaDiCaL::ExternalPropagator {
   void notify_new_decision_level() override {
     // CaDiCaL is about to make a new decision. Snapshot the e-graph as
     // it stands NOW so a future backtrack to this level can restore it.
-    snapshots_.push_back(current_->clone());
+    if (debug_) {
+      decisions_++;
+      auto t0 = std::chrono::steady_clock::now();
+      snapshots_.push_back(current_->clone());
+      clone_calls_++;
+      double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      clone_time_s_ += dt;
+      if (trace_)
+        std::fprintf(stderr,
+                     "[clone] #%llu decision  level=%zu  %.3fms\n",
+                     (unsigned long long)clone_calls_,
+                     snapshots_.size() - 1, dt * 1000.0);
+    } else {
+      snapshots_.push_back(current_->clone());
+    }
   }
 
   void notify_backtrack(std::size_t level) override {
     // CaDiCaL wants to be back at decision level `level`. Drop any
     // higher-level snapshots and replace `current` with the saved one.
-    while (snapshots_.size() > level + 1) snapshots_.pop_back();
-    current_ = snapshots_.back()->clone();
-    // Discard any pending disequalities collected above `level`.
-    while (diseq_levels_.size() > snapshots_.size() - 1) {
-      diseq_levels_.pop_back();
+    if (debug_) {
+      backtracks_++;
+      std::size_t prev_level = snapshots_.size() - 1;
+      auto t0 = std::chrono::steady_clock::now();
+      while (snapshots_.size() > level + 1) snapshots_.pop_back();
+      current_ = snapshots_.back()->clone();
+      clone_calls_++;
+      while (diseq_levels_.size() > snapshots_.size() - 1) {
+        diseq_levels_.pop_back();
+      }
+      double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      clone_time_s_ += dt;
+      if (trace_)
+        std::fprintf(stderr,
+                     "[clone] #%llu backtrack %zu->%zu  %.3fms\n",
+                     (unsigned long long)clone_calls_, prev_level, level,
+                     dt * 1000.0);
+    } else {
+      while (snapshots_.size() > level + 1) snapshots_.pop_back();
+      current_ = snapshots_.back()->clone();
+      while (diseq_levels_.size() > snapshots_.size() - 1) {
+        diseq_levels_.pop_back();
+      }
     }
   }
 
@@ -722,7 +794,20 @@ class UfPropagator : public CaDiCaL::ExternalPropagator {
     // snapshots) and run congruence closure. If any disequality has
     // both sides in the same e-class, the model is theory-inconsistent
     // — we return false and produce a conflict clause.
+    using clk = std::chrono::steady_clock;
+    auto t0 = debug_ ? clk::now() : clk::time_point{};
+    auto t_clone_start = t0;
     auto check_eg = current_->clone();
+    if (debug_) {
+      model_checks_++;
+      clone_calls_++;
+      double dt = std::chrono::duration<double>(clk::now() - t_clone_start).count();
+      clone_time_s_ += dt;
+      if (trace_)
+        std::fprintf(stderr,
+                     "[clone] #%llu check_model  %.3fms\n",
+                     (unsigned long long)clone_calls_, dt * 1000.0);
+    }
     std::vector<std::pair<Id, Id>> pos_eqs;
     std::vector<std::pair<Id, Id>> neg_eqs;
     for (int lit : model) {
@@ -734,13 +819,13 @@ class UfPropagator : public CaDiCaL::ExternalPropagator {
       else         neg_eqs.emplace_back(a, b);
     }
     for (auto& [a, b] : pos_eqs) check_eg->merge(a, b);
+    auto t_rb = debug_ ? clk::now() : clk::time_point{};
     if (parallel_) check_eg->parallel_rebuild();
     else           check_eg->rebuild();
+    if (debug_) rebuild_time_s_ += std::chrono::duration<double>(clk::now() - t_rb).count();
+    bool ok = true;
     for (auto& [a, b] : neg_eqs) {
       if (check_eg->equiv(a, b)) {
-        // Build conflict clause: negate every theory literal in the
-        // current model. A trivially-correct (but redundant) reason —
-        // the SAT solver will minimize.
         conflict_clause_.clear();
         for (int lit : model) {
           int v = std::abs(lit);
@@ -750,10 +835,13 @@ class UfPropagator : public CaDiCaL::ExternalPropagator {
         }
         conflict_clause_.push_back(0);
         conflict_pending_ = true;
-        return false;
+        if (debug_) conflicts_emitted_++;
+        ok = false;
+        break;
       }
     }
-    return true;
+    if (debug_) model_check_time_s_ += std::chrono::duration<double>(clk::now() - t0).count();
+    return ok;
   }
 
   // We do not implement theory-directed propagation in v1.
@@ -813,6 +901,20 @@ class UfPropagator : public CaDiCaL::ExternalPropagator {
   std::vector<int> conflict_clause_;
   std::size_t conflict_emit_idx_ = 0;
   bool conflict_pending_ = false;
+
+  // ---- Profiling counters (active when PE_PROP_DEBUG is set) ----
+  bool debug_ = false;
+  bool trace_ = false;
+  std::uint64_t clone_calls_ = 0;
+  std::uint64_t model_checks_ = 0;
+  std::uint64_t decisions_ = 0;
+  std::uint64_t backtracks_ = 0;
+  std::uint64_t notify_lits_ = 0;
+  std::uint64_t conflicts_emitted_ = 0;
+  double clone_time_s_ = 0.0;
+  double model_check_time_s_ = 0.0;
+  double merge_time_s_ = 0.0;
+  double rebuild_time_s_ = 0.0;
 };
 
 double secs_since(std::chrono::steady_clock::time_point t) {
@@ -825,6 +927,7 @@ double secs_since(std::chrono::steady_clock::time_point t) {
 std::pair<SolveResult, SolveTimings> sat_solve_timed(const std::string& input,
                                                      bool parallel) {
   using clk = std::chrono::steady_clock;
+  bool dbg = std::getenv("PE_PROP_DEBUG") != nullptr;
   SolveTimings timings;
   auto total_start = clk::now();
 
@@ -836,32 +939,42 @@ std::pair<SolveResult, SolveTimings> sat_solve_timed(const std::string& input,
     if (c.kind == Command::Kind::Assert) assertions.push_back(&c.term);
   }
   timings.parse_s = secs_since(parse_start);
+  if (dbg) std::fprintf(stderr, "[phase] parse done in %.3fs (assertions=%zu)\n",
+                        timings.parse_s, assertions.size());
 
   // ---- ITE lifting ----
-  // Rewrite each assertion so that ite never returns a UF-sorted value.
-  // This is a no-op for assertions whose only ites are Bool-typed.
   auto build_start = clk::now();
+  auto t_lift = clk::now();
   std::vector<Term> lifted;
   lifted.reserve(assertions.size());
   for (const Term* t : assertions) lifted.push_back(lift_ites(*t));
+  if (dbg) std::fprintf(stderr, "[phase] ite-lift done in %.3fs\n", secs_since(t_lift));
 
   // ---- Build EGraph ----
-  // Capacity: every subterm could become an e-class. Sum across the
-  // *lifted* assertions for a safe upper bound (lifting can fan out).
+  auto t_cap = clk::now();
   std::size_t capacity = 0;
   for (const Term& t : lifted) capacity += count_subterms_total(t);
   if (capacity == 0) capacity = 1;
+  if (dbg) std::fprintf(stderr, "[phase] capacity = %zu (count walk %.3fs)\n",
+                        capacity, secs_since(t_cap));
+  auto t_alloc = clk::now();
   auto eg = std::make_unique<EGraph>(capacity, parallel);
+  if (dbg) std::fprintf(stderr, "[phase] EGraph alloc in %.3fs\n", secs_since(t_alloc));
 
-  // Preflight: walk each assertion and add every UF subterm to the e-graph.
-  // This guarantees that by the time the encoder runs, every endpoint of
-  // every (= ti tj) atom already has a stable e-class id.
+  // Preflight: add every UF subterm to the e-graph.
+  auto t_pre = clk::now();
   for (const Term& t : lifted) preflight_add_uf(*eg, t);
+  if (dbg) std::fprintf(stderr, "[phase] preflight in %.3fs\n", secs_since(t_pre));
 
   // ---- Encode CNF ----
+  auto t_enc = clk::now();
   Encoder enc(*eg);
   for (const Term& t : lifted) enc.encode_assertion(t);
   timings.build_s = secs_since(build_start);
+  if (dbg) std::fprintf(stderr,
+                        "[phase] encode in %.3fs (vars=%d clauses_lits=%zu atoms=%zu)\n",
+                        secs_since(t_enc), enc.num_vars(), enc.cnf().size(),
+                        enc.atom_endpoints().size());
 
   // ---- Hand to CaDiCaL ----
   auto merge_start = clk::now();  // we'll attribute SAT search to "merge"
