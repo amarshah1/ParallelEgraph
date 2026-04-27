@@ -685,6 +685,10 @@ class UfPropagator : public CaDiCaL::ExternalPropagator {
         parallel_(parallel) {
     debug_ = std::getenv("PE_PROP_DEBUG") != nullptr;
     trace_ = std::getenv("PE_PROP_TRACE") != nullptr;
+    {
+      const char* mode = std::getenv("PE_EXPLAIN");
+      use_proof_explain_ = mode != nullptr && std::string(mode) == "proof";
+    }
     // The level-0 entry is always a real snapshot (the ground state). We
     // need it as the fallback target for backtracks all the way out and
     // as the seed value when restoring a higher level's nullptr entry.
@@ -818,28 +822,20 @@ class UfPropagator : public CaDiCaL::ExternalPropagator {
   }
 
   bool cb_check_found_model(const std::vector<int>& model) override {
-    // CaDiCaL has a complete assignment. Apply every theory atom in the
-    // model into a fresh e-graph (so we don't mutate the level-stack
-    // snapshots) and run congruence closure. If any disequality has
-    // both sides in the same e-class, the model is theory-inconsistent
-    // — we return false and produce a conflict clause.
+    // CaDiCaL has a complete assignment. We need to (a) close the e-graph
+    // under congruence, then (b) test each disequality for conflict.
+    //
+    // Two paths:
+    //   default        : clone current_, run rebuild on the clone (parallel
+    //                    or sequential), use prefix-replay for conflict cores.
+    //   PE_EXPLAIN=proof: rebuild current_ in place via rebuild_with_reasons
+    //                    (which logs congruences). On conflict, call
+    //                    current_->explain to get the asserted-lit core.
+    //                    No clone in this path.
     using clk = std::chrono::steady_clock;
     auto t0 = debug_ ? clk::now() : clk::time_point{};
-    auto t_clone_start = t0;
-    auto check_eg = current_->clone();
-    if (debug_) {
-      model_checks_++;
-      clone_calls_++;
-      double dt = std::chrono::duration<double>(clk::now() - t_clone_start).count();
-      clone_time_s_ += dt;
-      if (trace_)
-        std::fprintf(stderr,
-                     "[clone] #%llu check_model  %.3fms\n",
-                     (unsigned long long)clone_calls_, dt * 1000.0);
-    }
-    // Bucket the model into theory atoms with their (a, b) endpoints,
-    // *keeping the literal* so we can build a minimal conflict clause
-    // pointing back at the actual SAT vars.
+
+    // Bucket the model into theory atoms.
     struct EqLit  { int lit; Id a; Id b; };
     struct DiseqLit { int lit; Id a; Id b; };
     std::vector<EqLit>    pos_eqs;
@@ -852,37 +848,58 @@ class UfPropagator : public CaDiCaL::ExternalPropagator {
       if (lit > 0) pos_eqs.push_back({lit, a, b});
       else         neg_eqs.push_back({lit, a, b});
     }
-    for (auto& e : pos_eqs) check_eg->merge(e.a, e.b);
+
+    // Pick the e-graph to operate on. Proof mode mutates current_
+    // directly (cheap); default mode operates on a clone (safe).
+    EGraph* eg = current_.get();
+    std::unique_ptr<EGraph> check_eg_holder;
+    if (!use_proof_explain_) {
+      auto t_clone = clk::now();
+      check_eg_holder = current_->clone();
+      eg = check_eg_holder.get();
+      if (debug_) {
+        clone_calls_++;
+        double dt = std::chrono::duration<double>(clk::now() - t_clone).count();
+        clone_time_s_ += dt;
+        if (trace_)
+          std::fprintf(stderr,
+                       "[clone] #%llu check_model  %.3fms\n",
+                       (unsigned long long)clone_calls_, dt * 1000.0);
+      }
+      // current_ already has every model positive eq applied. The
+      // clone inherits the pending worklist; just need to close it.
+    }
+    if (debug_) model_checks_++;
+
+    // Close under congruence.
     auto t_rb = debug_ ? clk::now() : clk::time_point{};
-    if (parallel_) check_eg->parallel_rebuild();
-    else           check_eg->rebuild();
+    if (use_proof_explain_) {
+      eg->rebuild_with_reasons();
+    } else if (parallel_) {
+      eg->parallel_rebuild();
+    } else {
+      eg->rebuild();
+    }
     if (debug_) rebuild_time_s_ += std::chrono::duration<double>(clk::now() - t_rb).count();
+
     bool ok = true;
     for (auto& d : neg_eqs) {
-      if (!check_eg->equiv(d.a, d.b)) continue;
-      // ----------------------------------------------------------------
-      // Theory conflict on disequality literal `d`. Build a minimal-ish
-      // conflict clause via *prefix replay*: starting from the level-0
-      // snapshot (which contains every UF subterm as a singleton class),
-      // re-apply the model's positive equality literals one by one.
-      // After each merge, run sequential rebuild and test whether
-      // find(d.a) == find(d.b). The first prefix that triggers
-      // congruence is the core; the conflict clause is
-      //     [¬d.lit, ¬e.lit for e in prefix].
-      // This is a sound (not minimum) explanation. Any smaller
-      // unsatisfiable core would also work; this is what cvc5 calls
-      // a "naïve but small" explanation, and is dramatically smaller
-      // than the previous implementation, which negated the *entire*
-      // theory-atom assignment.
-      // ----------------------------------------------------------------
-      auto explain_eg = snapshots_[0]->clone();  // ground state, no merges
+      if (!eg->equiv(d.a, d.b)) continue;
       conflict_clause_.clear();
       conflict_clause_.push_back(-d.lit);
-      for (const auto& e : pos_eqs) {
-        explain_eg->merge(e.a, e.b);
-        explain_eg->rebuild();           // sequential rebuild — tiny per call
-        conflict_clause_.push_back(-e.lit);
-        if (explain_eg->equiv(d.a, d.b)) break;
+      if (use_proof_explain_) {
+        // Walk the proof log + adjacency for asserted reasons.
+        std::vector<int> reasons = eg->explain(d.a, d.b);
+        for (int rlit : reasons) conflict_clause_.push_back(-rlit);
+      } else {
+        // Prefix replay against a fresh ground-state clone.
+        auto explain_eg = snapshots_[0]->clone();
+        for (const auto& e : pos_eqs) {
+          explain_eg->merge(e.a, e.b);
+          explain_eg->rebuild();
+          conflict_clause_.push_back(-e.lit);
+          if (explain_eg->equiv(d.a, d.b)) break;
+        }
       }
       conflict_clause_.push_back(0);
       conflict_pending_ = true;
@@ -930,9 +947,15 @@ class UfPropagator : public CaDiCaL::ExternalPropagator {
     if (it == atom_endpoints_.end()) return;  // aux Tseitin var
     Id a = it->second.first, b = it->second.second;
     if (lit > 0) {
-      // Asserted equality: fold it into the current e-graph. Mark dirty
-      // so the next decision-level snapshot is taken for real.
-      current_->merge(a, b);
+      // Asserted equality. In proof-tracking mode, route through
+      // merge_with_reason so the merge log records this assertion
+      // (lit) as the reason for the merge. Otherwise use the cheaper
+      // untracked merge.
+      if (use_proof_explain_) {
+        current_->merge_with_reason(a, b, EGraph::ProofReason::asserted(lit));
+      } else {
+        current_->merge(a, b);
+      }
       dirty_ = true;
     } else {
       // Asserted disequality: stash for the final consistency check.
@@ -967,6 +990,7 @@ class UfPropagator : public CaDiCaL::ExternalPropagator {
   // ---- Profiling counters (active when PE_PROP_DEBUG is set) ----
   bool debug_ = false;
   bool trace_ = false;
+  bool use_proof_explain_ = false;  // PE_EXPLAIN=proof selects this path
   std::uint64_t clone_calls_ = 0;
   std::uint64_t model_checks_ = 0;
   std::uint64_t decisions_ = 0;
