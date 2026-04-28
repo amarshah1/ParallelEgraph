@@ -9,11 +9,12 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
-#include <random>
 #include <string>
 #include <vector>
 
 #include <parlay/parallel.h>
+#include <parlay/primitives.h>
+#include <parlay/random.h>
 #include <parlay/sequence.h>
 
 #include "parallel_egraph/egraph.hpp"
@@ -49,65 +50,76 @@ struct BuiltGraph {
   parlay::sequence<std::pair<Id, Id>> eqs;
 };
 
+// Workload generation is fully parallel:
+//   * Every ENode (leaves + per-level function nodes) is built in a single
+//     parlay::tabulate.
+//   * The whole e-graph (uf_, nodes_, parent_index_) is constructed in one
+//     parallel pass via EGraph::bulk_init.
+//   * Equality pairs come out of a parlay::tabulate.
+// parlay::random_generator gives per-index forked sub-generators, so each
+// node draws independent random numbers without sequential RNG state.
 BuiltGraph build(const Workload& w) {
-  std::mt19937_64 rng(0xC0FFEE ^ static_cast<std::uint64_t>(w.n_nodes));
-  std::size_t capacity = 2 * w.n_leaves + w.n_nodes;
-  auto eg = std::make_unique<EGraph>(capacity);
+  const std::size_t depth = std::max<std::size_t>(w.depth, 1);
+  const std::size_t per_level = w.n_nodes / depth;
 
-  std::vector<Id> x_ids;
-  x_ids.reserve(w.n_leaves);
-  for (std::size_t i = 0; i < w.n_leaves; ++i) {
-    ENode n;
-    n.op = "x" + std::to_string(i);
-    x_ids.push_back(eg->add(std::move(n)));
-  }
-  std::vector<Id> y_ids;
-  y_ids.reserve(w.n_leaves);
-  for (std::size_t i = 0; i < w.n_leaves; ++i) {
-    ENode n;
-    n.op = "y" + std::to_string(i);
-    y_ids.push_back(eg->add(std::move(n)));
-  }
-
-  std::size_t depth = std::max<std::size_t>(w.depth, 1);
-  std::size_t per_level = w.n_nodes / depth;
-
-  std::vector<Id> prev_level;
-  prev_level.reserve(2 * w.n_leaves);
-  prev_level.insert(prev_level.end(), x_ids.begin(), x_ids.end());
-  prev_level.insert(prev_level.end(), y_ids.begin(), y_ids.end());
-
+  // Compute level boundaries: level_starts[k] is the first class id of
+  // level k's function nodes. Leaves (x then y) occupy [0, 2*n_leaves);
+  // level k function nodes occupy [level_starts[k], level_starts[k+1]).
+  std::vector<std::size_t> level_starts;
+  level_starts.reserve(depth + 1);
+  level_starts.push_back(2 * w.n_leaves);
   for (std::size_t lvl = 0; lvl < depth; ++lvl) {
-    std::size_t count = (lvl + 1 == depth)
-                          ? (w.n_nodes - per_level * (depth - 1))
-                          : per_level;
-    std::vector<Id> this_level;
-    this_level.reserve(count);
-    for (std::size_t i = 0; i < count; ++i) {
-      std::uniform_int_distribution<std::size_t> d_fn(0, w.n_fns - 1);
-      std::uniform_int_distribution<std::size_t> d_prev(0, prev_level.size() - 1);
-      std::size_t k = d_fn(rng);
-      Id a = prev_level[d_prev(rng)];
-      Id b = prev_level[d_prev(rng)];
-      ENode n;
-      n.op = "f" + std::to_string(lvl) + "_" + std::to_string(k);
-      n.children = {a, b};
-      this_level.push_back(eg->add(std::move(n)));
+    const std::size_t count = (lvl + 1 == depth)
+                                ? (w.n_nodes - per_level * (depth - 1))
+                                : per_level;
+    level_starts.push_back(level_starts[lvl] + count);
+  }
+  const std::size_t total = level_starts.back();   // 2*n_leaves + n_nodes
+
+  parlay::random_generator gen(0xC0FFEEULL ^ static_cast<std::size_t>(w.n_nodes));
+
+  // ---- All nodes in one parallel tabulate ----
+  auto all_nodes = parlay::tabulate(total, [&](std::size_t i) -> ENode {
+    if (i < w.n_leaves) {
+      return ENode{std::string("x") + std::to_string(i), {}};
     }
-    prev_level = std::move(this_level);
-  }
+    if (i < 2 * w.n_leaves) {
+      return ENode{std::string("y") + std::to_string(i - w.n_leaves), {}};
+    }
+    // Function node: locate its level via binary search on level_starts.
+    std::size_t lvl = static_cast<std::size_t>(
+        std::upper_bound(level_starts.begin(), level_starts.end(), i) -
+        level_starts.begin()) - 1;
+    const std::size_t prev_start = (lvl == 0) ? 0 : level_starts[lvl - 1];
+    const std::size_t prev_size = level_starts[lvl] - prev_start;
 
-  parlay::sequence<std::pair<Id, Id>> equalities;
-  equalities.reserve(w.n_merges);
-  std::uniform_int_distribution<std::size_t> d_leaf(0, w.n_leaves - 1);
-  for (std::size_t i = 0; i < w.n_merges / 2; ++i) {
-    equalities.emplace_back(x_ids[d_leaf(rng)], x_ids[d_leaf(rng)]);
-  }
-  for (std::size_t i = 0; i < w.n_merges - w.n_merges / 2; ++i) {
-    equalities.emplace_back(y_ids[d_leaf(rng)], y_ids[d_leaf(rng)]);
-  }
+    auto r = gen[i];
+    ENode n;
+    n.op = std::string("f") + std::to_string(lvl) + "_" +
+           std::to_string(r() % w.n_fns);
+    n.children = {static_cast<Id>(prev_start + r() % prev_size),
+                  static_cast<Id>(prev_start + r() % prev_size)};
+    return n;
+  });
 
-  return {std::move(eg), std::move(equalities)};
+  auto eg = EGraph::bulk_init(std::move(all_nodes));
+
+  // ---- Equalities: fully parallel. ----
+  const std::size_t n_x_merges = w.n_merges / 2;
+  auto eq_seq = parlay::tabulate(w.n_merges, [&](std::size_t i) {
+    auto r = gen[total + i];   // distinct subkey from any node-gen seed
+    if (i < n_x_merges) {
+      // x-side merges: ids 0..n_leaves-1
+      return std::pair<Id, Id>{static_cast<Id>(r() % w.n_leaves),
+                               static_cast<Id>(r() % w.n_leaves)};
+    }
+    // y-side merges: ids n_leaves..2*n_leaves-1
+    return std::pair<Id, Id>{
+        static_cast<Id>(w.n_leaves + r() % w.n_leaves),
+        static_cast<Id>(w.n_leaves + r() % w.n_leaves)};
+  });
+
+  return {std::move(eg), std::move(eq_seq)};
 }
 
 double median(std::vector<double> xs) {

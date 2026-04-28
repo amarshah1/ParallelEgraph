@@ -23,23 +23,35 @@ set(PARLAY_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(PARLAY_BENCHMARK OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(parlaylib)
 
-# ---- core library: only what the bench uses ----
+# ---- core library ----
 add_library(parallel_egraph_core STATIC
   src/unionfind.cpp
   src/egraph.cpp
+  src/smtlib.cpp
 )
 target_include_directories(parallel_egraph_core
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 target_link_libraries(parallel_egraph_core PUBLIC parlay)
 
-# ---- benchmark ----
-add_executable(rebuild_compare_bench bench/rebuild_compare.cpp)
-target_link_libraries(rebuild_compare_bench PRIVATE parallel_egraph_core)
+# ---- CLI: egraph-cc <file.smt2> -> sat / unsat ----
+add_executable(egraph-cc src/main.cpp)
+target_link_libraries(egraph-cc PRIVATE parallel_egraph_core)
 
-# ---- UF unit test (kept as a sanity check on the lock-free union-find
-#      that the bench's parallel_close depends on) ----
+# ---- benchmark ----
+add_executable(closure_compare_bench bench/closure_compare.cpp)
+target_link_libraries(closure_compare_bench PRIVATE parallel_egraph_core)
+
+# ---- tests ----
 enable_testing()
+
 add_executable(unionfind_test tests/unionfind_test.cpp)
 target_link_libraries(unionfind_test PRIVATE parallel_egraph_core)
 add_test(NAME unionfind COMMAND unionfind_test)
+
+add_executable(regression_test tests/regression_test.cpp)
+target_link_libraries(regression_test PRIVATE parallel_egraph_core)
+target_compile_definitions(regression_test PRIVATE
+  REGRESSION_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples/regression"
+)
+add_test(NAME regression COMMAND regression_test)

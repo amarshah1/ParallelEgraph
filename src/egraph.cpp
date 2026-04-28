@@ -98,6 +98,54 @@ ENode EGraph::canonicalize(const ENode& node) {
   return out;
 }
 
+// Bulk parallel construction. See egraph.hpp for semantics.
+std::unique_ptr<EGraph> EGraph::bulk_init(parlay::sequence<ENode> nodes) {
+  const std::size_t n = nodes.size();
+  auto eg = std::make_unique<EGraph>(n);
+
+  // 1. UF: bump size_ to n in one shot (slots already at make_rank(0)).
+  eg->uf_.bulk_init(n);
+
+  // 2. node_idx prefix-scan: only non-leaves go into nodes_, so each
+  //    non-leaf at input position i gets node_idx = (# non-leaves before i).
+  auto is_nonleaf = parlay::tabulate(n, [&](std::size_t i) {
+    return nodes[i].children.empty() ? std::size_t{0} : std::size_t{1};
+  });
+  auto scan_pair = parlay::scan(is_nonleaf);
+  auto& offsets = scan_pair.first;
+  std::size_t total_nonleaves = scan_pair.second;
+
+  // 3. Build (child_class, node_idx) pairs in parallel before we move out
+  //    of `nodes`. We tabulate per-node-index sequences and flatten.
+  auto child_pairs = parlay::flatten(parlay::tabulate(
+      n, [&](std::size_t i) -> parlay::sequence<std::pair<Id, std::uint32_t>> {
+        const auto& cs = nodes[i].children;
+        if (cs.empty()) return {};
+        std::uint32_t j = static_cast<std::uint32_t>(offsets[i]);
+        return parlay::tabulate(cs.size(), [&, j](std::size_t k) {
+          return std::pair<Id, std::uint32_t>{cs[k], j};
+        });
+      }));
+
+  // 4. group_by_index by child class → parent_index_[c] = node_idx list.
+  eg->parent_index_ = parlay::group_by_index(
+      std::move(child_pairs), static_cast<Id>(n));
+
+  // 5. Pack non-leaves into eg->nodes_ in parallel (consumes `nodes`).
+  //    Each non-leaf has a unique offsets[i], so the parallel writes never
+  //    collide.
+  eg->nodes_ = parlay::sequence<std::pair<ENode, Id>>(total_nonleaves);
+  parlay::parallel_for(0, n, [&](std::size_t i) {
+    if (!nodes[i].children.empty()) {
+      eg->nodes_[offsets[i]] = std::pair<ENode, Id>{
+          std::move(nodes[i]), static_cast<Id>(i)};
+    }
+  });
+
+  // hashcons_ left empty: bulk_init skips dedup by contract.
+  return eg;
+}
+
 Id EGraph::add(ENode node) {
   ENode canon = canonicalize(node);
 

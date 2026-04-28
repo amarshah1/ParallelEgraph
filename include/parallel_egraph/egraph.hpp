@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -63,6 +64,16 @@ class EGraph {
   // Insert (and dedupe via hashcons) a single e-node. Sequential — runs
   // during the build phase before any closure call.
   Id add(ENode node);
+
+  // Bulk-construct an EGraph from a sequence of ENodes given in DAG order:
+  // the i-th node receives class id i, and every child id in node i must
+  // be < i. Hashcons is skipped — the caller is responsible for ensuring
+  // no two nodes are structurally identical (otherwise the duplicate gets
+  // its own class instead of being deduped). All structural setup
+  // (`uf_`, `nodes_`, `parent_index_`) is built via parlay primitives
+  // (tabulate / scan / group_by_index), so the work is fully parallel.
+  // Returns a unique_ptr because EGraph holds atomics (non-movable).
+  static std::unique_ptr<EGraph> bulk_init(parlay::sequence<ENode> nodes);
 
   // BSP closure on explicit initial unions; fully parallel within rounds.
   // See cpp/DESIGN.md §1 (parallel_consolidate) and §2

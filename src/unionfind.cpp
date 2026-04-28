@@ -24,6 +24,12 @@ Id ConcurrentUnionFind::make_set() {
   return id;
 }
 
+void ConcurrentUnionFind::bulk_init(std::size_t n) {
+  assert(n <= data_.size() && "bulk_init: n exceeds capacity");
+  size_ = n;
+  // Slots already at make_rank(0) from the ctor — nothing else to do.
+}
+
 std::pair<Id, std::uint32_t> ConcurrentUnionFind::find(Id u) {
   std::uint32_t p = data_[u].load(std::memory_order_acquire);
   if (is_rank(p)) {

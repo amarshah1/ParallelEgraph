@@ -37,6 +37,11 @@ class ConcurrentUnionFind {
   // Bumps size_ up to capacity_. Asserts on overflow.
   Id make_set();
 
+  // One-shot equivalent of calling `make_set()` n times. Used by
+  // `EGraph::bulk_init` to populate the UF without a per-element loop.
+  // Slots are already at make_rank(0) from the ctor.
+  void bulk_init(std::size_t n);
+
   // Thread-safe but non-const: CAS writes (path compression / rank bump)
   // are genuine mutations, so these are declared non-const. Safe to call
   // concurrently from multiple threads via a shared reference/pointer —
