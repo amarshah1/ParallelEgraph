@@ -349,11 +349,37 @@ struct CanonEntry {
 //
 // Below DNC_SEQ_CUTOFF, fall through to a sequential pairwise sweep —
 // par_do fork/join overhead dominates for tiny groups, which are common.
+// PE_DNC_CUTOFF env var lets us sweep without recompiling.
+inline std::size_t dnc_cutoff() {
+  static const std::size_t v = [] {
+    const char* s = std::getenv("PE_DNC_CUTOFF");
+    return s ? static_cast<std::size_t>(std::atoll(s)) : std::size_t{16};
+  }();
+  return v;
+}
+
+// PE_UNION_STYLE=adjacent uses a flat parlay::parallel_for over adjacent
+// pairs instead of the D&C tree. Higher CAS contention (each pair shares
+// an endpoint with its neighbour) but trivially simple.
+inline bool union_style_adjacent() {
+  static const bool v = [] {
+    const char* s = std::getenv("PE_UNION_STYLE");
+    return s && std::string(s) == "adjacent";
+  }();
+  return v;
+}
+
 template <typename Bucket>
 void dnc_union(Bucket& bucket, std::size_t lo, std::size_t hi,
                ConcurrentUnionFind& uf) {
-  constexpr std::size_t DNC_SEQ_CUTOFF = 16;
   if (hi - lo <= 1) return;
+  if (union_style_adjacent()) {
+    parlay::parallel_for(lo, hi - 1, [&](std::size_t i) {
+      uf.union_(bucket[i].root, bucket[i + 1].root);
+    });
+    return;
+  }
+  const std::size_t DNC_SEQ_CUTOFF = dnc_cutoff();
   if (hi - lo <= DNC_SEQ_CUTOFF) {
     for (std::size_t i = lo + 1; i < hi; ++i) {
       uf.union_(bucket[lo].root, bucket[i].root);

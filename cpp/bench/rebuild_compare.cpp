@@ -163,14 +163,29 @@ int main() {
               "name", "leaves", "nodes", "merges",
               "nelson_seq", "par_close", "par_spd");
 
+  // PE_BENCH_ONLY=large (etc.) restricts to a single workload — handy for
+  // quick parameter sweeps without paying for the other five.
+  const char* only = std::getenv("PE_BENCH_ONLY");
+  // PE_BENCH_SKIP_NELSON=1 skips the sequential baseline (sweep-only).
+  const bool skip_nelson = std::getenv("PE_BENCH_SKIP_NELSON") != nullptr;
+
   for (const auto& w : WORKLOADS) {
+    if (only && std::string(only) != w.name) continue;
     std::fprintf(stderr, "[bench] running %s ...\n", w.name);
-    auto nel = bench_nelson(w);
+    double mn = 0.0;
+    if (!skip_nelson) {
+      auto nel = bench_nelson(w);
+      mn = median(nel);
+    }
     auto par = bench_parallel_close(w);
-    double mn = median(nel);
     double mp = median(par);
-    std::printf("%-8s %8zu %10zu %9zu | %9.2fms | %9.2fms %9.2fx\n",
-                w.name, w.n_leaves, w.n_nodes, w.n_merges, mn, mp, mn / mp);
+    if (skip_nelson) {
+      std::printf("%-8s %8zu %10zu %9zu |   skipped  | %9.2fms\n",
+                  w.name, w.n_leaves, w.n_nodes, w.n_merges, mp);
+    } else {
+      std::printf("%-8s %8zu %10zu %9zu | %9.2fms | %9.2fms %9.2fx\n",
+                  w.name, w.n_leaves, w.n_nodes, w.n_merges, mn, mp, mn / mp);
+    }
     std::fflush(stdout);
   }
   return 0;
