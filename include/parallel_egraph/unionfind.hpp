@@ -1,0 +1,74 @@
+#pragma once
+// Lock-free concurrent union-find (Jayanti & Tarjan Listing 3) +
+// plain sequential UF. Mirrors src/unionfind.rs.
+//
+// Departure from Rust: no dynamic resize. Construct with a known capacity;
+// make_set() bumps a single-threaded counter within that capacity. The caller
+// (solver / benchmark) knows the upper bound on class count before e-graph
+// construction — for the SMT solver, a one-pass AST walk counts subterms.
+
+#include <atomic>
+#include <cstdint>
+#include <utility>
+#include <vector>
+
+namespace pe {
+
+using Id = std::uint32_t;
+
+// High bit set = node is a root holding its rank.
+// High bit clear = value is a parent pointer.
+inline constexpr std::uint32_t RANK_FLAG = 0x8000'0000u;
+
+inline bool is_rank(std::uint32_t v) { return (v & RANK_FLAG) != 0; }
+inline std::uint32_t rank_value(std::uint32_t v) { return v & ~RANK_FLAG; }
+inline std::uint32_t make_rank(std::uint32_t r) { return r | RANK_FLAG; }
+
+class ConcurrentUnionFind {
+ public:
+  ConcurrentUnionFind() = default;
+  explicit ConcurrentUnionFind(std::size_t capacity);
+
+  // Current live size (number of make_set calls so far).
+  std::size_t len() const { return size_; }
+  std::size_t capacity() const { return data_.size(); }
+
+  // Single-threaded; called only during the add phase.
+  // Bumps size_ up to capacity_. Asserts on overflow.
+  Id make_set();
+
+  // Thread-safe but non-const: CAS writes (path compression / rank bump)
+  // are genuine mutations, so these are declared non-const. Safe to call
+  // concurrently from multiple threads via a shared reference/pointer —
+  // thread-safety in C++ is orthogonal to const-correctness.
+  std::pair<Id, std::uint32_t> find(Id u);
+  Id find_root(Id u) { return find(u).first; }
+  void union_(Id u, Id v);
+  bool same_set(Id u, Id v);
+
+ private:
+  // std::atomic<T> is non-movable. std::vector's size-constructor default-
+  // constructs atomics in place — that works fine as long as we never grow
+  // the vector (we don't: size_ bumps up to capacity). Access pattern is
+  // identical to a raw array: one pointer-load + offset.
+  std::vector<std::atomic<std::uint32_t>> data_;
+  std::size_t size_ = 0;  // single-threaded counter, ≤ data_.size()
+};
+
+class SequentialUnionFind {
+ public:
+  SequentialUnionFind() = default;
+  explicit SequentialUnionFind(std::size_t size)
+      : data_(size, make_rank(0)) {}
+
+  std::size_t len() const { return data_.size(); }
+
+  Id find_root(Id u);
+  void union_(Id u, Id v);
+
+ private:
+  std::uint32_t rank_of(Id root) const { return rank_value(data_[root]); }
+  std::vector<std::uint32_t> data_;
+};
+
+}  // namespace pe

@@ -1,8 +1,0 @@
-; Two constants asserted equal, no disequalities to violate.
-; Expected: SAT
-(set-logic QF_UF)
-(declare-sort U 0)
-(declare-const a U)
-(declare-const b U)
-(assert (= a b))
-(check-sat)
