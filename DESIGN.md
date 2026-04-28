@@ -396,12 +396,15 @@ cmake --build build
 pip install -r bench/requirements.txt
 python3 bench/scripts/run.py all
 python3 bench/scripts/plot.py all
+python3 bench/scripts/summarize.py > bench/results/summary.txt
 ```
 
 Outputs land in `bench/results/` (gitignored). `run.py` has
 subcommands you can run individually — `strong-scaling`,
 `workload-sweep`, `trace`, `components`, `smt`, `all` — each writes one
-CSV; `plot.py` consumes them.
+CSV; `plot.py` renders PNGs; `summarize.py` prints the headline tables
+(median wallclock, speedup vs T=min, per-phase attribution, etc.) to
+stdout.
 
 | plot                           | what it shows                                                                              |
 |--------------------------------|--------------------------------------------------------------------------------------------|
