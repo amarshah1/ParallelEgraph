@@ -10,7 +10,8 @@ namespace {
 
 int usage(const char* prog) {
   std::fprintf(stderr,
-               "Usage: %s [--parallel|-p] [--timing|-t] [--profile-solve] [--debug-parse] <smt2-file>\n",
+               "Usage: %s [--parallel|-p] [--proof] [--timing|-t] "
+               "[--profile-solve] [--debug-parse] <smt2-file>\n",
                prog);
   return 2;
 }
@@ -19,6 +20,7 @@ int usage(const char* prog) {
 
 int main(int argc, char** argv) {
   bool parallel = false;
+  bool proof = false;
   bool timing = false;
   bool profile_solve = false;
   bool debug_parse = false;
@@ -28,6 +30,8 @@ int main(int argc, char** argv) {
     std::string arg = argv[i];
     if (arg == "--parallel" || arg == "-p") {
       parallel = true;
+    } else if (arg == "--proof") {
+      proof = true;
     } else if (arg == "--timing" || arg == "-t") {
       timing = true;
     } else if (arg == "--profile-solve") {
@@ -65,7 +69,7 @@ int main(int argc, char** argv) {
       return 0;
     }
     if (timing || profile_solve) {
-      auto [result, t] = pe::solve_timed(input, parallel);
+      auto [result, t] = pe::solve_timed(input, parallel, proof);
       std::printf("%s\n", pe::to_string(result));
       std::fprintf(stderr,
                    "timing: parse=%.6f build=%.6f merge=%.6f rebuild=%.6f "
@@ -73,7 +77,7 @@ int main(int argc, char** argv) {
                    t.parse_s, t.build_s, t.merge_s, t.rebuild_s, t.check_s,
                    t.solve_s, t.total_s);
     } else {
-      auto result = pe::solve_with_mode(input, parallel);
+      auto result = pe::solve_with_mode(input, parallel, proof);
       std::printf("%s\n", pe::to_string(result));
     }
   } catch (const std::exception& e) {

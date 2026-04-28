@@ -705,10 +705,11 @@ class UfPropagator : public CaDiCaL::ExternalPropagator {
  public:
   UfPropagator(std::unique_ptr<EGraph> root_eg,
                std::unordered_map<int, std::pair<Id, Id>> atoms,
-               bool parallel)
+               bool parallel, bool proof)
       : ground_(std::move(root_eg)),
         atom_endpoints_(std::move(atoms)),
-        parallel_(parallel) {
+        parallel_(parallel),
+        proof_(proof) {
     debug_ = std::getenv("PE_PROP_DEBUG") != nullptr;
     trace_ = std::getenv("PE_PROP_TRACE") != nullptr;
     lit_levels_.emplace_back();  // level 0 trail
@@ -774,10 +775,9 @@ class UfPropagator : public CaDiCaL::ExternalPropagator {
     // ---- (2) Flatten the trail. Use the model as ground truth: we want
     // to handle late literals CaDiCaL hasn't notified us about (e.g. some
     // fixed assignments at level 0 may bypass notify_assignment).
-    struct EqLit  { int lit; Id a; Id b; };
     struct DiseqLit { int lit; Id a; Id b; };
-    std::vector<EqLit>    pos_eqs;
-    std::vector<DiseqLit> neg_eqs;
+    parlay::sequence<EGraph::EqLit> pos_eqs;
+    std::vector<DiseqLit>           neg_eqs;
     pos_eqs.reserve(model.size());
     for (int lit : model) {
       int v = std::abs(lit);
@@ -789,38 +789,57 @@ class UfPropagator : public CaDiCaL::ExternalPropagator {
     }
 
     // ---- (3) Apply positive equalities. ----------------------------------
+    // Four-way switch over (parallel_, proof_):
+    //   parallel + proof    : parallel_merge_all_reason  (logs reasons)
+    //   parallel + no proof : parallel_merge_all          (no log)
+    //   sequential + proof  : per-pair merge_with_reason  (logs reasons)
+    //   sequential + no proof: per-pair merge             (no log)
     auto t_merge = debug_ ? clk::now() : clk::time_point{};
-    parlay::sequence<std::pair<Id, Id>> pairs;
-    pairs.reserve(pos_eqs.size());
-    for (auto& e : pos_eqs) pairs.emplace_back(e.a, e.b);
-    eg->parallel_merge_all(pairs);
+    if (parallel_ && proof_) {
+      eg->parallel_merge_all_reason(pos_eqs);
+    } else if (parallel_) {
+      eg->parallel_merge_all(pos_eqs);
+    } else if (proof_) {
+      for (auto& e : pos_eqs) {
+        eg->merge_with_reason(e.a, e.b, EGraph::ProofReason::asserted(e.lit));
+      }
+    } else {
+      for (auto& e : pos_eqs) eg->merge(e.a, e.b);
+    }
     if (debug_)
       merge_time_s_ += std::chrono::duration<double>(clk::now() - t_merge).count();
 
     // ---- (4) Close under congruence. -------------------------------------
+    // No parallel proof rebuild yet — proof mode always uses sequential
+    // rebuild_with_reasons regardless of parallel_.
     auto t_rb = debug_ ? clk::now() : clk::time_point{};
-    if (parallel_) eg->parallel_rebuild();
-    else           eg->rebuild();
+    if (proof_)         eg->rebuild_with_reasons();
+    else if (parallel_) eg->parallel_rebuild();
+    else                eg->rebuild();
     if (debug_)
       rebuild_time_s_ += std::chrono::duration<double>(clk::now() - t_rb).count();
 
     // ---- (5) Scan negative eqs for conflict. -----------------------------
-    // Conflict clause is built via prefix replay against a fresh ground
-    // clone: replay positive equalities one at a time, rebuild after
-    // each, and stop when the offending disequality's two sides become
-    // equivalent. The prefix used is the conflict core. This is sound
+    // Default mode: prefix replay against a fresh ground clone — sound
     // but not minimum.
+    // Proof mode: walk the merge log via explain() to get a small set of
+    // asserted literals whose conjunction forces a == b.
     bool ok = true;
     for (auto& d : neg_eqs) {
       if (!eg->equiv(d.a, d.b)) continue;
       conflict_clause_.clear();
       conflict_clause_.push_back(-d.lit);
-      auto explain_eg = ground_->clone();
-      for (const auto& e : pos_eqs) {
-        explain_eg->merge(e.a, e.b);
-        explain_eg->rebuild();
-        conflict_clause_.push_back(-e.lit);
-        if (explain_eg->equiv(d.a, d.b)) break;
+      if (proof_) {
+        std::vector<int> reasons = eg->explain(d.a, d.b);
+        for (int rlit : reasons) conflict_clause_.push_back(-rlit);
+      } else {
+        auto explain_eg = ground_->clone();
+        for (const auto& e : pos_eqs) {
+          explain_eg->merge(e.a, e.b);
+          explain_eg->rebuild();
+          conflict_clause_.push_back(-e.lit);
+          if (explain_eg->equiv(d.a, d.b)) break;
+        }
       }
       conflict_clause_.push_back(0);
       conflict_pending_ = true;
@@ -877,6 +896,8 @@ class UfPropagator : public CaDiCaL::ExternalPropagator {
 
   std::unordered_map<int, std::pair<Id, Id>> atom_endpoints_;
   bool parallel_;
+  bool proof_;  // when true, route merges through parallel_merge_all_reason
+                // and rebuild via rebuild_with_reasons for explain support
 
   // Pending conflict clause to deliver to CaDiCaL.
   std::vector<int> conflict_clause_;
@@ -905,7 +926,8 @@ double secs_since(std::chrono::steady_clock::time_point t) {
 }  // namespace
 
 std::pair<SolveResult, SolveTimings> sat_solve_timed(const std::string& input,
-                                                     bool parallel) {
+                                                     bool parallel,
+                                                     bool proof) {
   using clk = std::chrono::steady_clock;
   bool dbg = std::getenv("PE_PROP_DEBUG") != nullptr;
   SolveTimings timings;
@@ -970,7 +992,7 @@ std::pair<SolveResult, SolveTimings> sat_solve_timed(const std::string& input,
   // Build the propagator. It owns `eg` for the duration of the solve.
   UfPropagator prop(std::move(eg),
                     std::unordered_map<int, std::pair<Id, Id>>(enc.atom_endpoints()),
-                    parallel);
+                    parallel, proof);
   solver.connect_external_propagator(&prop);
   // Tell CaDiCaL which vars are theory atoms. Required by IPASIR-UP so it
   // notifies us only on those (skips aux Tseitin literal traffic).

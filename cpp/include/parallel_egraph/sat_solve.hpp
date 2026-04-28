@@ -15,6 +15,7 @@ namespace pe {
 // timings.rebuild_s = sum of in-propagator rebuild work, and the
 // existing parse/build/check fields preserved.
 std::pair<SolveResult, SolveTimings> sat_solve_timed(const std::string& input,
-                                                     bool parallel);
+                                                     bool parallel,
+                                                     bool proof = false);
 
 }  // namespace pe

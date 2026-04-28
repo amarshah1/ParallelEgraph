@@ -105,6 +105,7 @@ EGraph::EGraph(std::size_t capacity, bool parallel)
     : uf_(capacity),
       parent_index_(capacity),
       changed_(capacity),
+      explain_adj_(capacity),
       parallel_(parallel) {
   for (auto& b : changed_) b.store(false, std::memory_order_relaxed);
 }
@@ -196,6 +197,20 @@ Id EGraph::merge(Id a, Id b) {
     parents_.erase(it_p);
   }
 
+  // Migrate parent_index_[merged] into parent_index_[root]. parallel
+  // mode skips the classes_/parents_ migration above; the parent_index_
+  // migration here is what keeps the parent-walk in
+  // rebuild_with_reasons consistent across both modes (the parallel
+  // rebuild does the same migration via parallel_consolidate). Without
+  // this step, after merge(a, b) the parents of `a` get stranded under
+  // the old `merged` class id and rebuild_with_reasons misses them.
+  if (merged < parent_index_.size() && root < parent_index_.size()) {
+    auto& dst = parent_index_[root];
+    auto& src = parent_index_[merged];
+    for (auto idx : src) dst.push_back(idx);
+    src.clear();
+  }
+
   worklist_.push_back(root);
   return root;
 }
@@ -249,6 +264,157 @@ void EGraph::rebuild() {
   }
 }
 
+// ===========================================================================
+// Proof tracking: merge_with_reason / rebuild_with_reasons / explain
+// ===========================================================================
+// All three methods are opt-in. Default merge() / rebuild() /
+// parallel_rebuild() are unchanged and do not touch the proof state.
+// merge_with_reason and parallel_rebuild_with_reasons are concurrency-
+// safe because both merge_log_ and explain_adj_[c] are
+// ConcurrentAppendVec.
+
+Id EGraph::merge_with_reason(Id a, Id b, ProofReason r) {
+  // Skip if already equal — no log entry, nothing to do.
+  Id ra = uf_.find_root(a), rb = uf_.find_root(b);
+  if (ra == rb) return ra;
+  // Append to the global merge log first; the returned index is unique
+  // and serves as the edge label in explain_adj_.
+  std::uint64_t event_idx = merge_log_.append({a, b, std::move(r)});
+  // Append to both endpoints' adjacency lists. Two threads merging
+  // disjoint pairs touch disjoint adj lists; concurrent appends within
+  // a single class go through ConcurrentAppendVec's atomic counter.
+  // Keep the adjacency at the *pre-find* class ids — explain() walks
+  // these as recorded; the union-find post-state is irrelevant for the
+  // graph structure of "who was unioned with whom".
+  explain_adj_[a].append({b, event_idx});
+  explain_adj_[b].append({a, event_idx});
+  // Now do the union-find / classes_ / parents_ work via plain merge.
+  return merge(a, b);
+}
+
+void EGraph::rebuild_with_reasons() {
+  // Mirrors rebuild()'s outer loop, but the inner repair uses
+  // parent_index_ + nodes_ (which add() populates in *both* sequential
+  // and parallel modes). This makes proof tracking correct regardless
+  // of how the EGraph was constructed.
+  auto repair_one = [&](Id id) {
+    id = find(id);
+    if (id >= parent_index_.size()) return;
+    // Snapshot indices because merge_with_reason can recursively
+    // trigger more merges (via repair_one's outer loop). parent_index_
+    // is append-only, but defensive copy avoids iterator pitfalls.
+    std::vector<std::uint32_t> idxs(parent_index_[id].begin(),
+                                     parent_index_[id].end());
+    for (std::uint32_t node_idx : idxs) {
+      const auto& slot = nodes_[node_idx];
+      const ENode& p_enode = slot.first;
+      Id p_class = slot.second;
+      ENode p_canon = canonicalize(p_enode);
+      Id p_id = find(p_class);
+
+      auto existing_it = hashcons_.find(p_canon);
+      if (existing_it != hashcons_.end()) {
+        Id existing = find(existing_it->second);
+        if (find(p_id) != find(existing)) {
+          ProofReason r = ProofReason::congruence(
+              existing_it->first.children, p_canon.children);
+          merge_with_reason(p_id, existing, std::move(r));
+        }
+      } else {
+        hashcons_.emplace(std::move(p_canon), p_id);
+      }
+    }
+  };
+
+  while (!worklist_.empty()) {
+    std::vector<Id> todo;
+    todo.swap(worklist_);
+    for (Id id : todo) {
+      Id id_root = find(id);
+      repair_one(id_root);
+    }
+  }
+}
+
+std::vector<int> EGraph::explain(Id a, Id b) {
+  // Step 1: BFS over explain_adj_ from a until reaching b. Record the
+  // path of (event_idx) values used.
+  // Step 2: walk the path of MergeEvents, recursively expanding any
+  // Congruence reason into proofs of its children's equalities.
+  // Step 3: dedupe via a fresh union-find — keep an asserted reason iff
+  // its endpoints aren't yet equivalent in the fresh UF.
+  std::vector<int> result;
+  if (a == b) return result;
+
+  // Worklist of equalities to explain.
+  std::vector<std::pair<Id, Id>> todo;
+  todo.emplace_back(a, b);
+
+  struct AssertedHit { int lit; Id end_a, end_b; };
+  std::vector<AssertedHit> hits;
+
+  while (!todo.empty()) {
+    auto [x, y] = todo.back();
+    todo.pop_back();
+    if (x == y) continue;
+    if (x >= explain_adj_.size() || y >= explain_adj_.size()) continue;
+
+    // BFS from x to y. pred[c] = (predecessor class, event_idx of edge).
+    std::unordered_map<Id, std::pair<Id, std::uint64_t>> pred;
+    pred.emplace(x, std::make_pair(x, ~std::uint64_t(0)));
+    std::vector<Id> q;
+    q.push_back(x);
+    std::size_t qhead = 0;
+    bool found = false;
+    while (qhead < q.size()) {
+      Id cur = q[qhead++];
+      if (cur == y) { found = true; break; }
+      if (cur >= explain_adj_.size()) continue;
+      auto& adj = explain_adj_[cur];
+      std::size_t n = adj.size();
+      for (std::size_t i = 0; i < n; ++i) {
+        auto [nbr, evt] = adj.at(i);
+        if (pred.find(nbr) == pred.end()) {
+          pred.emplace(nbr, std::make_pair(cur, evt));
+          q.push_back(nbr);
+        }
+      }
+    }
+    if (!found) continue;
+
+    // Walk back from y to x, collecting events.
+    Id cur = y;
+    while (cur != x) {
+      auto& [prev, evt] = pred[cur];
+      const MergeEvent& ev = merge_log_.at(evt);
+      if (ev.reason.kind == ProofReason::Kind::Asserted) {
+        hits.push_back({ev.reason.sat_lit, ev.a, ev.b});
+      } else {
+        const auto& ca = ev.reason.children_a;
+        const auto& cb = ev.reason.children_b;
+        for (std::size_t i = 0; i < ca.size(); ++i) {
+          if (ca[i] != cb[i]) todo.emplace_back(ca[i], cb[i]);
+        }
+      }
+      cur = prev;
+    }
+  }
+
+  // Dedupe via fresh UF.
+  std::size_t cap = uf_.capacity();
+  if (cap == 0) cap = 1;
+  SequentialUnionFind fresh(cap);
+  std::unordered_set<int> already_emitted;
+  for (auto& h : hits) {
+    if (h.end_a >= cap || h.end_b >= cap) continue;
+    if (fresh.find_root(h.end_a) == fresh.find_root(h.end_b)) continue;
+    fresh.union_(h.end_a, h.end_b);
+    if (already_emitted.insert(h.lit).second) {
+      result.push_back(h.lit);
+    }
+  }
+  return result;
+}
 
 // ---- parallel_merge_all --------------------------------------------------
 
@@ -263,10 +429,34 @@ void EGraph::parallel_merge(Id a, Id b) {
 }
 
 void EGraph::parallel_merge_all(
-    const parlay::sequence<std::pair<Id, Id>>& pairs) {
-  if (pairs.empty()) return;
-  parlay::parallel_for(0, pairs.size(), [&](std::size_t i) {
-    parallel_merge(pairs[i].first, pairs[i].second);
+    const parlay::sequence<EqLit>& eqs) {
+  if (eqs.empty()) return;
+  parlay::parallel_for(0, eqs.size(), [&](std::size_t i) {
+    parallel_merge(eqs[i].a, eqs[i].b);
+  });
+}
+
+// Parallel-safe variant of merge_with_reason that skips the sequential-
+// only bookkeeping (classes_, parents_, worklist_), like parallel_merge
+// does. Called from parallel_merge_all_reason.
+void EGraph::parallel_merge_reason(Id a, Id b, ProofReason r) {
+  Id ra = uf_.find_root(a), rb = uf_.find_root(b);
+  if (ra == rb) return;
+  // Log via ConcurrentAppendVec (lock-free).
+  std::uint64_t event_idx = merge_log_.append({a, b, std::move(r)});
+  explain_adj_[a].append({b, event_idx});
+  explain_adj_[b].append({a, event_idx});
+  uf_.union_(a, b);
+  changed_[a].store(true, std::memory_order_release);
+  changed_[b].store(true, std::memory_order_release);
+}
+
+void EGraph::parallel_merge_all_reason(
+    const parlay::sequence<EqLit>& eqs) {
+  if (eqs.empty()) return;
+  parlay::parallel_for(0, eqs.size(), [&](std::size_t i) {
+    parallel_merge_reason(eqs[i].a, eqs[i].b,
+                          ProofReason::asserted(eqs[i].lit));
   });
 }
 

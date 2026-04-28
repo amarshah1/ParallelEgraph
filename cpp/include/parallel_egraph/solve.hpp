@@ -17,9 +17,16 @@ struct SolveTimings {
   double solve_s = 0.0;
 };
 
-SolveResult solve_with_mode(const std::string& input, bool parallel);
+// `proof` enables Nieuwenhuis-Oliveras-style proof tracking through the
+// SAT-driven path: the propagator records merges into the e-graph's
+// merge log and produces minimal-ish conflict clauses via explain()
+// instead of prefix replay. No-op for the legacy fast path (used when
+// the formula is top-level conjunctive).
+SolveResult solve_with_mode(const std::string& input, bool parallel,
+                            bool proof = false);
 std::pair<SolveResult, SolveTimings> solve_timed(const std::string& input,
-                                                 bool parallel);
+                                                 bool parallel,
+                                                 bool proof = false);
 
 void begin_solve_region();
 void end_solve_region();

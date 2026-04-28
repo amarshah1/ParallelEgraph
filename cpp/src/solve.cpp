@@ -115,7 +115,8 @@ double secs_since(std::chrono::steady_clock::time_point t) {
 }  // namespace
 
 std::pair<SolveResult, SolveTimings> solve_timed(const std::string& input,
-                                                 bool parallel) {
+                                                 bool parallel,
+                                                 bool proof) {
   using clk = std::chrono::steady_clock;
   SolveTimings timings;
   auto total_start = clk::now();
@@ -130,9 +131,11 @@ std::pair<SolveResult, SolveTimings> solve_timed(const std::string& input,
   timings.parse_s = secs_since(parse_start);
 
   // Boolean-structured assertions go through the SAT-driven pipeline.
-  // Pure (= ...) / (not (= ...)) at top level keeps the legacy fast path.
+  // Pure (= ...) / (not (= ...)) at top level keeps the legacy fast path
+  // (which doesn't use proof tracking — the `proof` flag is meaningful
+  // only for the SAT-driven path).
   if (!is_pure_conjunctive(script)) {
-    auto [r, t] = sat_solve_timed(input, parallel);
+    auto [r, t] = sat_solve_timed(input, parallel, proof);
     // sat_solve_timed re-parses; subtract its parse time from ours since
     // we already did one parse above. (The two parses are the same work,
     // and sat_solve_timed does its own parse to keep the pipeline self-
@@ -149,7 +152,8 @@ std::pair<SolveResult, SolveTimings> solve_timed(const std::string& input,
   // --- Build ---
   begin_solve_region();
   EGraph eg(capacity, parallel);
-  parlay::sequence<std::pair<Id, Id>> equalities;
+  // Legacy fast path has no SAT lits; use 0 as the sentinel literal.
+  parlay::sequence<EGraph::EqLit> equalities;
   std::vector<std::pair<Id, Id>> disequalities;
 
   auto build_start = clk::now();
@@ -157,7 +161,7 @@ std::pair<SolveResult, SolveTimings> solve_timed(const std::string& input,
   if (parallel) {
     for (const Term* t : assertions) {
       Assertion a = process_assertion(eg, *t);
-      if (a.kind == Assertion::Kind::Eq) equalities.emplace_back(a.a, a.b);
+      if (a.kind == Assertion::Kind::Eq) equalities.push_back({0, a.a, a.b});
       else                                 disequalities.emplace_back(a.a, a.b);
     }
     timings.build_s = secs_since(build_start);
@@ -209,8 +213,9 @@ std::pair<SolveResult, SolveTimings> solve_timed(const std::string& input,
   return {result, timings};
 }
 
-SolveResult solve_with_mode(const std::string& input, bool parallel) {
-  return solve_timed(input, parallel).first;
+SolveResult solve_with_mode(const std::string& input, bool parallel,
+                            bool proof) {
+  return solve_timed(input, parallel, proof).first;
 }
 
 }  // namespace pe
