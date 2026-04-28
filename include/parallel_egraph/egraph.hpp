@@ -89,6 +89,7 @@ class EGraph {
   // Internal but exposed for tests / benches that need raw access.
   ConcurrentUnionFind& uf() { return uf_; }
   const parlay::sequence<std::pair<ENode, Id>>& nodes() const { return nodes_; }
+  parlay::sequence<parlay::sequence<Id>>& parent_index() { return parent_index_; }
 
  private:
   Id make_id() { return uf_.make_set(); }

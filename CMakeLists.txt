@@ -42,6 +42,12 @@ target_link_libraries(egraph-cc PRIVATE parallel_egraph_core)
 add_executable(closure_compare_bench bench/closure_compare.cpp)
 target_link_libraries(closure_compare_bench PRIVATE parallel_egraph_core)
 
+add_executable(component_bench bench/component_bench.cpp)
+target_link_libraries(component_bench PRIVATE parallel_egraph_core)
+
+add_executable(smt_bench bench/smt_bench.cpp)
+target_link_libraries(smt_bench PRIVATE parallel_egraph_core)
+
 # ---- tests ----
 enable_testing()
 

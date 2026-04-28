@@ -1,5 +1,7 @@
 #include "parallel_egraph/egraph.hpp"
+#include "parallel_egraph/detail.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
@@ -175,7 +177,7 @@ Id EGraph::add(ENode node) {
 // precompute offsets via parlay::scan, resize parent_index[r] once, then
 // scatter each c's entries into its pre-computed slot.
 
-namespace {
+namespace detail {
 
 void parallel_consolidate(
     parlay::sequence<parlay::sequence<Id>>& parent_index,
@@ -222,11 +224,9 @@ void parallel_consolidate(
   });
 }
 
-struct CanonEntry {
-  std::uint64_t h;
-  std::uint32_t idx;
-  Id root;
-};
+}  // namespace detail
+
+namespace {
 
 // PE_DNC_CUTOFF env var lets us sweep without recompiling.
 inline std::size_t dnc_cutoff() {
@@ -273,6 +273,10 @@ void dnc_union(Bucket& bucket, std::size_t lo, std::size_t hi,
   uf.union_(bucket[lo].root, bucket[mid].root);
 }
 
+}  // namespace
+
+namespace detail {
+
 // Given a canon sequence, merge classes that share both hash and signature,
 // applying unions inline as the per-bucket scan proceeds, and return the
 // set of touched class ids (pre-round roots of any union issued).
@@ -308,7 +312,7 @@ parlay::sequence<Id> merge_and_collect_semisort(
   return parlay::flatten(per_group);
 }
 
-}  // namespace
+}  // namespace detail
 
 // ---- parallel_close ------------------------------------------------------
 
@@ -317,6 +321,10 @@ void EGraph::parallel_close(parlay::sequence<std::pair<Id, Id>> initial_unions) 
   auto& nodes = nodes_;
   auto& parent_index = parent_index_;
   const bool trace = std::getenv("PE_TRACE") != nullptr;
+  using clk = std::chrono::steady_clock;
+  auto ms_since = [](clk::time_point t0) {
+    return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+  };
 
   parlay::parallel_for(0, initial_unions.size(), [&](std::size_t i) {
     uf.union_(initial_unions[i].first, initial_unions[i].second);
@@ -330,35 +338,46 @@ void EGraph::parallel_close(parlay::sequence<std::pair<Id, Id>> initial_unions) 
   while (!work.empty()) {
     work = parlay::remove_duplicates(std::move(work));
 
+    auto t_consolidate = clk::now();
     auto roots = parlay::map(work, [&](Id c) { return uf.find_root(c); });
-    parallel_consolidate(parent_index, work, roots);
+    detail::parallel_consolidate(parent_index, work, roots);
+    double consolidate_ms = trace ? ms_since(t_consolidate) : 0.0;
 
+    auto t_frontier = clk::now();
     auto unique_roots = parlay::remove_duplicates(roots);
-
     auto frontier = parlay::flatten(parlay::map(unique_roots, [&](Id r) {
       return parlay::sequence<std::uint32_t>(std::begin(parent_index[r]),
                                              std::end(parent_index[r]));
     }));
+    double frontier_ms = trace ? ms_since(t_frontier) : 0.0;
+
     if (frontier.empty()) {
       if (trace) {
-        std::fprintf(stderr, "[pe] round=%3zu work=%9zu frontier=0 (break)\n",
-                     round, work.size());
+        std::fprintf(stderr,
+                     "[pe] round=%3zu work=%9zu frontier=        0 next=        0 "
+                     "consolidate=%7.3fms frontier=%7.3fms semisort=%7.3fms (break)\n",
+                     round, work.size(), consolidate_ms, frontier_ms, 0.0);
       }
       break;
     }
 
+    auto t_semisort = clk::now();
     auto canon = parlay::map(frontier, [&](std::uint32_t idx) {
       const auto& [node, class_id] = nodes[idx];
-      return CanonEntry{sig_hash(node, uf), idx, uf.find_root(class_id)};
+      return detail::CanonEntry{sig_hash(node, uf), idx, uf.find_root(class_id)};
     });
 
-    auto next_work = merge_and_collect_semisort(std::move(canon), uf, nodes);
+    auto next_work =
+        detail::merge_and_collect_semisort(std::move(canon), uf, nodes);
     next_work = parlay::remove_duplicates(std::move(next_work));
+    double semisort_ms = trace ? ms_since(t_semisort) : 0.0;
 
     if (trace) {
       std::fprintf(stderr,
-                   "[pe] round=%3zu work=%9zu frontier=%9zu next=%9zu\n",
-                   round, work.size(), frontier.size(), next_work.size());
+                   "[pe] round=%3zu work=%9zu frontier=%9zu next=%9zu "
+                   "consolidate=%7.3fms frontier=%7.3fms semisort=%7.3fms\n",
+                   round, work.size(), frontier.size(), next_work.size(),
+                   consolidate_ms, frontier_ms, semisort_ms);
     }
 
     work = std::move(next_work);

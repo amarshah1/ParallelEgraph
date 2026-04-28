@@ -9,6 +9,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -166,32 +168,108 @@ std::vector<double> bench_parallel_close(const Workload& w) {
 
 }  // namespace
 
+// Parse "leaves,fns,nodes,merges,depth" → Workload. Returns false on
+// malformed input.
+bool parse_custom_workload(const char* spec, Workload& out) {
+  out.name = "custom";
+  std::size_t* fields[] = {&out.n_leaves, &out.n_fns, &out.n_nodes,
+                           &out.n_merges, &out.depth};
+  std::string s(spec);
+  std::size_t start = 0;
+  for (int i = 0; i < 5; ++i) {
+    std::size_t end = s.find(',', start);
+    std::string tok = (end == std::string::npos) ? s.substr(start)
+                                                  : s.substr(start, end - start);
+    if (tok.empty()) return false;
+    char* endp = nullptr;
+    unsigned long long v = std::strtoull(tok.c_str(), &endp, 10);
+    if (!endp || *endp != '\0') return false;
+    *fields[i] = static_cast<std::size_t>(v);
+    if (end == std::string::npos) {
+      if (i != 4) return false;
+      break;
+    }
+    start = end + 1;
+  }
+  return out.depth >= 1 && out.n_leaves > 0 && out.n_nodes > 0;
+}
+
 int main() {
   std::size_t par_threads = parlay::num_workers();
-
-  std::printf("close_compare  trials=%d  warmup=%d  par_threads=%zu\n",
-              TRIALS, WARMUP, par_threads);
-  std::printf("%-8s %8s %10s %9s | %11s | %11s %11s\n",
-              "name", "leaves", "nodes", "merges",
-              "nelson_seq", "par_close", "par_spd");
 
   // PE_BENCH_ONLY=large (etc.) restricts to a single workload — handy for
   // quick parameter sweeps without paying for the other five.
   const char* only = std::getenv("PE_BENCH_ONLY");
   // PE_BENCH_SKIP_NELSON=1 skips the sequential baseline (sweep-only).
   const bool skip_nelson = std::getenv("PE_BENCH_SKIP_NELSON") != nullptr;
+  // PE_BENCH_FORMAT=csv emits one row per (workload, algorithm, trial)
+  // instead of the aligned summary table. Header gated by PE_BENCH_HEADER=1
+  // so multiple driver invocations can append.
+  const char* fmt = std::getenv("PE_BENCH_FORMAT");
+  const bool csv = fmt && std::strcmp(fmt, "csv") == 0;
+  const bool csv_header = std::getenv("PE_BENCH_HEADER") != nullptr;
+  // PE_BENCH_CUSTOM=leaves,fns,nodes,merges,depth replaces the 6 baked-in
+  // workloads with a single caller-specified one.
+  const char* custom_spec = std::getenv("PE_BENCH_CUSTOM");
+  // PE_UNION_STYLE / PE_DNC_CUTOFF aren't read here, but we tag CSV rows
+  // with their values so downstream plots can group correctly.
+  const char* union_style_env = std::getenv("PE_UNION_STYLE");
+  const char* dnc_cutoff_env = std::getenv("PE_DNC_CUTOFF");
+  const std::string union_style = union_style_env ? union_style_env : "dnc";
+  const std::string dnc_cutoff = dnc_cutoff_env ? dnc_cutoff_env : "16";
 
-  for (const auto& w : WORKLOADS) {
+  std::vector<Workload> workloads;
+  Workload custom_w{};
+  if (custom_spec) {
+    if (!parse_custom_workload(custom_spec, custom_w)) {
+      std::fprintf(stderr,
+                   "PE_BENCH_CUSTOM must be 'leaves,fns,nodes,merges,depth' "
+                   "(got '%s')\n",
+                   custom_spec);
+      return 2;
+    }
+    workloads.push_back(custom_w);
+  } else {
+    workloads = WORKLOADS;
+  }
+
+  if (!csv) {
+    std::printf("close_compare  trials=%d  warmup=%d  par_threads=%zu\n",
+                TRIALS, WARMUP, par_threads);
+    std::printf("%-8s %8s %10s %9s | %11s | %11s %11s\n",
+                "name", "leaves", "nodes", "merges",
+                "nelson_seq", "par_close", "par_spd");
+  } else if (csv_header) {
+    std::printf("workload,leaves,fns,nodes,merges,depth,algorithm,trial,"
+                "parlay_threads,union_style,dnc_cutoff,wallclock_ms\n");
+  }
+
+  auto emit_csv = [&](const Workload& w, const char* algorithm,
+                      const std::vector<double>& times) {
+    for (std::size_t i = 0; i < times.size(); ++i) {
+      std::printf("%s,%zu,%zu,%zu,%zu,%zu,%s,%zu,%zu,%s,%s,%.4f\n",
+                  w.name, w.n_leaves, w.n_fns, w.n_nodes, w.n_merges, w.depth,
+                  algorithm, i, par_threads, union_style.c_str(),
+                  dnc_cutoff.c_str(), times[i]);
+    }
+  };
+
+  for (const auto& w : workloads) {
     if (only && std::string(only) != w.name) continue;
     std::fprintf(stderr, "[bench] running %s ...\n", w.name);
+    std::vector<double> nel;
     double mn = 0.0;
     if (!skip_nelson) {
-      auto nel = bench_nelson(w);
+      nel = bench_nelson(w);
       mn = median(nel);
     }
     auto par = bench_parallel_close(w);
     double mp = median(par);
-    if (skip_nelson) {
+
+    if (csv) {
+      if (!skip_nelson) emit_csv(w, "nelson_seq", nel);
+      emit_csv(w, "par_close", par);
+    } else if (skip_nelson) {
       std::printf("%-8s %8zu %10zu %9zu |   skipped  | %9.2fms\n",
                   w.name, w.n_leaves, w.n_nodes, w.n_merges, mp);
     } else {

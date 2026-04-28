@@ -383,3 +383,45 @@ for s in '' adjacent; do
     ./build/closure_compare_bench | grep '^large'
 done
 ```
+
+## Eval (reproducing the plots)
+
+The bench infra under [bench/scripts/](bench/scripts/) drives sweeps and
+emits plots. CSV output from `closure_compare_bench` is opt-in
+(`PE_BENCH_FORMAT=csv`); the human-readable text format is unchanged
+when the env var is unset.
+
+```
+cmake --build build
+pip install -r bench/requirements.txt
+python3 bench/scripts/run.py all
+python3 bench/scripts/plot.py all
+```
+
+Outputs land in `bench/results/` (gitignored). `run.py` has
+subcommands you can run individually — `strong-scaling`,
+`workload-sweep`, `trace`, `components`, `smt`, `all` — each writes one
+CSV; `plot.py` consumes them.
+
+| plot                           | what it shows                                                                              |
+|--------------------------------|--------------------------------------------------------------------------------------------|
+| `fig_strong_scaling.png`       | speedup vs PARLAY_NUM_THREADS, one line per workload, with an ideal `y=x` reference        |
+| `fig_wallclock.png`            | par_close wallclock vs threads, log-log; companion to the speedup plot                     |
+| `fig_trace_rounds_<w>_T<n>.png`| per-round time broken into consolidate / frontier / semisort (stacked bar)                 |
+| `fig_components.png`           | round-0 `parallel_consolidate` and `merge_and_collect_semisort` wallclock vs threads       |
+| `fig_workload_depth.png`       | par_close ms vs depth, one line per merge_frac                                              |
+| `fig_workload_merge_frac.png`  | par_close ms vs merge_frac, one line per depth                                              |
+| `fig_smt_scaling.png`          | par_close ms vs `n` for the four `gen_bench.py` families (`chain`, `grid`, `cube`, `exp`)   |
+
+Two new bench binaries:
+
+- `./build/component_bench` — times `parallel_consolidate` and
+  `merge_and_collect_semisort` in isolation on round-0 mid-state.
+  CSV mode under `PE_BENCH_FORMAT=csv`; workload via `PE_COMPONENT_WORKLOAD`.
+- `./build/smt_bench <dir-or-file> ...` — runs `parallel_close` over
+  every `.smt2` under the given paths, emitting CSV. Filename pattern
+  `<family>_n<N>_(sat|unsat).smt2` (matching `gen_bench.py`) gets
+  `family` and `n` columns; other names get blank `family`.
+
+Both share `PE_BENCH_HEADER=1` (emit CSV header) and
+`PE_BENCH_SKIP_NELSON=1` (skip the sequential baseline).
