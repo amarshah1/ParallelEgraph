@@ -286,21 +286,35 @@ namespace detail {
 // collisions, so groups are exact and no in-bucket sort is needed.
 parlay::sequence<Id> merge_and_collect_semisort(
     parlay::sequence<CanonEntry> canon, ConcurrentUnionFind& uf,
-    const parlay::sequence<std::pair<ENode, Id>>& nodes) {
+    const parlay::sequence<std::pair<ENode, Id>>& nodes,
+    SemisortTimings* timings) {
   const std::size_t n = canon.size();
-  if (n == 0) return {};
+  if (n == 0) {
+    if (timings) *timings = {0.0, 0.0, 0.0};
+    return {};
+  }
 
+  using clk = std::chrono::steady_clock;
+  auto ms_since = [](clk::time_point t0) {
+    return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+  };
+
+  auto t0 = timings ? clk::now() : clk::time_point{};
   auto keyed = parlay::tabulate(n, [&](std::size_t i) {
     return std::pair<CanonEntry, CanonEntry>{canon[i], canon[i]};
   });
+  if (timings) timings->keyed_ms = ms_since(t0);
 
   auto hash_fn = [](const CanonEntry& e) -> std::size_t { return e.h; };
   auto equal_fn = [&](const CanonEntry& a, const CanonEntry& b) -> bool {
     return a.h == b.h && sigs_equal(a.idx, b.idx, uf, nodes);
   };
+  auto t1 = timings ? clk::now() : clk::time_point{};
   auto groups =
       parlay::group_by_key(std::move(keyed), hash_fn, equal_fn);
+  if (timings) timings->group_by_ms = ms_since(t1);
 
+  auto t2 = timings ? clk::now() : clk::time_point{};
   auto per_group = parlay::map(groups, [&](auto& kv) -> parlay::sequence<Id> {
     auto& values = kv.second;
     if (values.size() < 2) return {};
@@ -309,7 +323,9 @@ parlay::sequence<Id> merge_and_collect_semisort(
                             [&](std::size_t i) { return values[i].root; });
   });
 
-  return parlay::flatten(per_group);
+  auto out = parlay::flatten(per_group);
+  if (timings) timings->per_group_ms = ms_since(t2);
+  return out;
 }
 
 }  // namespace detail
@@ -367,17 +383,20 @@ void EGraph::parallel_close(parlay::sequence<std::pair<Id, Id>> initial_unions) 
       return detail::CanonEntry{sig_hash(node, uf), idx, uf.find_root(class_id)};
     });
 
-    auto next_work =
-        detail::merge_and_collect_semisort(std::move(canon), uf, nodes);
+    detail::SemisortTimings semi_t{};
+    auto next_work = detail::merge_and_collect_semisort(
+        std::move(canon), uf, nodes, trace ? &semi_t : nullptr);
     next_work = parlay::remove_duplicates(std::move(next_work));
     double semisort_ms = trace ? ms_since(t_semisort) : 0.0;
 
     if (trace) {
       std::fprintf(stderr,
                    "[pe] round=%3zu work=%9zu frontier=%9zu next=%9zu "
-                   "consolidate=%7.3fms frontier=%7.3fms semisort=%7.3fms\n",
+                   "consolidate=%7.3fms frontier=%7.3fms semisort=%7.3fms "
+                   "(keyed=%6.3fms group_by=%7.3fms per_group=%6.3fms)\n",
                    round, work.size(), frontier.size(), next_work.size(),
-                   consolidate_ms, frontier_ms, semisort_ms);
+                   consolidate_ms, frontier_ms, semisort_ms,
+                   semi_t.keyed_ms, semi_t.group_by_ms, semi_t.per_group_ms);
     }
 
     work = std::move(next_work);

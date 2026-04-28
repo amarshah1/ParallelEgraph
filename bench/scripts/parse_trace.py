@@ -26,6 +26,9 @@ LINE_RE = re.compile(
     r"consolidate=\s*(?P<cons>[0-9.]+)ms\s+"
     r"frontier=\s*(?P<front>[0-9.]+)ms\s+"
     r"semisort=\s*(?P<semi>[0-9.]+)ms"
+    r"(?:\s+\(keyed=\s*(?P<keyed>[0-9.]+)ms"
+    r"\s+group_by=\s*(?P<group_by>[0-9.]+)ms"
+    r"\s+per_group=\s*(?P<per_group>[0-9.]+)ms\))?"
 )
 
 
@@ -39,17 +42,22 @@ def main():
     if not args.no_header:
         print(
             "workload,parlay_threads,round,work,frontier,next,"
-            "consolidate_ms,frontier_ms,semisort_ms"
+            "consolidate_ms,frontier_ms,semisort_ms,"
+            "keyed_ms,group_by_ms,per_group_ms"
         )
 
     for line in sys.stdin:
         m = LINE_RE.search(line)
         if not m:
             continue
+        keyed = m["keyed"] or ""
+        gby = m["group_by"] or ""
+        pg = m["per_group"] or ""
         print(
             f"{args.workload},{args.threads},"
             f"{m['round']},{m['work']},{m['frontier']},{m['next']},"
-            f"{m['cons']},{m['front']},{m['semi']}"
+            f"{m['cons']},{m['front']},{m['semi']},"
+            f"{keyed},{gby},{pg}"
         )
 
 

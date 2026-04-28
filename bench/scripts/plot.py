@@ -102,31 +102,52 @@ def plot_wallclock(_args):
 
 def plot_trace_rounds(_args):
     df = _read(RESULTS / "trace.csv")
-    # Average each phase per round across the 11 trials × 2 (warmup ignored
-    # — we want a representative profile, not a tail-distribution).
+    # If sub-phase columns are present, decompose semisort into them plus a
+    # "canon+other" residual = semisort_ms - (keyed + group_by + per_group).
+    has_sub = {"keyed_ms", "group_by_ms", "per_group_ms"}.issubset(df.columns)
+    cols = ["consolidate_ms", "frontier_ms", "semisort_ms"]
+    if has_sub:
+        cols += ["keyed_ms", "group_by_ms", "per_group_ms"]
+
     grp = (
-        df.groupby(["workload", "parlay_threads", "round"])[
-            ["consolidate_ms", "frontier_ms", "semisort_ms"]
-        ]
+        df.groupby(["workload", "parlay_threads", "round"])[cols]
         .mean()
         .reset_index()
     )
-    # Plot one figure per (workload, threads) combination.
+
     for (w, t), sub in grp.groupby(["workload", "parlay_threads"]):
-        sub = sub.sort_values("round")
-        fig, ax = plt.subplots(figsize=(7, 4.5))
+        sub = sub.sort_values("round").copy()
+        fig, ax = plt.subplots(figsize=(7.5, 4.8))
         bottom = [0.0] * len(sub)
-        for col, label in [
-            ("consolidate_ms", "consolidate"),
-            ("frontier_ms", "frontier"),
-            ("semisort_ms", "semisort"),
-        ]:
-            ax.bar(sub["round"], sub[col], bottom=bottom, label=label)
-            bottom = [b + v for b, v in zip(bottom, sub[col])]
+        if has_sub:
+            sub["semisort_other_ms"] = (
+                sub["semisort_ms"]
+                - sub["keyed_ms"].fillna(0)
+                - sub["group_by_ms"].fillna(0)
+                - sub["per_group_ms"].fillna(0)
+            ).clip(lower=0)
+            stacks = [
+                ("consolidate_ms", "consolidate"),
+                ("frontier_ms", "frontier_build"),
+                ("keyed_ms", "semi: keyed"),
+                ("group_by_ms", "semi: group_by_key"),
+                ("per_group_ms", "semi: per_group"),
+                ("semisort_other_ms", "semi: canon+dedup"),
+            ]
+        else:
+            stacks = [
+                ("consolidate_ms", "consolidate"),
+                ("frontier_ms", "frontier_build"),
+                ("semisort_ms", "semisort"),
+            ]
+        for col, label in stacks:
+            vals = sub[col].fillna(0)
+            ax.bar(sub["round"], vals, bottom=bottom, label=label)
+            bottom = [b + v for b, v in zip(bottom, vals)]
         ax.set_xlabel("round")
         ax.set_ylabel("ms (mean across trials)")
         ax.set_title(f"per-round phase breakdown — {w}, T={t}")
-        ax.legend()
+        ax.legend(loc="best", fontsize=8)
         ax.grid(True, alpha=0.3, axis="y")
         _save(fig, f"fig_trace_rounds_{w}_T{t}.png")
 

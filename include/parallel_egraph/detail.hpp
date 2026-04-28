@@ -18,6 +18,14 @@ struct CanonEntry {
   Id root;
 };
 
+// Optional sub-phase wallclock attribution for merge_and_collect_semisort.
+// Caller passes nullptr to skip the chrono::steady_clock samples entirely.
+struct SemisortTimings {
+  double keyed_ms;       // parlay::tabulate of keyed pairs
+  double group_by_ms;    // parlay::group_by_key (hash distribute + equal probe)
+  double per_group_ms;   // parlay::map + dnc_union + flatten
+};
+
 void parallel_consolidate(
     parlay::sequence<parlay::sequence<Id>>& parent_index,
     const parlay::sequence<Id>& cs,
@@ -26,6 +34,7 @@ void parallel_consolidate(
 parlay::sequence<Id> merge_and_collect_semisort(
     parlay::sequence<CanonEntry> canon,
     ConcurrentUnionFind& uf,
-    const parlay::sequence<std::pair<ENode, Id>>& nodes);
+    const parlay::sequence<std::pair<ENode, Id>>& nodes,
+    SemisortTimings* timings = nullptr);
 
 }  // namespace pe::detail

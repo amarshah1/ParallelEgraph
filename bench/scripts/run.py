@@ -48,7 +48,8 @@ SMT_HEADER = (
 )
 TRACE_HEADER = (
     "workload,parlay_threads,round,work,frontier,next,"
-    "consolidate_ms,frontier_ms,semisort_ms"
+    "consolidate_ms,frontier_ms,semisort_ms,"
+    "keyed_ms,group_by_ms,per_group_ms"
 )
 
 
@@ -73,6 +74,10 @@ def cmd_strong_scaling(args):
                 "PARLAY_NUM_THREADS": str(t),
                 "PE_BENCH_FORMAT": "csv",
             }
+            # nelson_seq is sequential; only meaningful at T=1. Re-running it
+            # at every T wastes wallclock without producing new data.
+            if t != min(threads):
+                env["PE_BENCH_SKIP_NELSON"] = "1"
             if w:
                 env["PE_BENCH_ONLY"] = w
             print(f"[strong-scaling] T={t} workload={w or 'all'}")
