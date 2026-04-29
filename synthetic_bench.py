@@ -48,14 +48,16 @@ ALL_FAMILIES = list(FAMILY_NS.keys())
 
 def build_synthetic_bench(release: bool) -> str:
     build_dir = "build"
-    if not os.path.isdir(build_dir):
-        build_type = "Release" if release else "Debug"
-        print(f"Configuring CMake ({build_type})...", flush=True)
-        subprocess.run(
-            ["cmake", "-B", build_dir, "-S", ".",
-             f"-DCMAKE_BUILD_TYPE={build_type}"],
-            check=True, capture_output=True,
-        )
+    build_type = "Release" if release else "Debug"
+    # Always run cmake configure: idempotent on an already-configured
+    # build dir (just regenerates Makefiles), and picks up any
+    # CMakeLists.txt edits since the last invocation.
+    print(f"Configuring CMake ({build_type})...", flush=True)
+    subprocess.run(
+        ["cmake", "-B", build_dir, "-S", ".",
+         f"-DCMAKE_BUILD_TYPE={build_type}"],
+        check=True, capture_output=True,
+    )
     print("Building synthetic_bench...", flush=True)
     subprocess.run(
         ["cmake", "--build", build_dir, "-j", "--target", "synthetic_bench"],
@@ -158,7 +160,16 @@ def print_summary(csv_text: str, has_header: bool):
     # Header
     print(f"  {'family':<8} {'n':>5} {'thr':>4} {'classes':>9} {'merges':>7} "
           f"| {'nelson_ms':>10} {'parclose_ms':>11} {'speedup':>8}")
-    for key in sorted(medians.keys()):
+    # Sort by (family, n, numeric_threads) so the table reads ascending in
+    # thread count instead of lexicographically (which would put "10"
+    # before "2").
+    def sort_key(k: tuple[str, int, str]) -> tuple[str, int, int]:
+        try:
+            t_int = int(k[2])
+        except ValueError:
+            t_int = -1   # "None"/"default" sorts before any real count
+        return (k[0], k[1], t_int)
+    for key in sorted(medians.keys(), key=sort_key):
         family, n, threads_str = key
         algos = medians[key]
         nel = algos.get("nelson_seq") or nelson_per_workload.get((family, n))
@@ -225,9 +236,9 @@ def main():
 
     if args.threads_sweep:
         try:
-            thread_counts: list[int | None] = [
+            thread_counts: list[int | None] = sorted(
                 int(t) for t in args.threads_sweep.split(",") if t
-            ]
+            )
         except ValueError:
             print("--threads-sweep expects comma-separated integers",
                   file=sys.stderr)
