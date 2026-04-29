@@ -153,6 +153,88 @@ def workload_sweep(results: Path) -> None:
     print(med.to_string())
 
 
+def width_grid(results: Path) -> None:
+    csv = results / "width_grid.csv"
+    if not csv.exists():
+        return
+    df = pd.read_csv(csv)
+    par = df[df.algorithm == "par_close"].copy()
+    if par.empty:
+        return
+
+    leaves_per_workload = par.groupby("workload")["leaves"].first()
+    workload_order = leaves_per_workload.sort_values().index.tolist()
+
+    med = (
+        par.groupby(["workload", "parlay_threads"])["wallclock_ms"]
+        .median()
+        .reset_index()
+    )
+    pivot = (
+        med.pivot(index="workload", columns="parlay_threads", values="wallclock_ms")
+        .reindex(workload_order)
+        .sort_index(axis=1)
+    )
+    _section("width grid: par_close median ms (workload × T)")
+    print(pivot.to_string())
+
+    nel = df[df.algorithm == "nelson_seq"]
+    if not nel.empty:
+        nel_med = nel.groupby("workload")["wallclock_ms"].median().reindex(
+            workload_order
+        )
+        _section("width grid: nelson_seq median ms")
+        print(nel_med.dropna().to_string())
+        if pivot.shape[1] >= 1:
+            par_at_max = pivot.iloc[:, -1]
+            speedup = nel_med / par_at_max
+            _section("width grid: speedup over nelson at T_max")
+            print(speedup.dropna().to_string())
+
+
+def depth_sweep(results: Path) -> None:
+    csv = results / "depth_sweep.csv"
+    if not csv.exists():
+        return
+    df = pd.read_csv(csv)
+    pivot = (
+        df.groupby(["depth", "algorithm"])["wallclock_ms"]
+        .median()
+        .reset_index()
+        .pivot(index="algorithm", columns="depth", values="wallclock_ms")
+        .sort_index(axis=1)
+    )
+    _section("depth sweep: median wallclock ms (algorithm × depth)")
+    print(pivot.to_string())
+
+
+def merge_density(results: Path) -> None:
+    csv = results / "merge_density.csv"
+    if not csv.exists():
+        return
+    df = pd.read_csv(csv)
+    par = df[df.algorithm == "par_close"].copy()
+    if par.empty:
+        return
+    par["merge_frac"] = par["merges"] / par["leaves"]
+    med = par.groupby("merge_frac")["wallclock_ms"].median()
+    _section("merge_density: par_close median ms by merge_frac")
+    print(med.to_string())
+
+
+def nfns_sweep(results: Path) -> None:
+    csv = results / "nfns_sweep.csv"
+    if not csv.exists():
+        return
+    df = pd.read_csv(csv)
+    par = df[df.algorithm == "par_close"].copy()
+    if par.empty:
+        return
+    med = par.groupby("fns")["wallclock_ms"].median()
+    _section("nfns_sweep: par_close median ms by n_fns")
+    print(med.to_string())
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS)
@@ -166,6 +248,10 @@ def main() -> None:
     pd.set_option("display.max_columns", 50)
 
     strong_scaling(args.results_dir)
+    width_grid(args.results_dir)
+    depth_sweep(args.results_dir)
+    merge_density(args.results_dir)
+    nfns_sweep(args.results_dir)
     components(args.results_dir)
     trace_rounds(args.results_dir)
     workload_sweep(args.results_dir)
