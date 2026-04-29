@@ -165,8 +165,12 @@ def fmt_check(result: str, expected: str | None) -> str:
     return "FAIL"
 
 
-def print_table_header(check: bool, threads_col: bool, phase: bool):
-    parts = [f"{'File':<40}", f"{'Result':<8}", f"{'Wall(s)':>10}"]
+def print_table_header(check: bool, threads_col: bool, phase: bool,
+                       algo_col: bool):
+    parts = [f"{'File':<40}"]
+    if algo_col:
+        parts.append(f"{'Algo':<10}")
+    parts.extend([f"{'Result':<8}", f"{'Wall(s)':>10}"])
     if phase:
         parts.extend([f"{'Read':>7}", f"{'Parse':>7}", f"{'Build':>7}",
                       f"{'Close':>7}", f"{'Check':>7}", f"{'Dtor':>7}"])
@@ -181,12 +185,15 @@ def print_table_header(check: bool, threads_col: bool, phase: bool):
 
 
 def print_table_row(name: str, info: dict, expected: str | None,
-                    check: bool, threads: int | None, phase: bool):
-    parts = [
-        f"{name:<40}",
+                    check: bool, threads: int | None, phase: bool,
+                    algorithm: str | None):
+    parts = [f"{name:<40}"]
+    if algorithm is not None:
+        parts.append(f"{algorithm:<10}")
+    parts.extend([
         f"{info['result']:<8}",
         f"{info['wall_s']:>10.4f}",
-    ]
+    ])
     if phase:
         for k in TIMING_KEYS:
             v = info.get(k)
@@ -227,8 +234,24 @@ def main():
     parser.add_argument("--solver-arg", action="append", default=[],
                         help="repeatable: extra arg passed to the solver "
                              "verbatim (e.g. --solver-arg=--smt2)")
+    parser.add_argument("--no-numactl", action="store_true",
+                        help="don't prepend `numactl -i all` to runs even "
+                             "if numactl is available. Default: use it "
+                             "when present (helps on multi-NUMA machines; "
+                             "no-op on macOS / single-socket boxes).")
+    parser.add_argument("--sequential", action="store_true",
+                        help="run sequential_close_nelson alongside "
+                             "parallel_close. Adds one row per file with "
+                             "algorithm=sequential.")
     args = parser.parse_args()
     extra = list(args.solver_arg)
+
+    # Decide whether to prepend numactl. Default is "yes if available".
+    numactl_prefix: list[str] | None = None
+    if not args.no_numactl and not args.solver:
+        which = shutil.which("numactl")
+        if which:
+            numactl_prefix = [which, "-i", "all"]
 
     files = sorted(glob.glob(os.path.join(args.folder, "*.smt2")))
     files = [f for f in files if fnmatch.fnmatch(os.path.basename(f), args.pattern)]
@@ -259,12 +282,17 @@ def main():
     else:
         thread_counts = [args.threads]  # may contain a single None
 
+    # Default CSV path includes timestamp when not explicitly given.
+    if args.csv_file is None and args.solver is None:
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.csv_file = f"synthetic_sweep_{ts}.csv"
+
     # Warmup: run the first file once at the smallest non-None thread count
     # so the solver binary is page-cached and parlay's scheduler is warm.
     warmup_threads = next((t for t in thread_counts if t is not None), None)
     print(f"Warmup: {os.path.basename(files[0])}", flush=True)
     run_one(solver, files[0], warmup_threads, args.timeout, extra,
-            phase_timing=phase_timing)
+            phase_timing=phase_timing, numactl_prefix=numactl_prefix)
 
     print()
     suffix = []
@@ -272,36 +300,64 @@ def main():
         suffix.append(f"threads={args.threads}")
     if args.threads_sweep:
         suffix.append(f"threads-sweep={args.threads_sweep}")
+    if args.sequential:
+        suffix.append("with-sequential")
+    if numactl_prefix:
+        suffix.append(f"numactl={' '.join(numactl_prefix[1:])}")
     if extra:
         suffix.append(f"extra={extra}")
     print(f"Solver: {solver_name}" + (f"  ({', '.join(suffix)})" if suffix else ""))
 
+    # An "algorithm" column shows up if we ran the sequential variant or
+    # if the user asked for it via --sequential. Only meaningful with
+    # our own egraph-cc (external solvers don't have --sequential).
+    show_algo_col = args.sequential and not args.solver
+
     print_table_header(check=args.check,
                        threads_col=(args.threads_sweep is not None),
-                       phase=phase_timing)
+                       phase=phase_timing,
+                       algo_col=show_algo_col)
 
+    # rows entries: (name, expected, algorithm, threads, info)
     rows = []
     n_runs = 0
     n_failures = 0
     n_timeouts = 0
     total_wall = 0.0
 
+    def record(name, expected, algorithm, t, info):
+        nonlocal n_runs, n_failures, n_timeouts, total_wall
+        n_runs += 1
+        total_wall += info["wall_s"]
+        if info["result"] == "TIMEOUT":
+            n_timeouts += 1
+        if args.check and expected is not None and \
+           info["result"].lower() not in (expected.lower(), "timeout", "error"):
+            n_failures += 1
+        print_table_row(name, info, expected, args.check, t,
+                        phase=phase_timing,
+                        algorithm=algorithm if show_algo_col else None)
+        rows.append((name, expected, algorithm, t, info))
+
     for path in files:
         name = os.path.basename(path)
         expected = expected_from_name(path)
+
+        # Sequential first: a single run, no thread sweep, no
+        # PARLAY_NUM_THREADS dependency. The "threads" column is left
+        # blank in the CSV for sequential rows.
+        if args.sequential and not args.solver:
+            info = run_one(solver, path, threads=None, timeout=args.timeout,
+                           extra_args=extra, phase_timing=phase_timing,
+                           sequential=True, numactl_prefix=numactl_prefix)
+            record(name, expected, "sequential", None, info)
+
+        # Parallel sweep across thread counts.
         for t in thread_counts:
             info = run_one(solver, path, t, args.timeout, extra,
-                           phase_timing=phase_timing)
-            n_runs += 1
-            total_wall += info["wall_s"]
-            if info["result"] == "TIMEOUT":
-                n_timeouts += 1
-            if args.check and expected is not None and \
-               info["result"].lower() not in (expected.lower(), "timeout", "error"):
-                n_failures += 1
-            print_table_row(name, info, expected, args.check, t,
-                            phase=phase_timing)
-            rows.append((name, expected, t, info))
+                           phase_timing=phase_timing,
+                           numactl_prefix=numactl_prefix)
+            record(name, expected, "parallel", t, info)
         sys.stdout.flush()
 
     print()
@@ -317,23 +373,24 @@ def main():
         # merge them into one CSV. Only writes the header if file is new.
         # Phase columns (read_s/parse_s/build_s/close_s/check_s/dtor_s)
         # come from egraph-cc's --timing line; they're empty when running
-        # an external solver.
+        # an external solver. The `algorithm` column is "parallel" or
+        # "sequential" (or external solver name when not ours).
         write_header = not os.path.exists(args.csv_file)
         with open(args.csv_file, "a", newline="") as f:
             writer = csv.writer(f)
             if write_header:
-                writer.writerow(["solver", "file", "expected", "threads",
-                                 "result", "wall_s",
+                writer.writerow(["solver", "algorithm", "file", "expected",
+                                 "threads", "result", "wall_s",
                                  "read_s", "parse_s", "build_s",
                                  "close_s", "check_s", "dtor_s",
                                  "check", "error"])
-            for name, expected, t, info in rows:
+            for name, expected, algorithm, t, info in rows:
                 phase_cells = [
                     f"{info[k]:.6f}" if k in info else ""
                     for k in TIMING_KEYS
                 ]
                 writer.writerow([
-                    solver_name, name,
+                    solver_name, algorithm, name,
                     expected if expected else "",
                     t if t is not None else "",
                     info["result"],
