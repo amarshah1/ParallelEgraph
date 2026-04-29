@@ -5,8 +5,10 @@
 // sat / unsat: unsat iff any asserted disequality (a != b) collapses
 // (find_root(a) == find_root(b)) after closure.
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -22,7 +24,11 @@
 namespace {
 
 int usage(const char* prog) {
-  std::fprintf(stderr, "usage: %s <file.smt2>\n", prog);
+  std::fprintf(stderr,
+               "usage: %s [--timing] <file.smt2>\n"
+               "  --timing  print per-phase timings to stderr "
+               "(read/parse/build/close/check/dtor)\n",
+               prog);
   return 2;
 }
 
@@ -97,15 +103,66 @@ pe::Id add_term(pe::EGraph& eg, const pe::Term& term) {
 
 }  // namespace
 
+// Phase-timing harness. When --timing is on, we record clock points
+// between phases and print them to stderr just before returning. We
+// also estimate destructor time via a static guard that captures the
+// "main returned" timestamp and emits the dtor delta from its own
+// destructor (which fires after main's locals have unwound).
+struct TimingState {
+  bool enabled = false;
+  using clk = std::chrono::steady_clock;
+  clk::time_point t_start;
+  clk::time_point t_after_read;
+  clk::time_point t_after_parse;
+  clk::time_point t_after_build;
+  clk::time_point t_after_close;
+  clk::time_point t_after_check;
+  clk::time_point t_after_main;  // set just before main returns
+  bool main_returned = false;
+
+  static double secs(clk::time_point a, clk::time_point b) {
+    return std::chrono::duration<double>(b - a).count();
+  }
+};
+static TimingState g_timing;
+
+// Module-scoped guard whose destructor fires after main's locals have
+// unwound (file-scoped statics are destroyed in reverse construction
+// order; this one's last). Uses g_timing.t_after_main as its baseline.
+struct DtorGuard {
+  ~DtorGuard() {
+    if (!g_timing.enabled || !g_timing.main_returned) return;
+    auto t_now = TimingState::clk::now();
+    double dtor_s = TimingState::secs(g_timing.t_after_main, t_now);
+    std::fprintf(stderr, " dtor=%.6f\n", dtor_s);
+  }
+};
+static DtorGuard g_dtor_guard;
+
 int main(int argc, char** argv) {
-  if (argc != 2) return usage(argv[0]);
+  g_timing.t_start = TimingState::clk::now();
+
+  // Parse our own flags. Single positional <file.smt2> + optional --timing.
+  const char* file = nullptr;
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--timing") == 0) {
+      g_timing.enabled = true;
+    } else if (file == nullptr) {
+      file = argv[i];
+    } else {
+      return usage(argv[0]);
+    }
+  }
+  if (file == nullptr) return usage(argv[0]);
+
   std::string input;
   try {
-    input = read_file(argv[1]);
+    input = read_file(file);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "%s\n", e.what());
     return 1;
   }
+  g_timing.t_after_read = TimingState::clk::now();
 
   pe::Script script;
   try {
@@ -114,6 +171,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "%s\n", e.what());
     return 1;
   }
+  g_timing.t_after_parse = TimingState::clk::now();
 
   // Pre-walk to bound the e-graph capacity.
   std::size_t capacity = 0;
@@ -150,15 +208,38 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "%s\n", e.what());
     return 1;
   }
+  g_timing.t_after_build = TimingState::clk::now();
 
   eg.parallel_close(std::move(equalities));
+  g_timing.t_after_close = TimingState::clk::now();
 
+  bool unsat = false;
   for (auto [a, b] : disequalities) {
     if (eg.equiv(a, b)) {
-      std::puts("unsat");
-      return 0;
+      unsat = true;
+      break;
     }
   }
-  std::puts("sat");
+  g_timing.t_after_check = TimingState::clk::now();
+
+  std::puts(unsat ? "unsat" : "sat");
+
+  if (g_timing.enabled) {
+    // Print a single timing: line that the bench harness can regex.
+    // The dtor delta is appended by DtorGuard after all local
+    // destructors run (DtorGuard emits the trailing newline).
+    auto& ts = g_timing;
+    std::fprintf(stderr,
+                 "timing: read=%.6f parse=%.6f build=%.6f "
+                 "close=%.6f check=%.6f",
+                 TimingState::secs(ts.t_start, ts.t_after_read),
+                 TimingState::secs(ts.t_after_read, ts.t_after_parse),
+                 TimingState::secs(ts.t_after_parse, ts.t_after_build),
+                 TimingState::secs(ts.t_after_build, ts.t_after_close),
+                 TimingState::secs(ts.t_after_close, ts.t_after_check));
+    g_timing.t_after_main = TimingState::clk::now();
+    g_timing.main_returned = true;
+    // No newline yet — DtorGuard appends " dtor=..." then \n.
+  }
   return 0;
 }
