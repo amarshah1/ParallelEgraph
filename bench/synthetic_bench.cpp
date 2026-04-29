@@ -15,6 +15,10 @@
 //   PE_BENCH_FORMAT=csv                emit one row per (family, n, algo, trial)
 //   PE_BENCH_HEADER=1                  emit CSV header (gated for appended runs)
 //   PE_UNION_STYLE / PE_DNC_CUTOFF     tagged into CSV for plot grouping
+//   PE_SYNTH_DUMP=1                    print every generated node + initial
+//                                      union to stderr, then exit (no timing).
+//                                      Useful for sanity-checking what's in
+//                                      the e-graph before closure.
 
 #include <algorithm>
 #include <chrono>
@@ -69,51 +73,94 @@ struct BuiltGraph {
   std::size_t n_eqs;
 };
 
-// ---- Builders -------------------------------------------------------------
-// Each builder lays out nodes in DAG order (children before parents) and
-// hands the sequence to bulk_init. Class id == position in the input
-// sequence, which we exploit when constructing the equality batch.
+// ---- Workload generation --------------------------------------------------
+// Each generator lays out nodes in DAG order (children before parents).
+// Class id == position in the sequence, which we exploit when constructing
+// the equality batch. Generators return raw (nodes, eqs) so we can either
+// hand them to bulk_init (for benchmarking) or print them (for dumping).
+
+struct Workload {
+  parlay::sequence<ENode> nodes;
+  parlay::sequence<std::pair<Id, Id>> eqs;
+};
 
 // chain: a0,b0 leaves; for i in 1..n, a_i = f(a_{i-1}), b_i = f(b_{i-1}).
 // Layout: [a0, b0, a1, b1, ..., a_n, b_n]. Initial union: (a0, b0).
-BuiltGraph build_chain(std::size_t n) {
+Workload gen_chain(std::size_t n) {
   const std::size_t total = 2 * (n + 1);
   auto nodes = parlay::tabulate(total, [&](std::size_t i) -> ENode {
-    const std::size_t lvl  = i / 2;     // 0 = leaves, k = layer-k constants
+    const std::size_t lvl  = i / 2;
     const bool is_b        = (i % 2) == 1;
     if (lvl == 0) {
       return ENode{is_b ? std::string("b0") : std::string("a0"), {}};
     }
-    // Parent is the same-side node one layer down.
     Id parent = static_cast<Id>(2 * (lvl - 1) + (is_b ? 1 : 0));
     return ENode{std::string("f"), {parent}};
   });
-
   parlay::sequence<std::pair<Id, Id>> eqs;
   eqs.push_back({Id{0}, Id{1}});
-  const std::size_t n_eqs = eqs.size();
-
-  auto eg = EGraph::bulk_init(std::move(nodes));
-  return {std::move(eg), std::move(eqs), total, n_eqs};
+  return {std::move(nodes), std::move(eqs)};
 }
 
-// Helpers to build the polynomial-arity families. They share a common
-// shape: 2n leaves, then 2 * n^k function nodes, with merges (a_i, b_i).
+// Polynomial-arity family: 2n leaves + 2 * n^arity f-applications +
+// a balanced binary `g`-tree wrapper on each side, mirroring
+// gen_bench.py's nest_balanced("g", ...) construction.
 //
-// Layout:
-//   [a_0 .. a_{n-1}, b_0 .. b_{n-1},
-//    f(a-tuples in lex order), f(b-tuples in lex order)]
-// Class id of a_i = i, of b_i = n + i. Function nodes occupy
-// [2n, 2n + n^k) for the a-side and [2n + n^k, 2n + 2*n^k) for the b-side.
+// Layout (children-before-parents, required by bulk_init):
+//   [a_0 .. a_{n-1}, b_0 .. b_{n-1},                        # 2n leaves
+//    f(a-tuple_0) .. f(a-tuple_{m-1}),                       # m  a-side f-apps
+//    f(b-tuple_0) .. f(b-tuple_{m-1}),                       # m  b-side f-apps
+//    g-internal-nodes for a-side (m-1 of them, bottom-up),   # m-1 g-nodes
+//    g-internal-nodes for b-side (m-1 of them, bottom-up)]   # m-1 g-nodes
+// where m = n^arity.
+//
+// Initial unions: a_i = b_i for i in [0, n). With the g-tree in place,
+// closure has to propagate congruences from the leaves all the way up
+// to the two g-tree roots — log_2(m) extra rounds beyond the f-layer
+// fan-out. This matches what running the SMT-LIB synthetic_benchmarks/
+// files through smt_bench would do, just without the parse/build cost.
 
-BuiltGraph build_poly(std::size_t n, std::size_t arity) {
-  // n^arity. We rely on the caller to pick n small enough that this fits.
+// Build a balanced binary g-tree over the f-app id range [lo, hi).
+// Mirrors gen_bench.py:nest_balanced exactly: split mid = len/2, recurse
+// left then right, then emit (g left right). For len=1 the "tree" is
+// the single f-app id itself (no g-node added). Returns the class id of
+// the root g-node (or the sole f-app id when the range has size 1).
+//
+// Appends new g-nodes to `out` and assigns them ids starting at
+// `next_id`, which is the current end of the workload sequence.
+Id emit_g_tree(parlay::sequence<ENode>& out, Id& next_id,
+               std::size_t lo, std::size_t hi) {
+  const std::size_t len = hi - lo;
+  if (len == 1) {
+    return static_cast<Id>(lo);
+  }
+  if (len == 2) {
+    Id node_id = next_id++;
+    out.push_back(ENode{std::string("g"),
+                        {static_cast<Id>(lo), static_cast<Id>(lo + 1)}});
+    return node_id;
+  }
+  const std::size_t mid = lo + len / 2;
+  Id left  = emit_g_tree(out, next_id, lo, mid);
+  Id right = emit_g_tree(out, next_id, mid, hi);
+  Id node_id = next_id++;
+  out.push_back(ENode{std::string("g"), {left, right}});
+  return node_id;
+}
+
+Workload gen_poly(std::size_t n, std::size_t arity) {
   std::size_t per_side = 1;
   for (std::size_t k = 0; k < arity; ++k) per_side *= n;
-  const std::size_t leaves = 2 * n;
-  const std::size_t total  = leaves + 2 * per_side;
+  const std::size_t leaves    = 2 * n;
+  const std::size_t f_total   = leaves + 2 * per_side;
+  // Each side's g-tree has per_side-1 internal nodes (a balanced binary
+  // tree over per_side leaves). Skip the wrapper entirely when per_side
+  // < 2 (no merges happen above a single f-app anyway).
+  const std::size_t g_per_side = per_side > 1 ? per_side - 1 : 0;
+  const std::size_t total = f_total + 2 * g_per_side;
 
-  auto nodes = parlay::tabulate(total, [&](std::size_t i) -> ENode {
+  // f-layer: leaves + f-apps, all positions deterministic, fully parallel.
+  auto nodes = parlay::tabulate(f_total, [&](std::size_t i) -> ENode {
     if (i < n) {
       return ENode{std::string("a") + std::to_string(i), {}};
     }
@@ -123,7 +170,6 @@ BuiltGraph build_poly(std::size_t n, std::size_t arity) {
     const std::size_t off = i - leaves;
     const bool is_b       = off >= per_side;
     const std::size_t idx = is_b ? off - per_side : off;
-    // Decode lex index -> (arity)-tuple of digits in base n.
     std::vector<Id> children(arity);
     std::size_t rem = idx;
     for (std::size_t d = arity; d-- > 0;) {
@@ -134,29 +180,74 @@ BuiltGraph build_poly(std::size_t n, std::size_t arity) {
     return ENode{std::string("f"), std::move(children)};
   });
 
-  // Initial unions: a_i = b_i for i in [0, n).
-  auto eqs_seq = parlay::tabulate(n, [&](std::size_t i) {
+  // g-tree appended sequentially. Each side's recursion is self-contained
+  // and order-of-emission is bottom-up (children before parents), so
+  // bulk_init's child<parent invariant holds. The work is O(m) total —
+  // small relative to the f-layer for the workload sizes we run.
+  nodes.reserve(total);
+  Id next_id = static_cast<Id>(f_total);
+  if (g_per_side > 0) {
+    const std::size_t a_lo = leaves;
+    const std::size_t a_hi = leaves + per_side;
+    const std::size_t b_lo = a_hi;
+    const std::size_t b_hi = a_hi + per_side;
+    emit_g_tree(nodes, next_id, a_lo, a_hi);
+    emit_g_tree(nodes, next_id, b_lo, b_hi);
+  }
+
+  auto eqs = parlay::tabulate(n, [&](std::size_t i) {
     return std::pair<Id, Id>{static_cast<Id>(i), static_cast<Id>(n + i)};
   });
 
-  auto eg = EGraph::bulk_init(std::move(nodes));
-  return {std::move(eg), std::move(eqs_seq), total, n};
+  return {std::move(nodes), std::move(eqs)};
 }
 
-BuiltGraph build_grid   (std::size_t n) { return build_poly(n, 2); }
-BuiltGraph build_cube   (std::size_t n) { return build_poly(n, 3); }
-BuiltGraph build_quartic(std::size_t n) { return build_poly(n, 4); }
-BuiltGraph build_quintic(std::size_t n) { return build_poly(n, 5); }
-
-BuiltGraph build(Family f, std::size_t n) {
+Workload gen_workload(Family f, std::size_t n) {
   switch (f) {
-    case Family::Chain:   return build_chain(n);
-    case Family::Grid:    return build_grid(n);
-    case Family::Cube:    return build_cube(n);
-    case Family::Quartic: return build_quartic(n);
-    case Family::Quintic: return build_quintic(n);
+    case Family::Chain:   return gen_chain(n);
+    case Family::Grid:    return gen_poly(n, 2);
+    case Family::Cube:    return gen_poly(n, 3);
+    case Family::Quartic: return gen_poly(n, 4);
+    case Family::Quintic: return gen_poly(n, 5);
   }
   std::abort();
+}
+
+BuiltGraph build(Family f, std::size_t n) {
+  auto w = gen_workload(f, n);
+  const std::size_t total = w.nodes.size();
+  const std::size_t n_eqs = w.eqs.size();
+  auto eg = EGraph::bulk_init(std::move(w.nodes));
+  return {std::move(eg), std::move(w.eqs), total, n_eqs};
+}
+
+// Prints every node + initial union to stderr in a human-readable form.
+// One line per node:  "id: op(child_id, child_id, ...)" or "id: op  // leaf"
+// One line per union: "  union: a_id = b_id"
+void dump_workload(Family f, std::size_t n) {
+  auto w = gen_workload(f, n);
+  std::fprintf(stderr,
+               "==== %s n=%zu  classes=%zu  unions=%zu ====\n",
+               family_name(f), n, w.nodes.size(), w.eqs.size());
+  for (std::size_t i = 0; i < w.nodes.size(); ++i) {
+    const auto& nd = w.nodes[i];
+    if (nd.children.empty()) {
+      std::fprintf(stderr, "  %6zu: %s  // leaf\n", i, nd.op.c_str());
+    } else {
+      std::fprintf(stderr, "  %6zu: %s(", i, nd.op.c_str());
+      for (std::size_t k = 0; k < nd.children.size(); ++k) {
+        std::fprintf(stderr, "%s%u",
+                     k ? ", " : "",
+                     static_cast<unsigned>(nd.children[k]));
+      }
+      std::fprintf(stderr, ")\n");
+    }
+  }
+  for (const auto& eq : w.eqs) {
+    std::fprintf(stderr, "  union: %u = %u\n",
+                 static_cast<unsigned>(eq.first),
+                 static_cast<unsigned>(eq.second));
+  }
 }
 
 // ---- Timing ---------------------------------------------------------------
@@ -264,6 +355,19 @@ int main() {
     }
   } else {
     ns = {5, 10, 20};
+  }
+
+  // PE_SYNTH_DUMP=1: print every node + initial union for each (family,n)
+  // to stderr, then exit without timing anything. The dump cost on big
+  // workloads is dominated by I/O, not generation, so cap n implicitly
+  // by trusting the caller to pick small ones.
+  if (std::getenv("PE_SYNTH_DUMP")) {
+    for (Family f : families) {
+      for (std::size_t n : ns) {
+        dump_workload(f, n);
+      }
+    }
+    return 0;
   }
 
   if (!csv) {
