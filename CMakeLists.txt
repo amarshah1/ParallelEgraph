@@ -48,6 +48,9 @@ target_link_libraries(component_bench PRIVATE parallel_egraph_core)
 add_executable(smt_bench bench/smt_bench.cpp)
 target_link_libraries(smt_bench PRIVATE parallel_egraph_core)
 
+add_executable(synthetic_bench bench/synthetic_bench.cpp)
+target_link_libraries(synthetic_bench PRIVATE parallel_egraph_core)
+
 # ---- tests ----
 enable_testing()
 

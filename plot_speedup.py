@@ -17,8 +17,8 @@ import matplotlib.pyplot as plt
 import matplotlib as mpl
 
 
-FAMILIES = ["chain", "grid", "cube", "exp"]
-FAMILY_RE = re.compile(r"^(chain|grid|cube|exp)_n(\d+)_")
+FAMILIES = ["chain", "grid", "cube", "quartic", "quintic", "exp"]
+FAMILY_RE = re.compile(r"^(chain|grid|cube|quartic|quintic|exp)_n(\d+)_")
 
 
 def family_and_n(filename: str):
