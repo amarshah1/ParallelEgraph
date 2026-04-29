@@ -250,27 +250,33 @@ inline bool union_style_adjacent() {
   return v;
 }
 
+// dnc_union accepts buckets of either CanonEntry (legacy) or raw Id; the
+// post-group reducer in merge_and_collect_semisort only needs roots, so we
+// pass `Id` there to halve per-element bandwidth through parlay's count-sort.
+inline Id as_root(Id x) { return x; }
+inline Id as_root(const detail::CanonEntry& e) { return e.root; }
+
 template <typename Bucket>
 void dnc_union(Bucket& bucket, std::size_t lo, std::size_t hi,
                ConcurrentUnionFind& uf) {
   if (hi - lo <= 1) return;
   if (union_style_adjacent()) {
     parlay::parallel_for(lo, hi - 1, [&](std::size_t i) {
-      uf.union_(bucket[i].root, bucket[i + 1].root);
+      uf.union_(as_root(bucket[i]), as_root(bucket[i + 1]));
     });
     return;
   }
   const std::size_t DNC_SEQ_CUTOFF = dnc_cutoff();
   if (hi - lo <= DNC_SEQ_CUTOFF) {
     for (std::size_t i = lo + 1; i < hi; ++i) {
-      uf.union_(bucket[lo].root, bucket[i].root);
+      uf.union_(as_root(bucket[lo]), as_root(bucket[i]));
     }
     return;
   }
   std::size_t mid = lo + (hi - lo) / 2;
   parlay::par_do([&] { dnc_union(bucket, lo, mid, uf); },
                  [&] { dnc_union(bucket, mid, hi, uf); });
-  uf.union_(bucket[lo].root, bucket[mid].root);
+  uf.union_(as_root(bucket[lo]), as_root(bucket[mid]));
 }
 
 }  // namespace
@@ -299,9 +305,14 @@ parlay::sequence<Id> merge_and_collect_semisort(
     return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
   };
 
+  // The value half of the keyed pair is just the root: dnc_union and the
+  // returned-touched-roots sequence are the only consumers downstream, and
+  // both consume Id only. Carrying a full CanonEntry as the value would
+  // double the per-element bandwidth through parlay::group_by_key's
+  // count-sort for no benefit (the hash and equal_fn read only the key).
   auto t0 = timings ? clk::now() : clk::time_point{};
-  auto keyed = parlay::tabulate(n, [&](std::size_t i) {
-    return std::pair<CanonEntry, CanonEntry>{canon[i], canon[i]};
+  auto keyed = parlay::delayed_tabulate(n, [&](std::size_t i) {
+    return std::pair<CanonEntry, Id>{canon[i], canon[i].root};
   });
   if (timings) timings->keyed_ms = ms_since(t0);
 
@@ -311,7 +322,7 @@ parlay::sequence<Id> merge_and_collect_semisort(
   };
   auto t1 = timings ? clk::now() : clk::time_point{};
   auto groups =
-      parlay::group_by_key(std::move(keyed), hash_fn, equal_fn);
+      parlay::group_by_key(keyed, hash_fn, equal_fn);
   if (timings) timings->group_by_ms = ms_since(t1);
 
   auto t2 = timings ? clk::now() : clk::time_point{};
@@ -319,8 +330,7 @@ parlay::sequence<Id> merge_and_collect_semisort(
     auto& values = kv.second;
     if (values.size() < 2) return {};
     dnc_union(values, 0, values.size(), uf);
-    return parlay::tabulate(values.size(),
-                            [&](std::size_t i) { return values[i].root; });
+    return std::move(values);
   });
 
   auto out = parlay::flatten(per_group);
