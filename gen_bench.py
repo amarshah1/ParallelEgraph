@@ -8,10 +8,12 @@ Usage:
     python gen_bench.py sweep:<family> <n1> <n2> <step> [output_dir]  # single family sweep
 
 Families:
-    chain — depth-n sequential congruence cascade                 O(n) congruences
-    grid  — n merges, binary f on all pairs                       O(n²) congruences
-    cube  — n merges, ternary f on all triples                    O(n³) congruences
-    exp   — 1 merge cascading through n layers of 2 functions     O(2^n) congruences
+    chain   — depth-n sequential congruence cascade                O(n) congruences
+    grid    — n merges, arity-2 f on all pairs                     O(n²) congruences
+    cube    — n merges, arity-3 f on all triples                   O(n³) congruences
+    quartic — n merges, arity-4 f on all 4-tuples                  O(n⁴) congruences
+    quintic — n merges, arity-5 f on all 5-tuples                  O(n⁵) congruences
+    exp     — 1 merge cascading through n layers of 2 functions    O(2^n) congruences
 
 Each benchmark produces a single UNSAT disequality that requires processing
 the entire formula.  Balanced binary nesting keeps depth at O(log m) where
@@ -150,6 +152,87 @@ def gen_cube(n: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# quartic: O(n⁴) congruences from n merges (arity-4 f)
+# ---------------------------------------------------------------------------
+
+def gen_quartic(n: int) -> str:
+    """a_i = b_i  =>  f(a_i,a_j,a_k,a_l) = f(b_i,b_j,b_k,b_l) for all i,j,k,l.
+
+    Inline f-terms in a balanced g-tree disequality.
+    Merges: n.  Congruences: n⁴.  Disequality depth: log(n⁴) + 1.
+    """
+    m = n ** 4
+    lines = smt_header([
+        f"Quartic benchmark (n={n}): {n} merges, {m} congruences",
+        f"UNSAT: a_i=b_i => f(a_i,a_j,a_k,a_l)=f(b_i,b_j,b_k,b_l) for all i,j,k,l",
+    ])
+    lines.append("(declare-fun f (U U U U) U)")
+    if m >= 2:
+        lines.append("(declare-fun g (U U) U)")
+
+    for i in range(n):
+        lines.append(f"(declare-const a{i} U)")
+        lines.append(f"(declare-const b{i} U)")
+
+    for i in range(n):
+        lines.append(f"(assert (= a{i} b{i}))")
+
+    a_elems = [f"(f a{i} a{j} a{k} a{l})"
+               for i in range(n) for j in range(n)
+               for k in range(n) for l in range(n)]
+    b_elems = [f"(f b{i} b{j} b{k} b{l})"
+               for i in range(n) for j in range(n)
+               for k in range(n) for l in range(n)]
+    nest_a = nest_balanced("g", a_elems)
+    nest_b = nest_balanced("g", b_elems)
+    lines.append(f"(assert (not (= {nest_a} {nest_b})))")
+    lines.append("(check-sat)")
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# quintic: O(n⁵) congruences from n merges (arity-5 f)
+# ---------------------------------------------------------------------------
+
+def gen_quintic(n: int) -> str:
+    """a_i = b_i  =>  f(a_i,a_j,a_k,a_l,a_m) = f(b_i,b_j,b_k,b_l,b_m) for all i..m.
+
+    Inline f-terms in a balanced g-tree disequality.
+    Merges: n.  Congruences: n⁵.  Disequality depth: log(n⁵) + 1.
+    """
+    m_total = n ** 5
+    lines = smt_header([
+        f"Quintic benchmark (n={n}): {n} merges, {m_total} congruences",
+        f"UNSAT: a_i=b_i => f(a_i,a_j,a_k,a_l,a_m)=f(b_i,b_j,b_k,b_l,b_m) for all i,j,k,l,m",
+    ])
+    lines.append("(declare-fun f (U U U U U) U)")
+    if m_total >= 2:
+        lines.append("(declare-fun g (U U) U)")
+
+    for i in range(n):
+        lines.append(f"(declare-const a{i} U)")
+        lines.append(f"(declare-const b{i} U)")
+
+    for i in range(n):
+        lines.append(f"(assert (= a{i} b{i}))")
+
+    # Use a non-`l` variable name in the comprehension to avoid the
+    # E741 lint flagging "ambiguous variable name 'l'"; keep readability
+    # by naming the 5th index `m` (matches the quintic convention).
+    a_elems = [f"(f a{i} a{j} a{k} a{x} a{y})"
+               for i in range(n) for j in range(n)
+               for k in range(n) for x in range(n) for y in range(n)]
+    b_elems = [f"(f b{i} b{j} b{k} b{x} b{y})"
+               for i in range(n) for j in range(n)
+               for k in range(n) for x in range(n) for y in range(n)]
+    nest_a = nest_balanced("g", a_elems)
+    nest_b = nest_balanced("g", b_elems)
+    lines.append(f"(assert (not (= {nest_a} {nest_b})))")
+    lines.append("(check-sat)")
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
 # exp: O(2^n) congruences from 1 merge (exponential cascade)
 # ---------------------------------------------------------------------------
 
@@ -211,10 +294,12 @@ def gen_exp(n: int) -> str:
 # ---------------------------------------------------------------------------
 
 FAMILIES = {
-    "chain": gen_chain,
-    "grid": gen_grid,
-    "cube": gen_cube,
-    "exp": gen_exp,
+    "chain":   gen_chain,
+    "grid":    gen_grid,
+    "cube":    gen_cube,
+    "quartic": gen_quartic,
+    "quintic": gen_quintic,
+    "exp":     gen_exp,
 }
 
 
