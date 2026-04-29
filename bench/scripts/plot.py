@@ -223,6 +223,157 @@ def plot_workload_sweep(_args):
 # ------------------------- smt -------------------------
 
 
+def plot_width_grid(_args):
+    df = _read(RESULTS / "width_grid.csv")
+    par = df[df.algorithm == "par_close"].copy()
+    nel = df[df.algorithm == "nelson_seq"].copy()
+    if par.empty:
+        return
+
+    leaves_per_workload = par.groupby("workload")["leaves"].first()
+    workload_order = leaves_per_workload.sort_values().index.tolist()
+
+    # Use highest measured T per workload
+    par_at_max_t = par.groupby("workload").apply(
+        lambda g: g[g.parlay_threads == g.parlay_threads.max()][
+            "wallclock_ms"
+        ].median(),
+        include_groups=False,
+    )
+    par_at_max_t = par_at_max_t.reindex(workload_order)
+    leaves = leaves_per_workload.reindex(workload_order)
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.plot(leaves.values, par_at_max_t.values, marker="o", label="par_close")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("n_leaves")
+    ax.set_ylabel("par_close wallclock (ms)")
+    ax.set_title("Width-axis scaling (T_max)")
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend()
+    _save(fig, "fig_width_grid_wallclock.png")
+
+    if not nel.empty:
+        nel_med = nel.groupby("workload")["wallclock_ms"].median()
+        common = par_at_max_t.dropna().index.intersection(nel_med.index)
+        if len(common) >= 2:
+            speedup = (nel_med.loc[common] / par_at_max_t.loc[common]).reindex(
+                workload_order
+            ).dropna()
+            leaves_s = leaves.reindex(speedup.index)
+            fig, ax = plt.subplots(figsize=(7, 4.5))
+            ax.plot(leaves_s.values, speedup.values, marker="o")
+            ax.set_xscale("log")
+            ax.set_xlabel("n_leaves")
+            ax.set_ylabel("speedup over Nelson")
+            ax.set_title("Width-axis: speedup over Nelson at T_max")
+            ax.grid(True, which="both", alpha=0.3)
+            _save(fig, "fig_width_grid_speedup.png")
+
+
+def plot_depth_sweep(_args):
+    df = _read(RESULTS / "depth_sweep.csv")
+    med = (
+        df.groupby(["depth", "algorithm"])["wallclock_ms"].median().reset_index()
+    )
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    for algo in sorted(med["algorithm"].unique()):
+        sub = med[med["algorithm"] == algo].sort_values("depth")
+        ax.plot(sub["depth"], sub["wallclock_ms"], marker="o", label=algo)
+    ax.set_xlabel("depth (function-node levels)")
+    ax.set_ylabel("wallclock (ms)")
+    ax.set_yscale("log")
+    ax.set_title("Depth sweep (xl, T_max)")
+    ax.legend()
+    ax.grid(True, which="both", alpha=0.3)
+    _save(fig, "fig_depth_sweep.png")
+
+
+def plot_merge_density(_args):
+    df = _read(RESULTS / "merge_density.csv")
+    par = df[df.algorithm == "par_close"].copy()
+    if par.empty:
+        return
+    par["merge_frac"] = par["merges"] / par["leaves"]
+    med = par.groupby("merge_frac")["wallclock_ms"].median().reset_index()
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.plot(med["merge_frac"], med["wallclock_ms"], marker="o")
+    ax.set_xscale("log")
+    ax.set_xlabel("merge_frac (n_merges / n_leaves)")
+    ax.set_ylabel("par_close wallclock (ms)")
+    ax.set_title("Merge-density sweep (xl-d3, T_max)")
+    ax.grid(True, which="both", alpha=0.3)
+    _save(fig, "fig_merge_density.png")
+
+
+def plot_nfns_sweep(_args):
+    df = _read(RESULTS / "nfns_sweep.csv")
+    par = df[df.algorithm == "par_close"].copy()
+    if par.empty:
+        return
+    med = par.groupby("fns")["wallclock_ms"].median().reset_index()
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.plot(med["fns"], med["wallclock_ms"], marker="o")
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("n_fns (operators per level)")
+    ax.set_ylabel("par_close wallclock (ms)")
+    ax.set_title("n_fns sweep (xl-d3, T_max)")
+    ax.grid(True, which="both", alpha=0.3)
+    _save(fig, "fig_nfns_sweep.png")
+
+
+def plot_round_by_size(_args):
+    df = _read(RESULTS / "trace.csv")
+    has_sub = {"keyed_ms", "group_by_ms", "per_group_ms"}.issubset(df.columns)
+    cols = ["consolidate_ms", "frontier_ms", "semisort_ms"]
+    if has_sub:
+        cols += ["keyed_ms", "group_by_ms", "per_group_ms"]
+
+    # Mean per (workload, round), then sum across rounds → total per workload
+    grp = df.groupby(["workload", "round"])[cols].mean().reset_index()
+    agg = grp.groupby("workload")[cols].sum()
+
+    order = ["large", "xl-d3", "2xl-d3", "4xl-d3", "8xl-d3", "16xl-d3"]
+    agg = agg.reindex([w for w in order if w in agg.index])
+    if agg.empty:
+        return
+
+    if has_sub:
+        agg["semi_other_ms"] = (
+            agg["semisort_ms"]
+            - agg[["keyed_ms", "group_by_ms", "per_group_ms"]].sum(axis=1)
+        ).clip(lower=0)
+        stacks = [
+            ("consolidate_ms", "consolidate"),
+            ("frontier_ms", "frontier_build"),
+            ("keyed_ms", "semi: keyed"),
+            ("group_by_ms", "semi: group_by_key"),
+            ("per_group_ms", "semi: per_group"),
+            ("semi_other_ms", "semi: canon+dedup"),
+        ]
+    else:
+        stacks = [
+            ("consolidate_ms", "consolidate"),
+            ("frontier_ms", "frontier"),
+            ("semisort_ms", "semisort"),
+        ]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    bottom = [0.0] * len(agg)
+    labels = agg.index.tolist()
+    for col, label in stacks:
+        vals = agg[col].fillna(0).values
+        ax.bar(labels, vals, bottom=bottom, label=label)
+        bottom = [b + v for b, v in zip(bottom, vals)]
+    ax.set_xlabel("workload")
+    ax.set_ylabel("total ms across all rounds (mean over trials)")
+    ax.set_title("Phase decomposition by workload size")
+    ax.legend(loc="best", fontsize=8)
+    ax.grid(True, alpha=0.3, axis="y")
+    _save(fig, "fig_round_by_size.png")
+
+
 def plot_smt(_args):
     df = _read(RESULTS / "smt.csv")
     df = df[df["family"] != ""]  # skip non-matching filenames (regression cases)
@@ -257,6 +408,11 @@ def plot_all(args):
         plot_trace_rounds,
         plot_workload_sweep,
         plot_smt,
+        plot_width_grid,
+        plot_depth_sweep,
+        plot_merge_density,
+        plot_nfns_sweep,
+        plot_round_by_size,
     ):
         try:
             fn(args)
@@ -275,6 +431,11 @@ def main():
         ("components", plot_components),
         ("workload-sweep", plot_workload_sweep),
         ("smt", plot_smt),
+        ("width-grid", plot_width_grid),
+        ("depth-sweep", plot_depth_sweep),
+        ("merge-density", plot_merge_density),
+        ("nfns-sweep", plot_nfns_sweep),
+        ("round-by-size", plot_round_by_size),
         ("all", plot_all),
     ]:
         p = sub.add_parser(name)

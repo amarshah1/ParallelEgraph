@@ -164,6 +164,32 @@ PhaseTimes run_trial(const Workload& w) {
   return {consolidate_ms, semisort_ms};
 }
 
+// Parse "leaves,fns,nodes,merges,depth" → Workload. Mirrors
+// parse_custom_workload in closure_compare.cpp.
+bool parse_custom_workload(const char* spec, Workload& out) {
+  out.name = "custom";
+  std::size_t* fields[] = {&out.n_leaves, &out.n_fns, &out.n_nodes,
+                           &out.n_merges, &out.depth};
+  std::string s(spec);
+  std::size_t start = 0;
+  for (int i = 0; i < 5; ++i) {
+    std::size_t end = s.find(',', start);
+    std::string tok = (end == std::string::npos) ? s.substr(start)
+                                                  : s.substr(start, end - start);
+    if (tok.empty()) return false;
+    char* endp = nullptr;
+    unsigned long long v = std::strtoull(tok.c_str(), &endp, 10);
+    if (!endp || *endp != '\0') return false;
+    *fields[i] = static_cast<std::size_t>(v);
+    if (end == std::string::npos) {
+      if (i != 4) return false;
+      break;
+    }
+    start = end + 1;
+  }
+  return out.depth >= 1 && out.n_leaves > 0 && out.n_nodes > 0;
+}
+
 }  // namespace
 
 int main() {
@@ -173,6 +199,24 @@ int main() {
   const char* fmt = std::getenv("PE_BENCH_FORMAT");
   const bool csv = fmt && std::strcmp(fmt, "csv") == 0;
   const bool csv_header = std::getenv("PE_BENCH_HEADER") != nullptr;
+  // PE_COMPONENT_CUSTOM=leaves,fns,nodes,merges,depth replaces the baked-in
+  // WORKLOADS table with one caller-specified workload.
+  const char* custom_spec = std::getenv("PE_COMPONENT_CUSTOM");
+
+  std::vector<Workload> workloads;
+  Workload custom_w{};
+  if (custom_spec) {
+    if (!parse_custom_workload(custom_spec, custom_w)) {
+      std::fprintf(stderr,
+                   "PE_COMPONENT_CUSTOM must be 'leaves,fns,nodes,merges,depth' "
+                   "(got '%s')\n",
+                   custom_spec);
+      return 2;
+    }
+    workloads.push_back(custom_w);
+  } else {
+    workloads = WORKLOADS;
+  }
 
   if (csv && csv_header) {
     std::printf("phase,trial,parlay_threads,workload,wallclock_ms\n");
@@ -183,7 +227,7 @@ int main() {
     std::printf("%-8s %15s %15s\n", "name", "consolidate(med)", "semisort(med)");
   }
 
-  for (const auto& w : WORKLOADS) {
+  for (const auto& w : workloads) {
     if (only && std::string(only) != w.name) continue;
     std::fprintf(stderr, "[component] running %s ...\n", w.name);
 
