@@ -23,6 +23,21 @@ set(PARLAY_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(PARLAY_BENCHMARK OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(parlaylib)
 
+# ---- allocator: jemalloc ----
+# Replaces glibc malloc. Removes per-arena lock contention that throttles
+# parallel_close on wide-shallow workloads (≈1.76× faster on synthetic_bench
+# quintic n=23 at T=192, ~1.20× on closure_compare_bench 16xl-d3 at T=192).
+option(USE_JEMALLOC "Link binaries against jemalloc" ON)
+if(USE_JEMALLOC)
+  find_library(JEMALLOC_LIB jemalloc)
+  if(NOT JEMALLOC_LIB)
+    message(FATAL_ERROR
+      "libjemalloc not found. Install with: "
+      "sudo apt-get install libjemalloc-dev  (or set -DUSE_JEMALLOC=OFF)")
+  endif()
+  message(STATUS "Linking with jemalloc: ${JEMALLOC_LIB}")
+endif()
+
 # ---- core library ----
 add_library(parallel_egraph_core STATIC
   src/unionfind.cpp
@@ -32,7 +47,7 @@ add_library(parallel_egraph_core STATIC
 target_include_directories(parallel_egraph_core
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
-target_link_libraries(parallel_egraph_core PUBLIC parlay)
+target_link_libraries(parallel_egraph_core PUBLIC parlay ${JEMALLOC_LIB})
 
 # ---- CLI: egraph-cc <file.smt2> -> sat / unsat ----
 add_executable(egraph-cc src/main.cpp)
