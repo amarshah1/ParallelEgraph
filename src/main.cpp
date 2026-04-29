@@ -25,9 +25,11 @@ namespace {
 
 int usage(const char* prog) {
   std::fprintf(stderr,
-               "usage: %s [--timing] <file.smt2>\n"
-               "  --timing  print per-phase timings to stderr "
-               "(read/parse/build/close/check/dtor)\n",
+               "usage: %s [--timing] [--sequential] <file.smt2>\n"
+               "  --timing      print per-phase timings to stderr "
+               "(read/parse/build/close/check/dtor)\n"
+               "  --sequential  run sequential_close_nelson instead of "
+               "parallel_close\n",
                prog);
   return 2;
 }
@@ -142,11 +144,15 @@ static DtorGuard g_dtor_guard;
 int main(int argc, char** argv) {
   g_timing.t_start = TimingState::clk::now();
 
-  // Parse our own flags. Single positional <file.smt2> + optional --timing.
+  // Parse flags. Single positional <file.smt2> + optional --timing /
+  // --sequential.
   const char* file = nullptr;
+  bool sequential = false;
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--timing") == 0) {
       g_timing.enabled = true;
+    } else if (std::strcmp(argv[i], "--sequential") == 0) {
+      sequential = true;
     } else if (file == nullptr) {
       file = argv[i];
     } else {
@@ -210,7 +216,11 @@ int main(int argc, char** argv) {
   }
   g_timing.t_after_build = TimingState::clk::now();
 
-  eg.parallel_close(std::move(equalities));
+  if (sequential) {
+    eg.sequential_close_nelson(equalities);
+  } else {
+    eg.parallel_close(std::move(equalities));
+  }
   g_timing.t_after_close = TimingState::clk::now();
 
   bool unsat = false;

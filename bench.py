@@ -18,10 +18,12 @@ Usage:
 
 import argparse
 import csv
+import datetime
 import fnmatch
 import glob
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -86,7 +88,9 @@ def expected_from_name(path: str):
 
 def run_one(solver: str, path: str, threads: int | None,
             timeout: float | None, extra_args: list[str],
-            phase_timing: bool = False) -> dict:
+            phase_timing: bool = False,
+            sequential: bool = False,
+            numactl_prefix: list[str] | None = None) -> dict:
     """Run the solver on a single file. Returns a result dict.
 
     `threads`, when set, is passed to the child via PARLAY_NUM_THREADS so
@@ -95,10 +99,23 @@ def run_one(solver: str, path: str, threads: int | None,
 
     `phase_timing` requests our solver's --timing output; the parsed
     phase fields are merged into the result dict.
+
+    `sequential` adds --sequential to the solver invocation (only
+    meaningful for our own egraph-cc; ignored args are caller's problem).
+
+    `numactl_prefix`, if set, is prepended to the command line. Typical
+    use: ["numactl", "-i", "all"] to interleave allocations across NUMA
+    nodes and avoid contention on a single node's memory.
     """
-    cmd = [solver, *extra_args]
+    cmd = []
+    if numactl_prefix:
+        cmd.extend(numactl_prefix)
+    cmd.append(solver)
+    cmd.extend(extra_args)
     if phase_timing:
         cmd.append("--timing")
+    if sequential:
+        cmd.append("--sequential")
     cmd.append(path)
     env = os.environ.copy()
     if threads is not None:
