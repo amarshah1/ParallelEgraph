@@ -35,6 +35,26 @@ std::uint64_t sig_hash(const ENode& node, ConcurrentUnionFind& uf) {
   return h.finish();
 }
 
+// Constant for h2's seed: golden-ratio-derived; same constant rustc uses
+// for its `RandomState` initialisation seed. Picked because it has good
+// bit distribution and is structurally unrelated to FxHasher's mixing
+// constant (0x517C…), keeping h1 and h2 effectively independent.
+namespace { constexpr std::uint64_t kSigHash2Seed = 0x9E37'79B9'7F4A'7C15ULL; }
+
+std::pair<std::uint64_t, std::uint32_t> sig_hashes(
+    const ENode& node, ConcurrentUnionFind& uf) {
+  FxHasher h1;
+  FxHasher h2(kSigHash2Seed);
+  h1.write_str(node.op);
+  h2.write_str(node.op);
+  for (Id c : node.children) {
+    Id r = uf.find_root(c);
+    h1.write_u32(r);
+    h2.write_u32(r);
+  }
+  return {h1.finish(), static_cast<std::uint32_t>(h2.finish())};
+}
+
 std::uint64_t sig_hash_seq(const ENode& node, SequentialUnionFind& uf) {
   FxHasher h;
   h.write_str(node.op);
@@ -250,11 +270,21 @@ inline bool union_style_adjacent() {
   return v;
 }
 
-// dnc_union accepts buckets of either CanonEntry (legacy) or raw Id; the
-// post-group reducer in merge_and_collect_semisort only needs roots, so we
-// pass `Id` there to halve per-element bandwidth through parlay's count-sort.
+
+// dnc_union accepts buckets of CanonEntry, raw Id, or RootH2 pairs; only
+// the root is consumed for the union. RootH2 carries h2 alongside root so
+// the per-group reducer in merge_and_collect_semisort can verify the group
+// is collision-free with a single 32-bit compare per element instead of
+// invoking sigs_equal (which does N UF lookups per call).
+struct RootH2 {
+  Id root;
+  std::uint32_t h2;
+};
+static_assert(sizeof(RootH2) == 8);
+
 inline Id as_root(Id x) { return x; }
 inline Id as_root(const detail::CanonEntry& e) { return e.root; }
+inline Id as_root(const RootH2& v) { return v.root; }
 
 template <typename Bucket>
 void dnc_union(Bucket& bucket, std::size_t lo, std::size_t hi,
@@ -305,11 +335,76 @@ parlay::sequence<Id> merge_and_collect_semisort(
     return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
   };
 
-  // The value half of the keyed pair is just the root: dnc_union and the
-  // returned-touched-roots sequence are the only consumers downstream, and
-  // both consume Id only. Carrying a full CanonEntry as the value would
-  // double the per-element bandwidth through parlay::group_by_key's
-  // count-sort for no benefit (the hash and equal_fn read only the key).
+  // Two implementations selected at build time. Default (ordered) uses
+  // parlay::group_by_key_ordered on the 64-bit primary hash with a 32-bit
+  // secondary hash carried in the value for collision-safe per-group
+  // equality (combined 96-bit entropy → ~10⁻¹⁴ collision probability per
+  // 64M-element batch). Falls back to a slow path for adversarial inputs.
+  //
+  // PE_GROUPBY_HASH selects the legacy hash + open-addressing variant
+  // with sigs_equal as the equality predicate — deterministically correct
+  // under any hash function but ~1.2× slower because each equal_fn call
+  // does N UF lookups.
+  parlay::sequence<parlay::sequence<Id>> per_group;
+
+#ifndef PE_GROUPBY_HASH
+  auto t0 = timings ? clk::now() : clk::time_point{};
+  auto keyed = parlay::delayed_tabulate(n, [&](std::size_t i) {
+    return std::pair<std::uint64_t, RootH2>{
+        canon[i].h, RootH2{canon[i].root, canon[i].h2}};
+  });
+  if (timings) timings->keyed_ms = ms_since(t0);
+
+  auto t1 = timings ? clk::now() : clk::time_point{};
+  auto groups = parlay::group_by_key_ordered(keyed);
+  if (timings) timings->group_by_ms = ms_since(t1);
+
+  (void)nodes;  // sigs_equal not invoked from this path
+  auto t2 = timings ? clk::now() : clk::time_point{};
+  per_group = parlay::map(groups, [&](auto& kv) -> parlay::sequence<Id> {
+    auto& values = kv.second;
+    const std::size_t k = values.size();
+    if (k < 2) return {};
+
+    // Fast path: every element shares h2 with the first → same signature.
+    bool same = true;
+    const std::uint32_t h2_ref = values[0].h2;
+    for (std::size_t i = 1; i < k; ++i) {
+      if (values[i].h2 != h2_ref) { same = false; break; }
+    }
+    if (same) {
+      dnc_union(values, 0, k, uf);
+      return parlay::tabulate(k,
+                              [&](std::size_t i) { return values[i].root; });
+    }
+
+    // Slow path: bucket by h2 within this h1-equal group. With 96-bit
+    // combined entropy this should never fire on real inputs.
+    parlay::sequence<bool> consumed(k, false);
+    parlay::sequence<Id> touched;
+    for (std::size_t i = 0; i < k; ++i) {
+      if (consumed[i]) continue;
+      consumed[i] = true;
+      parlay::sequence<RootH2> bucket;
+      bucket.push_back(values[i]);
+      for (std::size_t j = i + 1; j < k; ++j) {
+        if (!consumed[j] && values[j].h2 == values[i].h2) {
+          consumed[j] = true;
+          bucket.push_back(values[j]);
+        }
+      }
+      if (bucket.size() < 2) continue;
+      dnc_union(bucket, 0, bucket.size(), uf);
+      for (auto& v : bucket) touched.push_back(v.root);
+    }
+    return touched;
+  });
+  if (timings) timings->per_group_ms = ms_since(t2);
+#else
+  // Hash variant: original group_by_key + sigs_equal. Value half of the
+  // keyed pair is just Id — only the root is consumed downstream — so we
+  // don't double the count-sort bandwidth carrying CanonEntry as the
+  // value (a strict-win optimization that's independent of the algorithm).
   auto t0 = timings ? clk::now() : clk::time_point{};
   auto keyed = parlay::delayed_tabulate(n, [&](std::size_t i) {
     return std::pair<CanonEntry, Id>{canon[i], canon[i].root};
@@ -321,17 +416,18 @@ parlay::sequence<Id> merge_and_collect_semisort(
     return a.h == b.h && sigs_equal(a.idx, b.idx, uf, nodes);
   };
   auto t1 = timings ? clk::now() : clk::time_point{};
-  auto groups =
-      parlay::group_by_key(keyed, hash_fn, equal_fn);
+  auto groups = parlay::group_by_key(keyed, hash_fn, equal_fn);
   if (timings) timings->group_by_ms = ms_since(t1);
 
   auto t2 = timings ? clk::now() : clk::time_point{};
-  auto per_group = parlay::map(groups, [&](auto& kv) -> parlay::sequence<Id> {
+  per_group = parlay::map(groups, [&](auto& kv) -> parlay::sequence<Id> {
     auto& values = kv.second;
     if (values.size() < 2) return {};
     dnc_union(values, 0, values.size(), uf);
     return std::move(values);
   });
+  if (timings) timings->per_group_ms = ms_since(t2);
+#endif
 
   auto out = parlay::flatten(per_group);
   if (timings) timings->per_group_ms = ms_since(t2);
@@ -390,7 +486,12 @@ void EGraph::parallel_close(parlay::sequence<std::pair<Id, Id>> initial_unions) 
     auto t_semisort = clk::now();
     auto canon = parlay::map(frontier, [&](std::uint32_t idx) {
       const auto& [node, class_id] = nodes[idx];
-      return detail::CanonEntry{sig_hash(node, uf), idx, uf.find_root(class_id)};
+#ifdef PE_GROUPBY_HASH
+      return detail::CanonEntry{sig_hash(node, uf), uf.find_root(class_id), idx};
+#else
+      auto [h1, h2] = sig_hashes(node, uf);
+      return detail::CanonEntry{h1, uf.find_root(class_id), h2};
+#endif
     });
 
     detail::SemisortTimings semi_t{};

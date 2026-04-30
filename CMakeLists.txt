@@ -38,6 +38,17 @@ if(USE_JEMALLOC)
   message(STATUS "Linking with jemalloc: ${JEMALLOC_LIB}")
 endif()
 
+# ---- semisort group-by variant ----
+# Default: parlay::group_by_key_ordered (integer_sort) with a 32-bit
+# secondary hash carried in each CanonEntry — fastest, with collisions
+# made effectively impossible by 96-bit combined entropy and a defensive
+# slow path for the (statistically unreachable) collision case.
+# Set PE_GROUPBY_HASH=ON to build with the legacy parlay::group_by_key
+# (open-addressing) + sigs_equal path, which is deterministically correct
+# under any hash function. CanonEntry stays at 16 bytes either way (the
+# trailing 4 bytes are h2 in the default build, idx in the legacy build).
+option(PE_GROUPBY_HASH "Use deterministic hash + sigs_equal group-by" OFF)
+
 # ---- core library ----
 add_library(parallel_egraph_core STATIC
   src/unionfind.cpp
@@ -48,6 +59,9 @@ target_include_directories(parallel_egraph_core
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 target_link_libraries(parallel_egraph_core PUBLIC parlay ${JEMALLOC_LIB})
+if(PE_GROUPBY_HASH)
+  target_compile_definitions(parallel_egraph_core PUBLIC PE_GROUPBY_HASH)
+endif()
 
 # ---- CLI: egraph-cc <file.smt2> -> sat / unsat ----
 add_executable(egraph-cc src/main.cpp)

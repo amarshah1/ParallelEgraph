@@ -109,11 +109,24 @@ loop {
   roots := map(c -> uf.find_root(c)) over work
   parallel_consolidate(parent_index, work, roots)        // §1
   frontier := flatten(parent_index[r] for r in dedup(roots))
-  canon := map(idx -> (sig_hash, idx, find_root(class))) over frontier
+  canon := map(idx -> (h1, h2 or idx, root)) over frontier  // see §2
   next  := merge_and_collect_semisort(canon)             // §2
   work  := dedup(next)
 }
 ```
+
+`CanonEntry` is 16 bytes either way:
+
+| field | default build       | `PE_GROUPBY_HASH=ON` build |
+|-------|---------------------|---------------------------|
+| `h`   | 64-bit primary hash | 64-bit primary hash       |
+| `root`| pre-round root id   | pre-round root id         |
+| `h2` / `idx` | 32-bit secondary hash | 32-bit node index in `nodes_` |
+
+The trailing 4-byte slot is an `#ifdef`-selected union: we never need both
+fields in the same build. The default carries `h2`; the legacy build
+carries `idx` so its equality predicate (`sigs_equal`) can recover the
+ENode.
 
 ---
 
@@ -177,53 +190,113 @@ Span: `O(log N)` per round (dominated by `parlay::scan`).
 ### What it does
 
 Given a `canon` sequence (one entry per parent node in the frontier — `(h,
-idx, root)` where `h = sig_hash(node)` and `root = find_root(class_of_node)`),
-it merges every set of class roots whose entries share a sig and returns
-the set of touched class ids for the next round.
+root, h2|idx)` where `h = sig_hash(node)` and `root =
+find_root(class_of_node)`), it merges every set of class roots whose
+entries share a signature and returns the set of touched class ids for the
+next round.
 
-### Why it's a semisort, not a sort
+### Two implementations, one selected at build time
 
-A *full* sort by `(hash, sig_cmp)` would also work, but parlay's semisort
-primitive (`group_by_key` with custom hash + equal) is a closer fit: items
-with equal key go to the same group, and we don't care about the order
-within a group. Sample sort does extra work to maintain a global ordering
-we'd immediately discard.
+The grouping is the dominant phase of `parallel_close` on dense workloads
+(e.g. round-0 of the synthetic quintic-n23 input has a 64.4M-element
+frontier with ~12.87M unique signatures, all consumed in a single
+semisort). We ship two implementations and pick at compile time:
 
-### Implementation
+| build                            | algorithm                                    | correctness                                        | speed (16xl-d3, T=192) |
+|----------------------------------|-----------------------------------------------|----------------------------------------------------|-------|
+| default                          | `parlay::group_by_key_ordered` (radix sort)  | hash-quality argument (96-bit combined entropy)    | 350 ms |
+| `-DPE_GROUPBY_HASH=ON`           | `parlay::group_by_key` + `sigs_equal`        | deterministic under any hash function              | 422 ms |
+
+The default is ~1.2× faster because parlay's `group_by_key_ordered` hits
+the `integer_sort` (radix) fast path when the key is an unsigned integral
+and `sizeof(pair) ≤ 16` — both of which we ensure by keying on the 64-bit
+hash and keeping the value half slim.
+
+### Default implementation (ordered + dual hash)
 
 ```cpp
+// Computed once during the consolidation map: h is the 64-bit primary
+// signature hash, h2 is a 32-bit secondary computed by FxHasher with a
+// different seed in the same children-roots pass (no extra UF lookups).
+auto keyed = parlay::delayed_tabulate(n, [&](size_t i) {
+  return std::pair<uint64_t, RootH2>{canon[i].h,
+                                     RootH2{canon[i].root, canon[i].h2}};
+});
+
+// Radix-sort by h, group runs of equal h, return (h, sequence<RootH2>).
+auto groups = parlay::group_by_key_ordered(keyed);
+
+auto per_group = parlay::map(groups, [&](auto& kv) {
+  auto& values = kv.second;
+  if (values.size() < 2) return parlay::sequence<Id>{};
+
+  // Fast path: every element shares h2 with the first → same signature.
+  bool same = true;
+  uint32_t h2_ref = values[0].h2;
+  for (size_t i = 1; i < values.size(); ++i)
+    if (values[i].h2 != h2_ref) { same = false; break; }
+  if (same) {
+    dnc_union(values, 0, values.size(), uf);
+    return parlay::tabulate(values.size(),
+                            [&](size_t i) { return values[i].root; });
+  }
+  // Slow path: sub-bucket by h2 (defensive — should never fire on real
+  // inputs given 96-bit combined entropy; expected count of distinct
+  // signatures with both hashes colliding in a 64M-element batch is
+  // ≈10⁻¹⁴). Keeps the algorithm correct on adversarial inputs.
+  ...
+});
+return parlay::flatten(per_group);
+```
+
+#### 2a. Why dual hash
+
+`group_by_key_ordered` defines group boundaries solely by the sort
+comparator on the key. With a 64-bit hash and 64M elements, the expected
+number of distinct signatures sharing a hash is ≈ 64M² / 2⁶⁴ ≈ 2×10⁻⁴ —
+non-zero, and a single collision would silently merge unrelated classes,
+corrupting the equivalence forever. So the key alone isn't enough.
+
+`sigs_equal` is correct but expensive: each call does N `find_root`
+lookups per child, and parlay's open-addressing hash table calls it once
+per probe in a bucket. Empirically that single phase eats ~1.4× of the
+algorithm's total wallclock at high T on quintic-n23.
+
+The trick: compute a *second* 64-bit FxHash with a different seed in the
+same children-roots pass (no extra UF lookups), truncate to 32 bits, and
+carry it as the value half of the keyed pair. Per-group equality becomes
+a single `uint32` compare per element — no UF lookups, no node lookup, no
+predicate at all.
+
+Combined entropy is 64 + 32 = 96 bits. Across a 64M-element batch the
+expected number of distinct signatures sharing both hashes is
+≈ 64M² / 2⁹⁶ ≈ 10⁻¹⁴, *much* smaller than the per-batch noise floor of
+literally any other failure mode in the system. The slow-path subdivision
+is kept as a defensive net so correctness is unconditional, not
+probabilistic.
+
+#### 2b. Legacy implementation (deterministic)
+
+`-DPE_GROUPBY_HASH=ON` selects the original code path:
+
+```cpp
+auto keyed = parlay::delayed_tabulate(n, [&](size_t i) {
+  return std::pair<CanonEntry, Id>{canon[i], canon[i].root};
+});
 auto hash_fn  = [](const CanonEntry& e) { return e.h; };
 auto equal_fn = [&](const CanonEntry& a, const CanonEntry& b) {
   return a.h == b.h && sigs_equal(a.idx, b.idx, uf, nodes);
 };
 auto groups = parlay::group_by_key(keyed, hash_fn, equal_fn);
-
-auto per_group = parlay::map(groups, [&](auto& kv) {
-  auto& values = kv.second;
-  if (values.size() < 2) return parlay::sequence<Id>{};
-  dnc_union(values, 0, values.size(), uf);
-  return parlay::tabulate(values.size(), [&](size_t i) {
-    return values[i].root;
-  });
-});
-return parlay::flatten(per_group);
 ```
 
-#### 2a. Custom hash + equality
+`parlay::group_by_key(R, hash, equal)` is the hash-distribute-then-
+equality-resolve primitive. Feeding it `sigs_equal` filters 64-bit hash
+collisions by actually walking the children — slower per probe, but
+provably correct under any hash function. Useful when the hash-quality
+argument isn't acceptable (e.g. fuzzing harnesses).
 
-`parlay::group_by_key(R, hash, equal)` is parlay's hash-distribute-then-
-equality-resolve grouping primitive. We feed it:
-
-* `hash` = `sig_hash` (already cached in `canon[i].h`, so this is a memory
-  read).
-* `equal` = `sigs_equal` (`op` match plus `find_root(children)` match
-  componentwise).
-
-Hash collisions at 64 bits are filtered by `equal`, so groups are *exact*:
-every entry in a group has the same signature. No probabilistic
-unsoundness, no in-bucket sort needed.
-
-#### 2b. Within-group union
+#### 2c. Within-group union
 
 Two strategies, env-selectable via `PE_UNION_STYLE`:
 
@@ -280,6 +353,16 @@ cmake --build build
 ```
 
 Parlay is pulled by CMake's `FetchContent`. C++20 required.
+`libjemalloc-dev` is also required by default (Ubuntu/Debian:
+`sudo apt-get install libjemalloc-dev`); see the `USE_JEMALLOC` option
+below to opt out.
+
+### CMake options
+
+| option              | default | effect |
+|---------------------|---------|--------|
+| `USE_JEMALLOC`      | `ON`    | Link against jemalloc to bypass glibc's per-arena lock contention. ~1.2× speedup on closure_compare 16xl-d3 at T=192, ~1.8× on the synthetic wide-shallow workloads. Set `OFF` to fall back to system malloc (dev package not required). |
+| `PE_GROUPBY_HASH`   | `OFF`   | Switch `merge_and_collect_semisort` from the default `group_by_key_ordered` + dual-hash path to the legacy `group_by_key` + `sigs_equal` path. The legacy path is deterministically correct under any hash function but ~1.2× slower on closure_compare. `CanonEntry` stays at 16 B in either build. |
 
 ### Test
 

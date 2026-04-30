@@ -39,6 +39,14 @@ struct ENodeHash {
 std::uint64_t sig_hash(const ENode& node, ConcurrentUnionFind& uf);
 std::uint64_t sig_hash_seq(const ENode& node, SequentialUnionFind& uf);
 
+// Returns a 64-bit primary hash and a 32-bit secondary hash computed in a
+// single pass over the node's children (one set of UF lookups). The
+// secondary uses a different FxHasher seed; combined 96-bit entropy makes
+// hash collisions across distinct signatures effectively impossible
+// (≈10⁻¹⁴ across a 64M-element batch on the largest synthetic workload).
+std::pair<std::uint64_t, std::uint32_t> sig_hashes(
+    const ENode& node, ConcurrentUnionFind& uf);
+
 bool sigs_equal(std::uint32_t ia, std::uint32_t ib,
                 ConcurrentUnionFind& uf,
                 const parlay::sequence<std::pair<ENode, Id>>& nodes);

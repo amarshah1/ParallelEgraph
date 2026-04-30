@@ -152,7 +152,12 @@ PhaseTimes run_trial(const Workload& w) {
 
   auto canon = parlay::map(frontier, [&](std::uint32_t idx) {
     const auto& [node, class_id] = nodes[idx];
-    return detail::CanonEntry{sig_hash(node, uf), idx, uf.find_root(class_id)};
+#ifdef PE_GROUPBY_HASH
+    return detail::CanonEntry{sig_hash(node, uf), uf.find_root(class_id), idx};
+#else
+    auto [h1, h2] = sig_hashes(node, uf);
+    return detail::CanonEntry{h1, uf.find_root(class_id), h2};
+#endif
   });
 
   auto t1 = clk::now();
