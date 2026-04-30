@@ -1,15 +1,14 @@
 #pragma once
-// E-graph trimmed to exactly what the bench needs: build via add(), then
-// run sequential_close_nelson or parallel_close on a list of equalities.
-// Everything else (the multiple parallel_rebuild variants, sequential
-// merge/repair/rebuild worklist, parallel_merge_all, clone, num_classes,
-// the SAT integration, the SMT-LIB solver, the CLI) was removed.
+// E-graph trimmed to exactly what the closure benchmark needs: bulk_init
+// to construct from a flat sequence of ENodes, then parallel_close /
+// sequential_close_nelson on a list of equalities. No incremental add()
+// — all consumers go through bulk_init, so nodes_ is sparsely indexed by
+// class id (the array index *is* the class id).
 
 #include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -29,11 +28,6 @@ struct ENode {
   }
 };
 
-// Hasher for hashcons keyed on fully-canonicalized ENodes.
-struct ENodeHash {
-  std::size_t operator()(const ENode& n) const noexcept;
-};
-
 // ---- Signature helpers (used during BSP rounds) ---------------------------
 
 std::uint64_t sig_hash(const ENode& node, ConcurrentUnionFind& uf);
@@ -49,15 +43,15 @@ std::pair<std::uint64_t, std::uint32_t> sig_hashes(
 
 bool sigs_equal(std::uint32_t ia, std::uint32_t ib,
                 ConcurrentUnionFind& uf,
-                const parlay::sequence<std::pair<ENode, Id>>& nodes);
+                const parlay::sequence<ENode>& nodes);
 
 bool sigs_equal_seq(std::uint32_t ia, std::uint32_t ib,
                     SequentialUnionFind& uf,
-                    const parlay::sequence<std::pair<ENode, Id>>& nodes);
+                    const parlay::sequence<ENode>& nodes);
 
 int sig_cmp(std::uint32_t ia, std::uint32_t ib,
             ConcurrentUnionFind& uf,
-            const parlay::sequence<std::pair<ENode, Id>>& nodes);
+            const parlay::sequence<ENode>& nodes);
 
 // ---- EGraph ---------------------------------------------------------------
 
@@ -69,23 +63,18 @@ class EGraph {
   // so this is non-const.
   Id find(Id id) { return uf_.find_root(id); }
 
-  // Insert (and dedupe via hashcons) a single e-node. Sequential — runs
-  // during the build phase before any closure call.
-  Id add(ENode node);
-
   // Bulk-construct an EGraph from a sequence of ENodes given in DAG order:
   // the i-th node receives class id i, and every child id in node i must
-  // be < i. Hashcons is skipped — the caller is responsible for ensuring
-  // no two nodes are structurally identical (otherwise the duplicate gets
-  // its own class instead of being deduped). All structural setup
-  // (`uf_`, `nodes_`, `parent_index_`) is built via parlay primitives
-  // (tabulate / scan / group_by_index), so the work is fully parallel.
-  // Returns a unique_ptr because EGraph holds atomics (non-movable).
+  // be < i. The caller is responsible for ensuring no two nodes are
+  // structurally identical (no hashcons dedup is performed). nodes_ ends
+  // up class-id-indexed (sparse), so leaves occupy slots in nodes_ but
+  // contribute nothing to parent_index_. Returns a unique_ptr because
+  // EGraph holds atomics (non-movable).
   static std::unique_ptr<EGraph> bulk_init(parlay::sequence<ENode> nodes);
 
   // BSP closure on explicit initial unions; fully parallel within rounds.
-  // See cpp/DESIGN.md §1 (parallel_consolidate) and §2
-  // (merge_and_collect_semisort) for the algorithm.
+  // See DESIGN.md §1 (parallel_consolidate) and §2 (merge_and_collect_semisort)
+  // for the algorithm.
   void parallel_close(parlay::sequence<std::pair<Id, Id>> initial_unions);
 
   // Sequential Nelson-style closure baseline used by the bench.
@@ -96,19 +85,13 @@ class EGraph {
 
   // Internal but exposed for tests / benches that need raw access.
   ConcurrentUnionFind& uf() { return uf_; }
-  const parlay::sequence<std::pair<ENode, Id>>& nodes() const { return nodes_; }
+  const parlay::sequence<ENode>& nodes() const { return nodes_; }
   parlay::sequence<parlay::sequence<Id>>& parent_index() { return parent_index_; }
 
  private:
-  Id make_id() { return uf_.make_set(); }
-  ENode canonicalize(const ENode& node);
-
   ConcurrentUnionFind uf_;
-  parlay::sequence<std::pair<ENode, Id>> nodes_;
+  parlay::sequence<ENode> nodes_;
   parlay::sequence<parlay::sequence<Id>> parent_index_;
-
-  // Hashcons for dedup during add(). Sequential-only access.
-  std::unordered_map<ENode, Id, ENodeHash> hashcons_;
 };
 
 }  // namespace pe

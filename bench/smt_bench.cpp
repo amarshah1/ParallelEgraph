@@ -27,10 +27,13 @@
 #include <utility>
 #include <vector>
 
+#include <ankerl/unordered_dense.h>
+
 #include <parlay/parallel.h>
 #include <parlay/sequence.h>
 
 #include "parallel_egraph/egraph.hpp"
+#include "parallel_egraph/fxhash.hpp"
 #include "parallel_egraph/smtlib.hpp"
 
 namespace fs = std::filesystem;
@@ -45,56 +48,91 @@ std::string read_file(const fs::path& path) {
   return buf.str();
 }
 
-std::size_t count_subterms(const pe::Term& t) {
-  std::size_t n = 1;
-  for (const auto& a : t.args) n += count_subterms(a);
-  return n;
-}
-
-// Matches main.cpp's add_term: iterative add of a Term tree to an EGraph.
-pe::Id add_term(pe::EGraph& eg, const pe::Term& term) {
-  enum class WK { Process, Build };
-  struct W { WK kind; const pe::Term* term; std::string op; std::size_t nargs; };
-  std::vector<W> stack;
-  std::vector<pe::Id> results;
-  stack.push_back({WK::Process, &term, {}, 0});
-  while (!stack.empty()) {
-    W w = std::move(stack.back());
-    stack.pop_back();
-    if (w.kind == WK::Process) {
-      const pe::Term& t = *w.term;
-      switch (t.kind) {
-        case pe::Term::Kind::Const: {
-          pe::ENode leaf;
-          leaf.op = t.op;
-          results.push_back(eg.add(std::move(leaf)));
-          break;
-        }
-        case pe::Term::Kind::App:
-          stack.push_back({WK::Build, nullptr, t.op, t.args.size()});
-          for (auto it = t.args.rbegin(); it != t.args.rend(); ++it) {
-            stack.push_back({WK::Process, &*it, {}, 0});
-          }
-          break;
-        case pe::Term::Kind::Eq:
-        case pe::Term::Kind::Not:
-          throw std::runtime_error("= and not are not first-class terms");
-      }
-    } else {
-      std::size_t start = results.size() - w.nargs;
-      std::vector<pe::Id> children(results.begin() + start, results.end());
-      results.erase(results.begin() + start, results.end());
-      pe::ENode node;
-      node.op = std::move(w.op);
-      node.children = std::move(children);
-      results.push_back(eg.add(std::move(node)));
-    }
+// Hash for ENode used by the parser-side hashcons. Same as the now-removed
+// EGraph internal hashcons — we keep it parser-local because EGraph itself
+// has no add() / hashcons of its own; bulk_init expects a flat, unique
+// ENode sequence, which this builder produces.
+struct ENodeHash {
+  std::size_t operator()(const pe::ENode& n) const noexcept {
+    pe::FxHasher h;
+    h.write_str(n.op);
+    for (pe::Id c : n.children) h.write_u32(c);
+    return static_cast<std::size_t>(h.finish());
   }
-  return results.back();
-}
+};
+
+// Walk a Term tree iteratively, dedupe via hashcons, append unique ENodes
+// to a flat sequence in DAG order. Each call to add_term returns the
+// class id of the term's root. After all calls, take_nodes() yields the
+// DAG-ordered ENode sequence to feed EGraph::bulk_init.
+class SmtToEGraphBuilder {
+ public:
+  pe::Id add_term(const pe::Term& term) {
+    enum class WK { Process, Build };
+    struct W {
+      WK kind;
+      const pe::Term* term;
+      std::string op;
+      std::size_t nargs;
+    };
+    std::vector<W> stack;
+    std::vector<pe::Id> results;
+    stack.push_back({WK::Process, &term, {}, 0});
+    while (!stack.empty()) {
+      W w = std::move(stack.back());
+      stack.pop_back();
+      if (w.kind == WK::Process) {
+        const pe::Term& t = *w.term;
+        switch (t.kind) {
+          case pe::Term::Kind::Const:
+            results.push_back(intern(pe::ENode{t.op, {}}));
+            break;
+          case pe::Term::Kind::App:
+            stack.push_back({WK::Build, nullptr, t.op, t.args.size()});
+            for (auto it = t.args.rbegin(); it != t.args.rend(); ++it) {
+              stack.push_back({WK::Process, &*it, {}, 0});
+            }
+            break;
+          case pe::Term::Kind::Eq:
+          case pe::Term::Kind::Not:
+            throw std::runtime_error(
+                "= and not are not first-class terms; only allowed at "
+                "the top of an assertion");
+        }
+      } else {
+        std::size_t start = results.size() - w.nargs;
+        std::vector<pe::Id> children(results.begin() + start, results.end());
+        results.erase(results.begin() + start, results.end());
+        pe::ENode node;
+        node.op = std::move(w.op);
+        node.children = std::move(children);
+        results.push_back(intern(std::move(node)));
+      }
+    }
+    return results.back();
+  }
+
+  parlay::sequence<pe::ENode> take_nodes() && { return std::move(nodes_); }
+  std::size_t size() const { return nodes_.size(); }
+
+ private:
+  pe::Id intern(pe::ENode node) {
+    auto it = hashcons_.find(node);
+    if (it != hashcons_.end()) return it->second;
+    pe::Id id = static_cast<pe::Id>(nodes_.size());
+    nodes_.push_back(node);
+    hashcons_.emplace(std::move(node), id);
+    return id;
+  }
+
+  parlay::sequence<pe::ENode> nodes_;
+  ankerl::unordered_dense::map<pe::ENode, pe::Id, ENodeHash> hashcons_;
+};
 
 // Build EGraph from a parsed script's asserted equalities (skipping
-// disequalities — we don't time the sat/unsat verdict here).
+// disequalities — we don't time the sat/unsat verdict here). Construction
+// happens once: walk all assertions through the builder, then bulk_init
+// the resulting flat ENode sequence.
 struct Built {
   std::unique_ptr<pe::EGraph> eg;
   parlay::sequence<std::pair<pe::Id, pe::Id>> eqs;
@@ -102,25 +140,20 @@ struct Built {
 };
 
 Built build_from_script(const pe::Script& script) {
-  std::size_t capacity = 0;
-  for (const auto& cmd : script.commands) {
-    if (cmd.kind == pe::Command::Kind::Assert) {
-      capacity += count_subterms(cmd.term);
-    }
-  }
-  auto eg = std::make_unique<pe::EGraph>(capacity);
+  SmtToEGraphBuilder builder;
   parlay::sequence<std::pair<pe::Id, pe::Id>> eqs;
   for (const auto& cmd : script.commands) {
     if (cmd.kind != pe::Command::Kind::Assert) continue;
     const pe::Term& t = cmd.term;
     if (t.kind == pe::Term::Kind::Eq) {
-      pe::Id a = add_term(*eg, t.args[0]);
-      pe::Id b = add_term(*eg, t.args[1]);
+      pe::Id a = builder.add_term(t.args[0]);
+      pe::Id b = builder.add_term(t.args[1]);
       eqs.emplace_back(a, b);
     }
     // disequalities ignored for benchmarking
   }
-  std::size_t classes = eg->nodes().size();
+  std::size_t classes = builder.size();
+  auto eg = pe::EGraph::bulk_init(std::move(builder).take_nodes());
   return {std::move(eg), std::move(eqs), classes};
 }
 

@@ -151,12 +151,13 @@ PhaseTimes run_trial(const Workload& w) {
   if (frontier.empty()) return {consolidate_ms, 0.0};
 
   auto canon = parlay::map(frontier, [&](std::uint32_t idx) {
-    const auto& [node, class_id] = nodes[idx];
+    const auto& node = nodes[idx];
+    // class_id == idx (nodes_ is class-id-indexed).
 #ifdef PE_GROUPBY_HASH
-    return detail::CanonEntry{sig_hash(node, uf), uf.find_root(class_id), idx};
+    return detail::CanonEntry{sig_hash(node, uf), uf.find_root(idx), idx};
 #else
     auto [h1, h2] = sig_hashes(node, uf);
-    return detail::CanonEntry{h1, uf.find_root(class_id), h2};
+    return detail::CanonEntry{h1, uf.find_root(idx), h2};
 #endif
   });
 

@@ -18,15 +18,6 @@
 
 namespace pe {
 
-// ---- ENode hashing --------------------------------------------------------
-
-std::size_t ENodeHash::operator()(const ENode& n) const noexcept {
-  FxHasher h;
-  h.write_str(n.op);
-  for (Id c : n.children) h.write_u32(c);
-  return static_cast<std::size_t>(h.finish());
-}
-
 // ---- Signature helpers ----------------------------------------------------
 
 std::uint64_t sig_hash(const ENode& node, ConcurrentUnionFind& uf) {
@@ -64,9 +55,9 @@ std::uint64_t sig_hash_seq(const ENode& node, SequentialUnionFind& uf) {
 }
 
 bool sigs_equal(std::uint32_t ia, std::uint32_t ib, ConcurrentUnionFind& uf,
-                const parlay::sequence<std::pair<ENode, Id>>& nodes) {
-  const auto& na = nodes[ia].first;
-  const auto& nb = nodes[ib].first;
+                const parlay::sequence<ENode>& nodes) {
+  const auto& na = nodes[ia];
+  const auto& nb = nodes[ib];
   if (na.op != nb.op) return false;
   if (na.children.size() != nb.children.size()) return false;
   for (std::size_t i = 0; i < na.children.size(); ++i) {
@@ -78,9 +69,9 @@ bool sigs_equal(std::uint32_t ia, std::uint32_t ib, ConcurrentUnionFind& uf,
 }
 
 bool sigs_equal_seq(std::uint32_t ia, std::uint32_t ib, SequentialUnionFind& uf,
-                    const parlay::sequence<std::pair<ENode, Id>>& nodes) {
-  const auto& na = nodes[ia].first;
-  const auto& nb = nodes[ib].first;
+                    const parlay::sequence<ENode>& nodes) {
+  const auto& na = nodes[ia];
+  const auto& nb = nodes[ib];
   if (na.op != nb.op) return false;
   if (na.children.size() != nb.children.size()) return false;
   for (std::size_t i = 0; i < na.children.size(); ++i) {
@@ -92,9 +83,9 @@ bool sigs_equal_seq(std::uint32_t ia, std::uint32_t ib, SequentialUnionFind& uf,
 }
 
 int sig_cmp(std::uint32_t ia, std::uint32_t ib, ConcurrentUnionFind& uf,
-            const parlay::sequence<std::pair<ENode, Id>>& nodes) {
-  const auto& na = nodes[ia].first;
-  const auto& nb = nodes[ib].first;
+            const parlay::sequence<ENode>& nodes) {
+  const auto& na = nodes[ia];
+  const auto& nb = nodes[ib];
   int c = na.op.compare(nb.op);
   if (c != 0) return c < 0 ? -1 : 1;
   if (na.children.size() != nb.children.size()) {
@@ -108,86 +99,34 @@ int sig_cmp(std::uint32_t ia, std::uint32_t ib, ConcurrentUnionFind& uf,
   return 0;
 }
 
-// ---- EGraph ctor / build helpers -----------------------------------------
+// ---- EGraph ctor / bulk init ---------------------------------------------
 
 EGraph::EGraph(std::size_t capacity)
     : uf_(capacity), parent_index_(capacity) {}
 
-ENode EGraph::canonicalize(const ENode& node) {
-  ENode out;
-  out.op = node.op;
-  out.children.reserve(node.children.size());
-  for (Id c : node.children) out.children.push_back(find(c));
-  return out;
-}
-
-// Bulk parallel construction. See egraph.hpp for semantics.
+// Bulk parallel construction. nodes_ is sparsely indexed by class id (the
+// array index *is* the class id), so leaves occupy nodes_ slots but
+// contribute nothing to parent_index_. No prefix-scan or packing — just
+// the inverse from (parent → children) into (class → parents).
 std::unique_ptr<EGraph> EGraph::bulk_init(parlay::sequence<ENode> nodes) {
   const std::size_t n = nodes.size();
   auto eg = std::make_unique<EGraph>(n);
-
-  // 1. UF: bump size_ to n in one shot (slots already at make_rank(0)).
   eg->uf_.bulk_init(n);
 
-  // 2. node_idx prefix-scan: only non-leaves go into nodes_, so each
-  //    non-leaf at input position i gets node_idx = (# non-leaves before i).
-  auto is_nonleaf = parlay::tabulate(n, [&](std::size_t i) {
-    return nodes[i].children.empty() ? std::size_t{0} : std::size_t{1};
-  });
-  auto scan_pair = parlay::scan(is_nonleaf);
-  auto& offsets = scan_pair.first;
-  std::size_t total_nonleaves = scan_pair.second;
-
-  // 3. Build (child_class, node_idx) pairs in parallel before we move out
-  //    of `nodes`. We tabulate per-node-index sequences and flatten.
   auto child_pairs = parlay::flatten(parlay::tabulate(
-      n, [&](std::size_t i) -> parlay::sequence<std::pair<Id, std::uint32_t>> {
+      n, [&](std::size_t i) -> parlay::sequence<std::pair<Id, Id>> {
         const auto& cs = nodes[i].children;
-        if (cs.empty()) return {};
-        std::uint32_t j = static_cast<std::uint32_t>(offsets[i]);
-        return parlay::tabulate(cs.size(), [&, j](std::size_t k) {
-          return std::pair<Id, std::uint32_t>{cs[k], j};
-        });
+        parlay::sequence<std::pair<Id, Id>> result;
+        result.reserve(cs.size());
+        Id parent = static_cast<Id>(i);
+        for (Id c : cs) result.emplace_back(c, parent);
+        return result;
       }));
 
-  // 4. group_by_index by child class → parent_index_[c] = node_idx list.
   eg->parent_index_ = parlay::group_by_index(
       std::move(child_pairs), static_cast<Id>(n));
-
-  // 5. Pack non-leaves into eg->nodes_ in parallel (consumes `nodes`).
-  //    Each non-leaf has a unique offsets[i], so the parallel writes never
-  //    collide.
-  eg->nodes_ = parlay::sequence<std::pair<ENode, Id>>(total_nonleaves);
-  parlay::parallel_for(0, n, [&](std::size_t i) {
-    if (!nodes[i].children.empty()) {
-      eg->nodes_[offsets[i]] = std::pair<ENode, Id>{
-          std::move(nodes[i]), static_cast<Id>(i)};
-    }
-  });
-
-  // hashcons_ left empty: bulk_init skips dedup by contract.
+  eg->nodes_ = std::move(nodes);
   return eg;
-}
-
-Id EGraph::add(ENode node) {
-  ENode canon = canonicalize(node);
-
-  auto it = hashcons_.find(canon);
-  if (it != hashcons_.end()) return find(it->second);
-
-  Id id = make_id();
-
-  if (!canon.children.empty()) {
-    std::uint32_t node_idx = static_cast<std::uint32_t>(nodes_.size());
-    nodes_.emplace_back(canon, id);
-    for (Id child : canon.children) {
-      Id child_root = find(child);
-      parent_index_[child_root].push_back(node_idx);
-    }
-  }
-
-  hashcons_.emplace(std::move(canon), id);
-  return id;
 }
 
 // ---- parallel consolidation helper ---------------------------------------
@@ -218,30 +157,23 @@ void parallel_consolidate(
     Id r = groups[g].first;
     const auto& cs_for_r = groups[g].second;
 
-    auto sizes = parlay::tabulate(cs_for_r.size(), [&](std::size_t i) {
-      return parent_index[cs_for_r[i]].size();
-    });
-    auto scan_result = parlay::scan(sizes);
-    auto& offsets = scan_result.first;
-    std::size_t total_new = scan_result.second;
+    // Replace parent_index[r] with the concatenation of:
+    //   - its existing entries (from add-time registration)
+    //   - parent_index[c] for every non-root c grouped under r
+    // Each source is moved out (so cs_for_r's parent_index slots end up
+    // empty); parlay::flatten allocates the destination buffer once and
+    // does the parallel scatter internally.
+    auto inputs = parlay::tabulate(
+        cs_for_r.size() + 1,
+        [&](std::size_t i) -> parlay::sequence<Id> {
+          if (i == 0) return std::move(parent_index[r]);
+          Id c = cs_for_r[i - 1];
+          auto out = std::move(parent_index[c]);
+          parent_index[c].clear();  // defensive: post-move state is unspecified
+          return out;
+        });
 
-    auto& dst = parent_index[r];
-    std::size_t old_size = dst.size();
-    dst.resize(old_size + total_new);
-
-    constexpr std::size_t COPY_SEQ_CUTOFF = 1024;
-    parlay::parallel_for(0, cs_for_r.size(), [&](std::size_t i) {
-      Id c = cs_for_r[i];
-      auto& src = parent_index[c];
-      std::size_t ofs = old_size + offsets[i];
-      if (src.size() < COPY_SEQ_CUTOFF) {
-        for (std::size_t j = 0; j < src.size(); ++j) dst[ofs + j] = src[j];
-      } else {
-        parlay::parallel_for(0, src.size(),
-                             [&](std::size_t j) { dst[ofs + j] = src[j]; });
-      }
-      src.clear();
-    });
+    parent_index[r] = parlay::flatten(std::move(inputs));
   });
 }
 
@@ -323,7 +255,7 @@ namespace detail {
 // collisions, so groups are exact and no in-bucket sort is needed.
 parlay::sequence<Id> merge_and_collect_semisort(
     parlay::sequence<CanonEntry> canon, ConcurrentUnionFind& uf,
-    const parlay::sequence<std::pair<ENode, Id>>& nodes,
+    const parlay::sequence<ENode>& nodes,
     SemisortTimings* timings) {
   const std::size_t n = canon.size();
   if (n == 0) {
@@ -497,12 +429,13 @@ void EGraph::parallel_close(parlay::sequence<std::pair<Id, Id>> initial_unions) 
 
     auto t_semisort = clk::now();
     auto canon = parlay::map(frontier, [&](std::uint32_t idx) {
-      const auto& [node, class_id] = nodes[idx];
+      const auto& node = nodes[idx];
+      // class_id == idx since nodes_ is class-id-indexed.
 #ifdef PE_GROUPBY_HASH
-      return detail::CanonEntry{sig_hash(node, uf), uf.find_root(class_id), idx};
+      return detail::CanonEntry{sig_hash(node, uf), uf.find_root(idx), idx};
 #else
       auto [h1, h2] = sig_hashes(node, uf);
-      return detail::CanonEntry{h1, uf.find_root(class_id), h2};
+      return detail::CanonEntry{h1, uf.find_root(idx), h2};
 #endif
     });
 
@@ -569,9 +502,10 @@ void EGraph::sequential_close_nelson(
     if (frontier.empty()) continue;
 
     for (std::uint32_t pidx : frontier) {
-      const auto& [node, my_class_raw] = nodes_[pidx];
+      // class_id == pidx since nodes_ is class-id-indexed.
+      const auto& node = nodes_[pidx];
       std::uint64_t h = sig_hash_seq(node, uf);
-      Id my_class = uf.find_root(my_class_raw);
+      Id my_class = uf.find_root(static_cast<Id>(pidx));
 
       auto& bucket = sig_table[h];
       std::int64_t match_o = -1;
@@ -582,8 +516,7 @@ void EGraph::sequential_close_nelson(
         }
       }
       if (match_o >= 0) {
-        Id other_class = uf.find_root(
-            nodes_[static_cast<std::size_t>(match_o)].second);
+        Id other_class = uf.find_root(static_cast<Id>(match_o));
         if (my_class != other_class) {
           uf.union_(my_class, other_class);
           worklist.push_back(my_class);

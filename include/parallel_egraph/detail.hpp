@@ -44,7 +44,7 @@ void parallel_consolidate(
 parlay::sequence<Id> merge_and_collect_semisort(
     parlay::sequence<CanonEntry> canon,
     ConcurrentUnionFind& uf,
-    const parlay::sequence<std::pair<ENode, Id>>& nodes,
+    const parlay::sequence<ENode>& nodes,
     SemisortTimings* timings = nullptr);
 
 }  // namespace pe::detail
