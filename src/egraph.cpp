@@ -374,6 +374,17 @@ parlay::sequence<Id> merge_and_collect_semisort(
       if (values[i].h2 != h2_ref) { same = false; break; }
     }
     if (same) {
+      // Skip groups whose members all already share the same root — the
+      // unions would be no-ops and the touched ids would re-enter
+      // next_work, looping the BSP forever. Sequential O(k) scan; same
+      // shape as the h2 check above and short-circuits on the first
+      // mismatch (i.e. on every group that's actually doing useful work).
+      const Id root_ref = values[0].root;
+      bool all_same_root = true;
+      for (std::size_t i = 1; i < k; ++i) {
+        if (values[i].root != root_ref) { all_same_root = false; break; }
+      }
+      if (all_same_root) return {};
       dnc_union(values, 0, k, uf);
       return parlay::tabulate(k,
                               [&](std::size_t i) { return values[i].root; });
