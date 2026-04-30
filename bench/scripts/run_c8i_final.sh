@@ -3,16 +3,14 @@
 # single-socket Intel Xeon 6 / Granite Rapids, SNC=3).
 #
 # Runs:
-#   Tier 1.1 — fine-grained strong scaling on 4xl-d3 (T = 1..192, 11 cells)
-#   Tier 1.2 — width grid extended to 8xl-d3 at T_max
-#   Tier 1.3 — round-level traces at five widths
+#   Tier 1.1 — fine-grained strong scaling on 16xl-d3 (T = 1..192, 11 cells)
+#   Tier 1.2 — width grid extended to 16xl-d3 at T_max
+#   Tier 1.3 — round-level traces at six widths
 #   Tier 1.4 — per-phase scaling on 4xl-d3 across T
-#   Tier 2.5 — depth sweep on xl at T=192
 #   Tier 2.6 — merge-density sweep on xl-d3 at T=192
-#   n_fns   — operator-pool size sweep on xl-d3 at T=192
 #
 # Outputs CSVs and rendered PNGs under bench/results/. Re-running overwrites
-# prior results. Total wall time ~30–40 min on c8i.metal-48xl.
+# prior results. Total wall time ~25–35 min on c8i.metal-48xl.
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -37,23 +35,23 @@ mkdir -p bench/results
 T_MAX=${T_MAX:-192}
 echo "T_max=$T_MAX"
 
-# ------------------- Tier 1.1 — fine-grained strong scaling -------------------
-echo "[1/7] strong scaling on 4xl-d3 across T"
+# ------------------- Tier 1.1 — fine-grained strong scaling on 16xl-d3 -------
+echo "[1/5] strong scaling on 16xl-d3 across T"
 : > bench/results/strong_scaling.csv
 HDR=PE_BENCH_HEADER=1
 for T in 1 2 4 8 16 32 48 64 96 144 192; do
   echo "    T=$T"
   env $HDR PARLAY_NUM_THREADS=$T PE_BENCH_FORMAT=csv \
-    PE_BENCH_CUSTOM=400000,16,8000000,800000,3 \
+    PE_BENCH_CUSTOM=1600000,16,32000000,3200000,3 \
     PE_BENCH_SKIP_NELSON=1 \
     ./build/closure_compare_bench 2>/dev/null \
-    | sed 's/^custom,/4xl-d3,/' \
+    | sed 's/^custom,/16xl-d3,/' \
     >> bench/results/strong_scaling.csv
   HDR=
 done
 
 # ------------------- Tier 1.2 — width grid extended -------------------
-echo "[2/7] width grid (large, xl-d3, 2xl-d3, 4xl-d3, 8xl-d3, 16xl-d3) at T=$T_MAX"
+echo "[2/5] width grid (large, xl-d3, 2xl-d3, 4xl-d3, 8xl-d3, 16xl-d3) at T=$T_MAX"
 : > bench/results/width_grid.csv
 HDR=PE_BENCH_HEADER=1
 for SPEC in "large:50000,16,1000000,100000,3" \
@@ -75,7 +73,7 @@ for SPEC in "large:50000,16,1000000,100000,3" \
 done
 
 # ------------------- Tier 1.3 — round-level traces -------------------
-echo "[3/7] traces at six widths"
+echo "[3/5] traces at six widths"
 echo "workload,parlay_threads,round,work,frontier,next,consolidate_ms,frontier_ms,semisort_ms,keyed_ms,group_by_ms,per_group_ms" \
   > bench/results/trace.csv
 for SPEC in "large:50000,16,1000000,100000,3" \
@@ -95,7 +93,7 @@ for SPEC in "large:50000,16,1000000,100000,3" \
 done
 
 # ------------------- Tier 1.4 — per-phase scaling on 4xl-d3 -------------------
-echo "[4/7] components on 4xl-d3 across T"
+echo "[4/5] components on 4xl-d3 across T"
 : > bench/results/components.csv
 HDR=PE_BENCH_HEADER=1
 for T in 1 16 48 96 144 192; do
@@ -108,22 +106,8 @@ for T in 1 16 48 96 144 192; do
   HDR=
 done
 
-# ------------------- Tier 2.5 — depth sweep on xl -------------------
-echo "[5/7] depth sweep on xl at T=$T_MAX"
-: > bench/results/depth_sweep.csv
-HDR=PE_BENCH_HEADER=1
-for D in 1 2 3 5 7 10; do
-  echo "    depth=$D"
-  env $HDR PARLAY_NUM_THREADS=$T_MAX PE_BENCH_FORMAT=csv \
-    PE_BENCH_CUSTOM=100000,16,2000000,200000,$D \
-    ./build/closure_compare_bench 2>/dev/null \
-    | sed 's/^custom,/xl,/' \
-    >> bench/results/depth_sweep.csv
-  HDR=
-done
-
 # ------------------- Tier 2.6 — merge-density sweep on xl-d3 -------------------
-echo "[6/7] merge-density sweep on xl-d3 at T=$T_MAX"
+echo "[5/5] merge-density sweep on xl-d3 at T=$T_MAX"
 : > bench/results/merge_density.csv
 HDR=PE_BENCH_HEADER=1
 for FRAC in 0.05 0.1 0.25 0.5 1.0 2.0; do
@@ -135,21 +119,6 @@ for FRAC in 0.05 0.1 0.25 0.5 1.0 2.0; do
     ./build/closure_compare_bench 2>/dev/null \
     | sed 's/^custom,/xl-d3,/' \
     >> bench/results/merge_density.csv
-  HDR=
-done
-
-# ------------------- n_fns sweep on xl-d3 -------------------
-echo "[7/7] n_fns sweep on xl-d3 at T=$T_MAX"
-: > bench/results/nfns_sweep.csv
-HDR=PE_BENCH_HEADER=1
-for FNS in 4 8 16 32 64 128; do
-  echo "    n_fns=$FNS"
-  env $HDR PARLAY_NUM_THREADS=$T_MAX PE_BENCH_FORMAT=csv \
-    PE_BENCH_CUSTOM=100000,$FNS,2000000,200000,3 \
-    PE_BENCH_SKIP_NELSON=1 \
-    ./build/closure_compare_bench 2>/dev/null \
-    | sed 's/^custom,/xl-d3,/' \
-    >> bench/results/nfns_sweep.csv
   HDR=
 done
 
