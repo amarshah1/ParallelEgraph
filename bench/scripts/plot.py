@@ -47,7 +47,6 @@ def _read(csv: Path) -> pd.DataFrame:
 def plot_strong_scaling(_args):
     df = _read(RESULTS / "strong_scaling.csv")
     par = df[df["algorithm"] == "par_close"].copy()
-    # Take median across trials per (workload, parlay_threads).
     med = (
         par.groupby(["workload", "parlay_threads"])["wallclock_ms"]
         .median()
@@ -56,22 +55,44 @@ def plot_strong_scaling(_args):
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
     workloads = sorted(med["workload"].unique())
+    threads = sorted(med["parlay_threads"].unique())
+
+    # Subtle parallel-efficiency reference lines (slope-1 in log-log).
+    for eff, label in [(1.0, "100% eff"), (0.5, "50% eff"),
+                       (0.25, "25% eff"), (0.10, "10% eff")]:
+        ref = [t * eff for t in threads]
+        ax.plot(threads, ref, "--", color="gray", alpha=0.35,
+                linewidth=0.8, zorder=1)
+        # Label on the right edge.
+        ax.annotate(label, xy=(threads[-1], ref[-1]),
+                    xytext=(4, 0), textcoords="offset points",
+                    fontsize=8, color="gray", va="center")
+
     for w in workloads:
         sub = med[med["workload"] == w].sort_values("parlay_threads")
-        # Speedup = T1 / TN where T1 is wallclock at smallest thread count.
         baseline = sub.iloc[0]["wallclock_ms"]
         speedup = baseline / sub["wallclock_ms"]
-        ax.plot(sub["parlay_threads"], speedup, marker="o", label=w)
+        ax.plot(sub["parlay_threads"], speedup, marker="o",
+                linewidth=2.2, markersize=6, label=w, zorder=3)
+        # Annotate peak.
+        peak_idx = speedup.idxmax()
+        peak_t = sub.loc[peak_idx, "parlay_threads"]
+        peak_s = speedup.loc[peak_idx]
+        ax.annotate(f"peak {peak_s:.1f}× @ T={int(peak_t)}",
+                    xy=(peak_t, peak_s),
+                    xytext=(-8, 12), textcoords="offset points",
+                    fontsize=9, ha="right",
+                    arrowprops=dict(arrowstyle="-",
+                                    color="black", alpha=0.5,
+                                    lw=0.6))
 
-    # Ideal y=x line.
-    threads = sorted(med["parlay_threads"].unique())
-    ax.plot(threads, threads, "k--", alpha=0.4, label="ideal")
     ax.set_xscale("log", base=2)
+    ax.set_yscale("log", base=2)
     ax.set_xlabel("parlay threads")
     ax.set_ylabel("speedup vs T=min")
     ax.set_title("parallel_close strong scaling")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper left")
+    ax.grid(True, which="both", alpha=0.25)
     _save(fig, "fig_strong_scaling.png")
 
 
@@ -233,7 +254,6 @@ def plot_width_grid(_args):
     leaves_per_workload = par.groupby("workload")["leaves"].first()
     workload_order = leaves_per_workload.sort_values().index.tolist()
 
-    # Use highest measured T per workload
     par_at_max_t = par.groupby("workload").apply(
         lambda g: g[g.parlay_threads == g.parlay_threads.max()][
             "wallclock_ms"
@@ -243,11 +263,24 @@ def plot_width_grid(_args):
     par_at_max_t = par_at_max_t.reindex(workload_order)
     leaves = leaves_per_workload.reindex(workload_order)
 
+    # Scale factor relative to the smallest workload (so smallest = 1×).
+    base_leaves = leaves.iloc[0]
+    scale = (leaves / base_leaves).astype(float)
+
+    def _format_axis(ax):
+        ax.set_xscale("log", base=2)
+        ax.set_xticks(scale.values)
+        ax.set_xticklabels([f"{int(s)}×" for s in scale.values])
+        ax.set_xlabel(f"scale factor (1× = {workload_order[0]})")
+
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    ax.plot(leaves.values, par_at_max_t.values, marker="o", label="par_close")
-    ax.set_xscale("log")
+    ax.plot(scale.values, par_at_max_t.values, marker="o", label="par_close")
+    for x, y, w in zip(scale.values, par_at_max_t.values, workload_order):
+        ax.annotate(w, xy=(x, y), xytext=(0, 6),
+                    textcoords="offset points", fontsize=8,
+                    ha="center", color="gray")
+    _format_axis(ax)
     ax.set_yscale("log")
-    ax.set_xlabel("n_leaves")
     ax.set_ylabel("par_close wallclock (ms)")
     ax.set_title("Width-axis scaling (T_max)")
     ax.grid(True, which="both", alpha=0.3)
@@ -261,11 +294,18 @@ def plot_width_grid(_args):
             speedup = (nel_med.loc[common] / par_at_max_t.loc[common]).reindex(
                 workload_order
             ).dropna()
-            leaves_s = leaves.reindex(speedup.index)
+            scale_s = scale.reindex(speedup.index)
             fig, ax = plt.subplots(figsize=(7, 4.5))
-            ax.plot(leaves_s.values, speedup.values, marker="o")
-            ax.set_xscale("log")
-            ax.set_xlabel("n_leaves")
+            ax.plot(scale_s.values, speedup.values, marker="o", linewidth=2)
+            for x, y, w in zip(scale_s.values, speedup.values, speedup.index):
+                ax.annotate(f"{w}\n{y:.1f}×",
+                            xy=(x, y), xytext=(0, 8),
+                            textcoords="offset points", fontsize=8,
+                            ha="center")
+            ax.set_xscale("log", base=2)
+            ax.set_xticks(scale_s.values)
+            ax.set_xticklabels([f"{int(s)}×" for s in scale_s.values])
+            ax.set_xlabel(f"scale factor (1× = {workload_order[0]})")
             ax.set_ylabel("speedup over Nelson")
             ax.set_title("Width-axis: speedup over Nelson at T_max")
             ax.grid(True, which="both", alpha=0.3)
@@ -321,6 +361,73 @@ def plot_nfns_sweep(_args):
     ax.set_title("n_fns sweep (xl-d3, T_max)")
     ax.grid(True, which="both", alpha=0.3)
     _save(fig, "fig_nfns_sweep.png")
+
+
+def plot_phase_crossover(_args):
+    """Show how `group_by_key` and `per_group` compete as workload grows.
+    Renders two panels: round-0 (where the crossover appears) and
+    summed-across-rounds (where group_by_key keeps the lead)."""
+    df = _read(RESULTS / "trace.csv")
+    if not {"group_by_ms", "per_group_ms"}.issubset(df.columns):
+        return
+    cols = ["group_by_ms", "per_group_ms", "semisort_ms"]
+    # Mean per (workload, round) across trials.
+    grp = df.groupby(["workload", "round"])[cols].mean().reset_index()
+
+    order = ["large", "xl-d3", "2xl-d3", "4xl-d3", "8xl-d3", "16xl-d3"]
+    workloads = [w for w in order if w in grp["workload"].unique()]
+    if not workloads:
+        return
+
+    # Map workload -> n_leaves via width_grid.csv if available, else baked in.
+    leaves_map = {
+        "large": 50000, "xl-d3": 100000, "2xl-d3": 200000,
+        "4xl-d3": 400000, "8xl-d3": 800000, "16xl-d3": 1600000,
+    }
+    width_csv = RESULTS / "width_grid.csv"
+    if width_csv.exists():
+        wg = pd.read_csv(width_csv)
+        for w in workloads:
+            sub = wg[wg.workload == w]
+            if not sub.empty:
+                leaves_map[w] = int(sub.iloc[0]["leaves"])
+    leaves = [leaves_map[w] for w in workloads]
+
+    # Round 0 panel
+    r0 = grp[grp["round"] == 0].set_index("workload").reindex(workloads)
+    # Summed-across-rounds panel
+    summed = grp.groupby("workload")[cols].sum().reindex(workloads)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+
+    ax = axes[0]
+    ax.plot(leaves, r0["group_by_ms"].values, marker="o", label="group_by_key")
+    ax.plot(leaves, r0["per_group_ms"].values, marker="s", label="per_group")
+    ax.plot(leaves, r0["semisort_ms"].values, marker="^",
+            linestyle="--", alpha=0.5, label="semisort total")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("n_leaves")
+    ax.set_ylabel("round-0 ms (mean over trials)")
+    ax.set_title("Round 0: per_group catches group_by_key at scale")
+    ax.legend()
+    ax.grid(True, which="both", alpha=0.3)
+
+    ax = axes[1]
+    ax.plot(leaves, summed["group_by_ms"].values, marker="o", label="group_by_key")
+    ax.plot(leaves, summed["per_group_ms"].values, marker="s", label="per_group")
+    ax.plot(leaves, summed["semisort_ms"].values, marker="^",
+            linestyle="--", alpha=0.5, label="semisort total")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("n_leaves")
+    ax.set_ylabel("total ms across all rounds")
+    ax.set_title("All rounds: group_by_key still leads")
+    ax.legend()
+    ax.grid(True, which="both", alpha=0.3)
+
+    fig.suptitle("Semisort sub-phase comparison (T=192)")
+    _save(fig, "fig_phase_crossover.png")
 
 
 def plot_round_by_size(_args):
@@ -413,6 +520,7 @@ def plot_all(args):
         plot_merge_density,
         plot_nfns_sweep,
         plot_round_by_size,
+        plot_phase_crossover,
     ):
         try:
             fn(args)
@@ -436,6 +544,7 @@ def main():
         ("merge-density", plot_merge_density),
         ("nfns-sweep", plot_nfns_sweep),
         ("round-by-size", plot_round_by_size),
+        ("phase-crossover", plot_phase_crossover),
         ("all", plot_all),
     ]:
         p = sub.add_parser(name)

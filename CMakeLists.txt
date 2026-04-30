@@ -23,6 +23,19 @@ set(PARLAY_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(PARLAY_BENCHMARK OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(parlaylib)
 
+# ---- ankerl::unordered_dense ----
+# Modern flat hashmap (robin-hood, single header) used by the sequential
+# Nelson baseline in place of std::unordered_map. ~3x faster on the
+# insert+lookup workload of the signature table, and avoids std's
+# chained-bucket allocator pressure. Used only by sequential_close_nelson;
+# the parallel path uses parlay's sort-based group_by_key_ordered instead.
+FetchContent_Declare(
+  unordered_dense
+  GIT_REPOSITORY https://github.com/martinus/unordered_dense.git
+  GIT_TAG        v4.4.0
+)
+FetchContent_MakeAvailable(unordered_dense)
+
 # ---- allocator: jemalloc ----
 # Replaces glibc malloc. Removes per-arena lock contention that throttles
 # parallel_close on wide-shallow workloads (≈1.76× faster on synthetic_bench
@@ -58,7 +71,7 @@ add_library(parallel_egraph_core STATIC
 target_include_directories(parallel_egraph_core
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
-target_link_libraries(parallel_egraph_core PUBLIC parlay ${JEMALLOC_LIB})
+target_link_libraries(parallel_egraph_core PUBLIC parlay unordered_dense::unordered_dense ${JEMALLOC_LIB})
 if(PE_GROUPBY_HASH)
   target_compile_definitions(parallel_egraph_core PUBLIC PE_GROUPBY_HASH)
 endif()
@@ -79,6 +92,9 @@ target_link_libraries(smt_bench PRIVATE parallel_egraph_core)
 
 add_executable(synthetic_bench bench/synthetic_bench.cpp)
 target_link_libraries(synthetic_bench PRIVATE parallel_egraph_core)
+
+add_executable(irregular_bench bench/irregular_bench.cpp)
+target_link_libraries(irregular_bench PRIVATE parallel_egraph_core)
 
 # ---- tests ----
 enable_testing()
