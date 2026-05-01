@@ -25,8 +25,8 @@ using namespace pe;
 
 namespace {
 
-constexpr int TRIALS = 11;
-constexpr int WARMUP = 3;
+constexpr int TRIALS = 5;
+constexpr int WARMUP = 1;
 
 struct Workload {
   const char* name;

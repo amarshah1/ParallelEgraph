@@ -41,8 +41,12 @@ using namespace pe;
 
 namespace {
 
-constexpr int TRIALS = 1;
-constexpr int WARMUP = 0;
+// Compile-time defaults; overridable at runtime via PE_BENCH_TRIALS /
+// PE_BENCH_WARMUP. Defaults are 1 warmup + 5 trials per the harness's
+// statistical-noise-vs-runtime tradeoff; override to 0+1 for big sweeps
+// where you'd rather do many more configurations than re-time each one.
+constexpr int DEFAULT_TRIALS = 5;
+constexpr int DEFAULT_WARMUP = 1;
 
 enum class Family { Chain, Grid, Cube, Quartic, Quintic };
 
@@ -120,43 +124,78 @@ Workload gen_chain(std::size_t n) {
 // fan-out. This matches what running the SMT-LIB synthetic_benchmarks/
 // files through smt_bench would do, just without the parse/build cost.
 
-// Build a balanced binary g-tree over the f-app id range [lo, hi).
-// Mirrors gen_bench.py:nest_balanced exactly: split mid = len/2, recurse
-// left then right, then emit (g left right). For len=1 the "tree" is
-// the single f-app id itself (no g-node added). Returns the class id of
-// the root g-node (or the sole f-app id when the range has size 1).
+// Build a balanced d-ary g-tree over the f-app id range [lo, hi). Each
+// internal g-node consumes up to `d` children (the last bucket may be
+// short when len isn't a multiple of d). For len=1 the "tree" is the
+// single f-app id itself (no g-node added). Returns the class id of the
+// root g-node, or the sole f-app id when the range has size 1.
+//
+// Round behavior on this shape: when level-i has m_i nodes touched, the
+// next level has m_i/d nodes (roughly), so frontier shrinks by d each
+// round and total g-tree depth is ⌈log_d(m)⌉.
 //
 // Appends new g-nodes to `out` and assigns them ids starting at
-// `next_id`, which is the current end of the workload sequence.
+// `next_id` (which is the current end of the workload sequence).
 Id emit_g_tree(parlay::sequence<ENode>& out, Id& next_id,
-               std::size_t lo, std::size_t hi) {
+               std::size_t lo, std::size_t hi, std::size_t d) {
   const std::size_t len = hi - lo;
   if (len == 1) {
     return static_cast<Id>(lo);
   }
-  if (len == 2) {
+  if (len <= d) {
+    // Bottom of the tree: one g-node consuming `len` direct f-app ids.
+    std::vector<Id> children(len);
+    for (std::size_t i = 0; i < len; ++i) {
+      children[i] = static_cast<Id>(lo + i);
+    }
     Id node_id = next_id++;
-    out.push_back(ENode{std::string("g"),
-                        {static_cast<Id>(lo), static_cast<Id>(lo + 1)}});
+    out.push_back(ENode{std::string("g"), std::move(children)});
     return node_id;
   }
-  const std::size_t mid = lo + len / 2;
-  Id left  = emit_g_tree(out, next_id, lo, mid);
-  Id right = emit_g_tree(out, next_id, mid, hi);
+  // Recursive case: split [lo, hi) into d roughly-equal chunks. Emit a
+  // subtree per chunk, then a single g-node above them with the d
+  // subtree-root ids as children.
+  const std::size_t per_chunk = (len + d - 1) / d;
+  std::vector<Id> children;
+  children.reserve(d);
+  for (std::size_t c_lo = lo; c_lo < hi; c_lo += per_chunk) {
+    const std::size_t c_hi = std::min(c_lo + per_chunk, hi);
+    children.push_back(emit_g_tree(out, next_id, c_lo, c_hi, d));
+  }
   Id node_id = next_id++;
-  out.push_back(ENode{std::string("g"), {left, right}});
+  out.push_back(ENode{std::string("g"), std::move(children)});
   return node_id;
 }
 
-Workload gen_poly(std::size_t n, std::size_t arity) {
+// Total number of internal g-nodes in a balanced d-ary tree built by
+// emit_g_tree over `m` leaves. Used to reserve storage up front. d≥2.
+// Closed form: nodes_per_level summed = m/d + m/d² + ... + 1, but
+// emit_g_tree's chunking sometimes leaves an extra parent (e.g. d=2
+// over 5 leaves), so we just simulate the level reduction.
+std::size_t count_g_internal(std::size_t m, std::size_t d) {
+  if (m < 2) return 0;
+  std::size_t total = 0;
+  std::size_t cur = m;
+  while (cur > 1) {
+    const std::size_t next = (cur + d - 1) / d;
+    total += next;
+    cur = next;
+  }
+  return total;
+}
+
+// `g_arity`: fan-in of each internal g-node. d=2 is the original binary
+// tree; larger d gives shallower trees (depth ⌈log_d(per_side)⌉) and
+// reduces frontier by a factor of d each round.
+Workload gen_poly(std::size_t n, std::size_t arity, std::size_t g_arity) {
   std::size_t per_side = 1;
   for (std::size_t k = 0; k < arity; ++k) per_side *= n;
   const std::size_t leaves    = 2 * n;
   const std::size_t f_total   = leaves + 2 * per_side;
-  // Each side's g-tree has per_side-1 internal nodes (a balanced binary
-  // tree over per_side leaves). Skip the wrapper entirely when per_side
-  // < 2 (no merges happen above a single f-app anyway).
-  const std::size_t g_per_side = per_side > 1 ? per_side - 1 : 0;
+  // Per-side g-tree size depends on d (the g-arity). We compute it
+  // exactly by simulating emit_g_tree's level reduction; this matches
+  // what gets pushed into `nodes` below.
+  const std::size_t g_per_side = count_g_internal(per_side, g_arity);
   const std::size_t total = f_total + 2 * g_per_side;
 
   // f-layer: leaves + f-apps, all positions deterministic, fully parallel.
@@ -191,8 +230,8 @@ Workload gen_poly(std::size_t n, std::size_t arity) {
     const std::size_t a_hi = leaves + per_side;
     const std::size_t b_lo = a_hi;
     const std::size_t b_hi = a_hi + per_side;
-    emit_g_tree(nodes, next_id, a_lo, a_hi);
-    emit_g_tree(nodes, next_id, b_lo, b_hi);
+    emit_g_tree(nodes, next_id, a_lo, a_hi, g_arity);
+    emit_g_tree(nodes, next_id, b_lo, b_hi, g_arity);
   }
 
   auto eqs = parlay::tabulate(n, [&](std::size_t i) {
@@ -202,19 +241,22 @@ Workload gen_poly(std::size_t n, std::size_t arity) {
   return {std::move(nodes), std::move(eqs)};
 }
 
-Workload gen_workload(Family f, std::size_t n) {
+// `g_arity` (a.k.a. d, the decomposition rate): fan-in of each internal
+// g-node in the polynomial families' wrapper. Ignored for chain (no
+// g-tree). d=2 is the historical default (balanced binary tree).
+Workload gen_workload(Family f, std::size_t n, std::size_t g_arity) {
   switch (f) {
     case Family::Chain:   return gen_chain(n);
-    case Family::Grid:    return gen_poly(n, 2);
-    case Family::Cube:    return gen_poly(n, 3);
-    case Family::Quartic: return gen_poly(n, 4);
-    case Family::Quintic: return gen_poly(n, 5);
+    case Family::Grid:    return gen_poly(n, 2, g_arity);
+    case Family::Cube:    return gen_poly(n, 3, g_arity);
+    case Family::Quartic: return gen_poly(n, 4, g_arity);
+    case Family::Quintic: return gen_poly(n, 5, g_arity);
   }
   std::abort();
 }
 
-BuiltGraph build(Family f, std::size_t n) {
-  auto w = gen_workload(f, n);
+BuiltGraph build(Family f, std::size_t n, std::size_t g_arity) {
+  auto w = gen_workload(f, n, g_arity);
   const std::size_t total = w.nodes.size();
   const std::size_t n_eqs = w.eqs.size();
   auto eg = EGraph::bulk_init(std::move(w.nodes));
@@ -224,11 +266,12 @@ BuiltGraph build(Family f, std::size_t n) {
 // Prints every node + initial union to stderr in a human-readable form.
 // One line per node:  "id: op(child_id, child_id, ...)" or "id: op  // leaf"
 // One line per union: "  union: a_id = b_id"
-void dump_workload(Family f, std::size_t n) {
-  auto w = gen_workload(f, n);
+void dump_workload(Family f, std::size_t n, std::size_t g_arity) {
+  auto w = gen_workload(f, n, g_arity);
   std::fprintf(stderr,
-               "==== %s n=%zu  classes=%zu  unions=%zu ====\n",
-               family_name(f), n, w.nodes.size(), w.eqs.size());
+               "==== %s n=%zu d=%zu  classes=%zu  unions=%zu ====\n",
+               family_name(f), n, g_arity,
+               w.nodes.size(), w.eqs.size());
   for (std::size_t i = 0; i < w.nodes.size(); ++i) {
     const auto& nd = w.nodes[i];
     if (nd.children.empty()) {
@@ -262,15 +305,17 @@ double elapsed_ms(clk::time_point t0) {
   return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
 }
 
-std::vector<double> bench_nelson(Family f, std::size_t n) {
-  for (int i = 0; i < WARMUP; ++i) {
-    auto g = build(f, n);
+std::vector<double> bench_nelson(Family f, std::size_t n,
+                                 std::size_t g_arity,
+                                 int warmup, int trials) {
+  for (int i = 0; i < warmup; ++i) {
+    auto g = build(f, n, g_arity);
     g.eg->sequential_close_nelson(g.eqs);
   }
   std::vector<double> times;
-  times.reserve(TRIALS);
-  for (int i = 0; i < TRIALS; ++i) {
-    auto g = build(f, n);
+  times.reserve(trials);
+  for (int i = 0; i < trials; ++i) {
+    auto g = build(f, n, g_arity);
     auto t0 = clk::now();
     g.eg->sequential_close_nelson(g.eqs);
     times.push_back(elapsed_ms(t0));
@@ -278,15 +323,17 @@ std::vector<double> bench_nelson(Family f, std::size_t n) {
   return times;
 }
 
-std::vector<double> bench_parallel_close(Family f, std::size_t n) {
-  for (int i = 0; i < WARMUP; ++i) {
-    auto g = build(f, n);
+std::vector<double> bench_parallel_close(Family f, std::size_t n,
+                                         std::size_t g_arity,
+                                         int warmup, int trials) {
+  for (int i = 0; i < warmup; ++i) {
+    auto g = build(f, n, g_arity);
     g.eg->parallel_close(std::move(g.eqs));
   }
   std::vector<double> times;
-  times.reserve(TRIALS);
-  for (int i = 0; i < TRIALS; ++i) {
-    auto g = build(f, n);
+  times.reserve(trials);
+  for (int i = 0; i < trials; ++i) {
+    auto g = build(f, n, g_arity);
     auto t0 = clk::now();
     g.eg->parallel_close(std::move(g.eqs));
     times.push_back(elapsed_ms(t0));
@@ -326,6 +373,41 @@ int main() {
   const std::string union_style = union_style_env ? union_style_env : "dnc";
   const std::string dnc_cutoff  = dnc_cutoff_env  ? dnc_cutoff_env  : "16";
 
+  // PE_SYNTH_D = decomposition rate / g-tree fan-in (>= 2). Default 2 is
+  // the historical balanced binary tree. Larger d → shallower tree,
+  // frontier shrinks by a factor of d each round.
+  std::size_t g_arity = 2;
+  if (const char* d_env = std::getenv("PE_SYNTH_D")) {
+    char* endp = nullptr;
+    unsigned long long v = std::strtoull(d_env, &endp, 10);
+    if (!endp || *endp != '\0' || v < 2) {
+      std::fprintf(stderr, "PE_SYNTH_D must be an integer >= 2 (got '%s')\n",
+                   d_env);
+      return 2;
+    }
+    g_arity = static_cast<std::size_t>(v);
+  }
+
+  // Trial counts override compile-time defaults (1 warmup + 5 trials).
+  // Set PE_BENCH_TRIALS=1 PE_BENCH_WARMUP=0 for fast sweeps where
+  // per-config repetition is too expensive.
+  int trials = DEFAULT_TRIALS;
+  int warmup = DEFAULT_WARMUP;
+  if (const char* t_env = std::getenv("PE_BENCH_TRIALS")) {
+    trials = std::atoi(t_env);
+    if (trials < 1) {
+      std::fprintf(stderr, "PE_BENCH_TRIALS must be >= 1 (got '%s')\n", t_env);
+      return 2;
+    }
+  }
+  if (const char* w_env = std::getenv("PE_BENCH_WARMUP")) {
+    warmup = std::atoi(w_env);
+    if (warmup < 0) {
+      std::fprintf(stderr, "PE_BENCH_WARMUP must be >= 0 (got '%s')\n", w_env);
+      return 2;
+    }
+  }
+
   std::vector<Family> families;
   if (fams_env) {
     for (const auto& tok : split_csv(fams_env)) {
@@ -364,7 +446,7 @@ int main() {
   if (std::getenv("PE_SYNTH_DUMP")) {
     for (Family f : families) {
       for (std::size_t n : ns) {
-        dump_workload(f, n);
+        dump_workload(f, n, g_arity);
       }
     }
     return 0;
@@ -372,12 +454,12 @@ int main() {
 
   if (!csv) {
     std::printf("synthetic_bench  trials=%d  warmup=%d  par_threads=%zu\n",
-                TRIALS, WARMUP, par_threads);
+                trials, warmup, par_threads);
     std::printf("%-8s %5s %10s %9s | %11s | %11s %11s\n",
                 "family", "n", "classes", "merges",
                 "nelson_seq", "par_close", "par_spd");
   } else if (csv_header) {
-    std::printf("family,n,classes,merges,algorithm,trial,"
+    std::printf("family,n,d,classes,merges,algorithm,trial,"
                 "parlay_threads,union_style,dnc_cutoff,wallclock_ms\n");
   }
 
@@ -385,8 +467,8 @@ int main() {
                       std::size_t merges, const char* algorithm,
                       const std::vector<double>& times) {
     for (std::size_t i = 0; i < times.size(); ++i) {
-      std::printf("%s,%zu,%zu,%zu,%s,%zu,%zu,%s,%s,%.4f\n",
-                  family_name(f), n, classes, merges,
+      std::printf("%s,%zu,%zu,%zu,%zu,%s,%zu,%zu,%s,%s,%.4f\n",
+                  family_name(f), n, g_arity, classes, merges,
                   algorithm, i, par_threads, union_style.c_str(),
                   dnc_cutoff.c_str(), times[i]);
     }
@@ -396,20 +478,21 @@ int main() {
     for (std::size_t n : ns) {
       // Probe sizes once so we can print classes/merges even when nelson is
       // skipped. The build is cheap relative to the timed work.
-      auto probe = build(f, n);
+      auto probe = build(f, n, g_arity);
       const std::size_t classes = probe.n_classes;
       const std::size_t merges  = probe.n_eqs;
 
-      std::fprintf(stderr, "[synthetic_bench] %s n=%zu classes=%zu merges=%zu ...\n",
-                   family_name(f), n, classes, merges);
+      std::fprintf(stderr,
+                   "[synthetic_bench] %s n=%zu d=%zu classes=%zu merges=%zu ...\n",
+                   family_name(f), n, g_arity, classes, merges);
 
       std::vector<double> nel;
       double mn = 0.0;
       if (!skip_nelson) {
-        nel = bench_nelson(f, n);
+        nel = bench_nelson(f, n, g_arity, warmup, trials);
         mn = median(nel);
       }
-      auto par = bench_parallel_close(f, n);
+      auto par = bench_parallel_close(f, n, g_arity, warmup, trials);
       double mp = median(par);
 
       if (csv) {
