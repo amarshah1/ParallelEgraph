@@ -157,8 +157,9 @@ void EGraph::parallel_close(parlay::sequence<std::pair<Id, Id>> initial_unions) 
 
     auto t_semisort = clk::now();
     auto canon = parlay::map(frontier, [&](std::uint32_t idx) {
+      // `idx` is a frontier element — under sparse `nodes_` storage it
+      // is the class id of a parent node and the index into `nodes_`.
       const auto& node = nodes[idx];
-      // class_id == idx since nodes_ is class-id-indexed.
 #ifdef PE_GROUPBY_HASH
       return detail::CanonEntry{sig_hash(node, uf), uf.find_root(idx), idx};
 #else

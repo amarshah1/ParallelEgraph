@@ -12,11 +12,11 @@
 // `PE_GROUPBY_HASH` defined. Despite the .hpp extension, this header is
 // included from exactly one translation unit — never from anywhere else.
 //
-// CanonEntry's trailing 4-byte slot stores a node index (`idx`) instead
-// of a secondary hash (selected by the `PE_GROUPBY_HASH` define in
-// detail.hpp); the kernel uses it only to recover the ENode for the
-// hash and equality probes — the cached `e.hash` field is intentionally
-// ignored for clarity.
+// CanonEntry's trailing 4-byte slot stores a class id (`class_id`)
+// instead of a secondary hash (selected by the `PE_GROUPBY_HASH` define
+// in detail.hpp); the kernel uses it only to recover the ENode (via
+// `nodes[e.class_id]`) for the hash and equality probes — the cached
+// `e.hash` field is intentionally ignored for clarity.
 
 #include "parallel_egraph/detail.hpp"
 #include "parallel_egraph/dnc_union.hpp"
@@ -58,10 +58,10 @@ parlay::sequence<Id> merge_and_collect_semisort(
   // `e.hash` is ignored). Equality is the full sigs_equal — no fast path,
   // no h2 short-circuit.
   auto hash_fn = [&](const CanonEntry& e) -> std::size_t {
-    return sig_hash(nodes[e.idx], uf);
+    return sig_hash(nodes[e.class_id], uf);
   };
   auto equal_fn = [&](const CanonEntry& a, const CanonEntry& b) -> bool {
-    return sigs_equal(a.idx, b.idx, uf, nodes);
+    return sigs_equal(a.class_id, b.class_id, uf, nodes);
   };
   auto t1 = timings ? clk::now() : clk::time_point{};
   auto groups = parlay::group_by_key(keyed, hash_fn, equal_fn);
