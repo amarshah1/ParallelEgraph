@@ -156,8 +156,8 @@ PhaseTimes run_trial(const Workload& w) {
 #ifdef PE_GROUPBY_HASH
     return detail::CanonEntry{sig_hash(node, uf), uf.find_root(idx), idx};
 #else
-    auto [h1, h2] = sig_hashes(node, uf);
-    return detail::CanonEntry{h1, uf.find_root(idx), h2};
+    auto [hash, secondary_hash] = sig_hashes(node, uf);
+    return detail::CanonEntry{hash, uf.find_root(idx), secondary_hash};
 #endif
   });
 

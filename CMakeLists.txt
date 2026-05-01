@@ -63,10 +63,15 @@ endif()
 option(PE_GROUPBY_HASH "Use deterministic hash + sigs_equal group-by" OFF)
 
 # ---- core library ----
+# Two interchangeable `merge_and_collect_semisort` impls live as headers
+# (include/parallel_egraph/semisort_{ordered,hash}.hpp). The dispatcher
+# src/semisort.cpp #include's one based on PE_GROUPBY_HASH; CMake just
+# compiles that single TU.
 add_library(parallel_egraph_core STATIC
   src/unionfind.cpp
   src/egraph.cpp
   src/smtlib.cpp
+  src/semisort.cpp
 )
 target_include_directories(parallel_egraph_core
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include

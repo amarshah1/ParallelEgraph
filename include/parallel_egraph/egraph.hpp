@@ -29,29 +29,57 @@ struct ENode {
 };
 
 // ---- Signature helpers (used during BSP rounds) ---------------------------
+//
+// Templated on the union-find type so the parallel path
+// (`ConcurrentUnionFind`) and sequential Nelson baseline
+// (`SequentialUnionFind`) share one implementation. Both UF types expose
+// `find_root(Id) -> Id`; that's the only requirement on `UF`.
 
-std::uint64_t sig_hash(const ENode& node, ConcurrentUnionFind& uf);
-std::uint64_t sig_hash_seq(const ENode& node, SequentialUnionFind& uf);
+template <typename UF>
+std::uint64_t sig_hash(const ENode& node, UF& uf) {
+  FxHasher h;
+  h.write_str(node.op);
+  for (Id c : node.children) h.write_u32(uf.find_root(c));
+  return h.finish();
+}
 
 // Returns a 64-bit primary hash and a 32-bit secondary hash computed in a
 // single pass over the node's children (one set of UF lookups). The
 // secondary uses a different FxHasher seed; combined 96-bit entropy makes
 // hash collisions across distinct signatures effectively impossible
 // (≈10⁻¹⁴ across a 64M-element batch on the largest synthetic workload).
+template <typename UF>
 std::pair<std::uint64_t, std::uint32_t> sig_hashes(
-    const ENode& node, ConcurrentUnionFind& uf);
+    const ENode& node, UF& uf) {
+  // Golden-ratio-derived seed; structurally unrelated to FxHasher's mixing
+  // constant, keeping h1 and h2 effectively independent.
+  static constexpr std::uint64_t kSigHash2Seed = 0x9E37'79B9'7F4A'7C15ULL;
+  FxHasher h1;
+  FxHasher h2(kSigHash2Seed);
+  h1.write_str(node.op);
+  h2.write_str(node.op);
+  for (Id c : node.children) {
+    Id r = uf.find_root(c);
+    h1.write_u32(r);
+    h2.write_u32(r);
+  }
+  return {h1.finish(), static_cast<std::uint32_t>(h2.finish())};
+}
 
-bool sigs_equal(std::uint32_t ia, std::uint32_t ib,
-                ConcurrentUnionFind& uf,
-                const parlay::sequence<ENode>& nodes);
-
-bool sigs_equal_seq(std::uint32_t ia, std::uint32_t ib,
-                    SequentialUnionFind& uf,
-                    const parlay::sequence<ENode>& nodes);
-
-int sig_cmp(std::uint32_t ia, std::uint32_t ib,
-            ConcurrentUnionFind& uf,
-            const parlay::sequence<ENode>& nodes);
+template <typename UF>
+bool sigs_equal(std::uint32_t ia, std::uint32_t ib, UF& uf,
+                const parlay::sequence<ENode>& nodes) {
+  const auto& na = nodes[ia];
+  const auto& nb = nodes[ib];
+  if (na.op != nb.op) return false;
+  if (na.children.size() != nb.children.size()) return false;
+  for (std::size_t i = 0; i < na.children.size(); ++i) {
+    if (uf.find_root(na.children[i]) != uf.find_root(nb.children[i])) {
+      return false;
+    }
+  }
+  return true;
+}
 
 // ---- EGraph ---------------------------------------------------------------
 
