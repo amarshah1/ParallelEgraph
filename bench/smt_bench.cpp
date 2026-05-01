@@ -27,13 +27,11 @@
 #include <utility>
 #include <vector>
 
-#include <ankerl/unordered_dense.h>
-
 #include <parlay/parallel.h>
 #include <parlay/sequence.h>
 
 #include "parallel_egraph/egraph.hpp"
-#include "parallel_egraph/fxhash.hpp"
+#include "parallel_egraph/smt_to_egraph.hpp"
 #include "parallel_egraph/smtlib.hpp"
 
 namespace fs = std::filesystem;
@@ -48,86 +46,8 @@ std::string read_file(const fs::path& path) {
   return buf.str();
 }
 
-// Hash for ENode used by the parser-side hashcons. Same as the now-removed
-// EGraph internal hashcons — we keep it parser-local because EGraph itself
-// has no add() / hashcons of its own; bulk_init expects a flat, unique
-// ENode sequence, which this builder produces.
-struct ENodeHash {
-  std::size_t operator()(const pe::ENode& n) const noexcept {
-    pe::FxHasher h;
-    h.write_str(n.op);
-    for (pe::Id c : n.children) h.write_u32(c);
-    return static_cast<std::size_t>(h.finish());
-  }
-};
-
-// Walk a Term tree iteratively, dedupe via hashcons, append unique ENodes
-// to a flat sequence in DAG order. Each call to add_term returns the
-// class id of the term's root. After all calls, take_nodes() yields the
-// DAG-ordered ENode sequence to feed EGraph::bulk_init.
-class SmtToEGraphBuilder {
- public:
-  pe::Id add_term(const pe::Term& term) {
-    enum class WK { Process, Build };
-    struct W {
-      WK kind;
-      const pe::Term* term;
-      std::string op;
-      std::size_t nargs;
-    };
-    std::vector<W> stack;
-    std::vector<pe::Id> results;
-    stack.push_back({WK::Process, &term, {}, 0});
-    while (!stack.empty()) {
-      W w = std::move(stack.back());
-      stack.pop_back();
-      if (w.kind == WK::Process) {
-        const pe::Term& t = *w.term;
-        switch (t.kind) {
-          case pe::Term::Kind::Const:
-            results.push_back(intern(pe::ENode{t.op, {}}));
-            break;
-          case pe::Term::Kind::App:
-            stack.push_back({WK::Build, nullptr, t.op, t.args.size()});
-            for (auto it = t.args.rbegin(); it != t.args.rend(); ++it) {
-              stack.push_back({WK::Process, &*it, {}, 0});
-            }
-            break;
-          case pe::Term::Kind::Eq:
-          case pe::Term::Kind::Not:
-            throw std::runtime_error(
-                "= and not are not first-class terms; only allowed at "
-                "the top of an assertion");
-        }
-      } else {
-        std::size_t start = results.size() - w.nargs;
-        std::vector<pe::Id> children(results.begin() + start, results.end());
-        results.erase(results.begin() + start, results.end());
-        pe::ENode node;
-        node.op = std::move(w.op);
-        node.children = std::move(children);
-        results.push_back(intern(std::move(node)));
-      }
-    }
-    return results.back();
-  }
-
-  parlay::sequence<pe::ENode> take_nodes() && { return std::move(nodes_); }
-  std::size_t size() const { return nodes_.size(); }
-
- private:
-  pe::Id intern(pe::ENode node) {
-    auto it = hashcons_.find(node);
-    if (it != hashcons_.end()) return it->second;
-    pe::Id id = static_cast<pe::Id>(nodes_.size());
-    nodes_.push_back(node);
-    hashcons_.emplace(std::move(node), id);
-    return id;
-  }
-
-  parlay::sequence<pe::ENode> nodes_;
-  ankerl::unordered_dense::map<pe::ENode, pe::Id, ENodeHash> hashcons_;
-};
+// `SmtToEGraphBuilder` lives in include/parallel_egraph/smt_to_egraph.hpp
+// and is shared with the egraph-cc CLI (src/main.cpp).
 
 // Build EGraph from a parsed script's asserted equalities (skipping
 // disequalities — we don't time the sat/unsat verdict here). Construction
@@ -140,7 +60,7 @@ struct Built {
 };
 
 Built build_from_script(const pe::Script& script) {
-  SmtToEGraphBuilder builder;
+  pe::SmtToEGraphBuilder builder;
   parlay::sequence<std::pair<pe::Id, pe::Id>> eqs;
   for (const auto& cmd : script.commands) {
     if (cmd.kind != pe::Command::Kind::Assert) continue;

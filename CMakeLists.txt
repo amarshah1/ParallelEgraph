@@ -81,6 +81,10 @@ if(PE_GROUPBY_HASH)
   target_compile_definitions(parallel_egraph_core PUBLIC PE_GROUPBY_HASH)
 endif()
 
+# ---- CLI: egraph-cc <file.smt2> -> sat / unsat ----
+add_executable(egraph-cc src/main.cpp)
+target_link_libraries(egraph-cc PRIVATE parallel_egraph_core)
+
 # ---- benchmarks ----
 add_executable(closure_compare_bench bench/closure_compare.cpp)
 target_link_libraries(closure_compare_bench PRIVATE parallel_egraph_core)
