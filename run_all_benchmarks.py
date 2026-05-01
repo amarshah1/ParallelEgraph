@@ -14,10 +14,10 @@ What it runs:
                      fan-in) and the cube parameter k. One trace file per
                      (d, k, threads). Designed to surface frontier/round
                      scaling differences across decomposition rates.
-  (d) egg          — egraph-cc on every .smt2 in ../cc-benchmarks/smt-grounded
-                     across all thread counts. Master CSV mirrors bench.py's
-                     schema (file, threads, trial, result, wall_s, phase
-                     fields).
+  (d) egg          — egraph-cc on every .smt2 in cc-benchmarks/smt-grounded
+                     (a git submodule of this repo) across all thread
+                     counts. Master CSV mirrors bench.py's schema
+                     (file, threads, trial, result, wall_s, phase fields).
 
 All four use a 1 warmup + 5 measured trials policy. The synthetic /
 cube_decomp binaries bake that into PE_BENCH_TRIALS / PE_BENCH_WARMUP
@@ -63,9 +63,8 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 DEFAULT_THREADS = "1,2,4,8,16,32,64,128"
-DEFAULT_EGG_DIR = "../cc-benchmarks/smt-grounded"
-CC_BENCHMARKS_REMOTE = "git@github.com:amarshah1/cc-benchmarks.git"
-CC_BENCHMARKS_LOCAL  = "../cc-benchmarks"
+DEFAULT_EGG_DIR = "cc-benchmarks/smt-grounded"
+CC_BENCHMARKS_LOCAL = "cc-benchmarks"
 
 # All three benchmark suites use a 1 warmup + 5 measured trials policy.
 # closure_compare and synthetic_bench bake this in at compile time
@@ -162,18 +161,23 @@ def cmake_configure_build(targets: list[str]):
 
 
 def ensure_cc_benchmarks() -> str:
-    """Clone cc-benchmarks if missing; return path to smt-grounded dir."""
+    """Populate the cc-benchmarks submodule if needed; return smt-grounded path.
+
+    cc-benchmarks/ is a git submodule of this repo. A fresh `git clone`
+    leaves the submodule directory empty until `git submodule update
+    --init` runs — we do that here so the egg phase always finds its
+    .smt2 files without the user having to remember the extra step.
+    """
     if os.path.isdir(DEFAULT_EGG_DIR):
         return DEFAULT_EGG_DIR
-    if not os.path.isdir(CC_BENCHMARKS_LOCAL):
-        print(f"Cloning {CC_BENCHMARKS_REMOTE} → {CC_BENCHMARKS_LOCAL}...",
-              flush=True)
-        subprocess.run(
-            ["git", "clone", CC_BENCHMARKS_REMOTE, CC_BENCHMARKS_LOCAL],
-            check=True,
-        )
+    print(f"Initializing submodule: {CC_BENCHMARKS_LOCAL}", flush=True)
+    subprocess.run(
+        ["git", "submodule", "update", "--init", "--recursive",
+         CC_BENCHMARKS_LOCAL],
+        check=True,
+    )
     if not os.path.isdir(DEFAULT_EGG_DIR):
-        sys.exit(f"clone succeeded but {DEFAULT_EGG_DIR} still missing")
+        sys.exit(f"submodule init succeeded but {DEFAULT_EGG_DIR} still missing")
     return DEFAULT_EGG_DIR
 
 

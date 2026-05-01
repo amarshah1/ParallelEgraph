@@ -9,12 +9,12 @@ fresh Linux box.
 `run_all_benchmarks.py` drives four benchmark suites into one
 timestamped folder under `runs/`:
 
-| phase         | binary                  | what it sweeps                                  |
-| ------------- | ----------------------- | ----------------------------------------------- |
-| `random`      | `closure_compare_bench` | 6 baked-in random DAGs at every thread count    |
-| `synthetic`   | `synthetic_bench`       | (family, n, threads) for chain/grid/cube/quartic/quintic |
-| `cube_decomp` | `synthetic_bench`       | cube only, swept over d ∈ {2,3,4,5} × k ∈ {5,55,105,155} |
-| `egg`         | `egraph-cc`             | every `.smt2` in `../cc-benchmarks/smt-grounded` |
+| phase         | binary                  | what it sweeps                                            |
+| ------------- | ----------------------- | --------------------------------------------------------- |
+| `random`      | `closure_compare_bench` | 6 baked-in random DAGs at every thread count              |
+| `synthetic`   | `synthetic_bench`       | (family, n, threads) for chain/grid/cube/quartic/quintic  |
+| `cube_decomp` | `synthetic_bench`       | cube only, swept over d ∈ {2,3,4,5} × k ∈ {5,55,105,155}  |
+| `egg`         | `egraph-cc`             | every `.smt2` in `cc-benchmarks/smt-grounded` (submodule) |
 
 All four use a 1 warmup + 5 measured trials policy. `PE_TRACE=1` is set
 on every invocation so per-round semisort/consolidate timings land
@@ -49,24 +49,32 @@ orchestrator auto-prepends `numactl -i all` when it's on PATH.
 
 ## 2. Clone the repos
 
-`run_all_benchmarks.py` expects `cc-benchmarks` to live as a sibling
-directory of `ParallelEgraph` — i.e. the layout must be:
+`cc-benchmarks` is a git submodule of this repo, so it lives at
+`ParallelEgraph/cc-benchmarks/`. A plain `git clone` leaves the
+submodule directory empty; populate it in one of two ways:
 
-```
-~/ParallelEgraph/
-~/cc-benchmarks/
+**Option A — clone with submodules** (one step, downloads everything):
+
+```bash
+cd ~
+git clone --recurse-submodules <YOUR_PARALLELEGRAPH_REMOTE> ParallelEgraph
+cd ParallelEgraph
 ```
 
-The orchestrator auto-clones `cc-benchmarks` only over SSH (which
-requires your SSH key to be registered with GitHub). On a fresh cloud
-machine without a key, pre-clone via HTTPS yourself:
+**Option B — clone first, init the submodule later** (smaller initial
+clone; useful if you only run the random/synthetic/cube_decomp phases):
 
 ```bash
 cd ~
 git clone <YOUR_PARALLELEGRAPH_REMOTE> ParallelEgraph
-git clone https://github.com/amarshah1/cc-benchmarks.git
 cd ParallelEgraph
+git submodule update --init --recursive cc-benchmarks
 ```
+
+`run_all_benchmarks.py` runs `git submodule update --init --recursive
+cc-benchmarks` automatically the first time the egg phase needs the
+data, so you can skip the explicit init step if you don't mind the
+implicit network call on first run.
 
 ## 3. Python env (for plotting only)
 
@@ -180,8 +188,11 @@ scp -r user@host:~/ParallelEgraph/runs/$RUN/figs/ ./figs_$RUN/
 `libjemalloc-dev` (Ubuntu) / `jemalloc-devel` (RHEL), or run cmake once
 with `-DUSE_JEMALLOC=OFF` before invoking the orchestrator.
 
-**`Permission denied (publickey)` cloning cc-benchmarks** — the
-orchestrator's auto-clone uses SSH. Pre-clone via HTTPS as in §2.
+**egg phase says "no .smt2 files matched"** — the cc-benchmarks
+submodule isn't populated. Run `git submodule update --init --recursive
+cc-benchmarks` (or re-clone the parent with `--recurse-submodules`).
+The orchestrator tries to do this automatically; if it fails, the
+network is likely blocked.
 
 **`run_all_benchmarks.py` says "(c) cube_decomp" but I see no
 data** — `cube_decomp` was added recently; older orchestrator copies
