@@ -76,25 +76,21 @@ if(PE_GROUPBY_HASH)
   target_compile_definitions(parallel_egraph_core PUBLIC PE_GROUPBY_HASH)
 endif()
 
-# ---- CLI: egraph-cc <file.smt2> -> sat / unsat ----
-add_executable(egraph-cc src/main.cpp)
-target_link_libraries(egraph-cc PRIVATE parallel_egraph_core)
-
-# ---- benchmark ----
+# ---- benchmarks ----
 add_executable(closure_compare_bench bench/closure_compare.cpp)
 target_link_libraries(closure_compare_bench PRIVATE parallel_egraph_core)
 
 add_executable(component_bench bench/component_bench.cpp)
 target_link_libraries(component_bench PRIVATE parallel_egraph_core)
 
-add_executable(smt_bench bench/smt_bench.cpp)
-target_link_libraries(smt_bench PRIVATE parallel_egraph_core)
-
 add_executable(synthetic_bench bench/synthetic_bench.cpp)
 target_link_libraries(synthetic_bench PRIVATE parallel_egraph_core)
 
 add_executable(irregular_bench bench/irregular_bench.cpp)
 target_link_libraries(irregular_bench PRIVATE parallel_egraph_core)
+
+add_executable(smt_bench bench/smt_bench.cpp)
+target_link_libraries(smt_bench PRIVATE parallel_egraph_core)
 
 # ---- tests ----
 enable_testing()
@@ -103,9 +99,6 @@ add_executable(unionfind_test tests/unionfind_test.cpp)
 target_link_libraries(unionfind_test PRIVATE parallel_egraph_core)
 add_test(NAME unionfind COMMAND unionfind_test)
 
-add_executable(regression_test tests/regression_test.cpp)
-target_link_libraries(regression_test PRIVATE parallel_egraph_core)
-target_compile_definitions(regression_test PRIVATE
-  REGRESSION_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples/regression"
-)
-add_test(NAME regression COMMAND regression_test)
+add_executable(closure_test tests/closure_test.cpp)
+target_link_libraries(closure_test PRIVATE parallel_egraph_core)
+add_test(NAME closure COMMAND closure_test)
