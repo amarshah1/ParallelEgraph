@@ -58,6 +58,14 @@ import time
 from pathlib import Path
 
 
+def _numactl_prefix() -> list[str]:
+    numactl = shutil.which("numactl")
+    return [numactl, "-i", "all"] if numactl else []
+
+
+NUMACTL_PREFIX = _numactl_prefix()
+
+
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
@@ -212,8 +220,8 @@ def run_random(out_dir: Path, thread_counts: list[int]):
             env["PE_TRACE"] = "1"
             env["PARLAY_NUM_THREADS"] = str(t)
             t0 = time.perf_counter()
-            proc = subprocess.run([binary], capture_output=True, text=True,
-                                  env=env)
+            proc = subprocess.run(NUMACTL_PREFIX + [binary],
+                                  capture_output=True, text=True, env=env)
             wall = time.perf_counter() - t0
             if proc.returncode != 0:
                 sys.stderr.write(proc.stderr)
@@ -285,7 +293,8 @@ def run_synthetic(out_dir: Path, thread_counts: list[int]):
                         env["PE_BENCH_SKIP_NELSON"] = "1"
                     env["PE_TRACE"] = "1"
                     env["PARLAY_NUM_THREADS"] = str(t)
-                    proc = subprocess.run([binary], capture_output=True,
+                    proc = subprocess.run(NUMACTL_PREFIX + [binary],
+                                          capture_output=True,
                                           text=True, env=env)
                     if proc.returncode != 0:
                         sys.stderr.write(proc.stderr)
@@ -357,7 +366,8 @@ def run_cube_decomp(out_dir: Path, thread_counts: list[int]):
                         env["PE_BENCH_SKIP_NELSON"] = "1"
                     env["PE_TRACE"] = "1"
                     env["PARLAY_NUM_THREADS"] = str(t)
-                    proc = subprocess.run([binary], capture_output=True,
+                    proc = subprocess.run(NUMACTL_PREFIX + [binary],
+                                          capture_output=True,
                                           text=True, env=env)
                     if proc.returncode != 0:
                         sys.stderr.write(proc.stderr)
@@ -428,12 +438,9 @@ def run_egg(out_dir: Path, thread_counts: list[int],
     print(f"  [egg] {len(files)} files × {len(thread_counts)} threads",
           flush=True)
 
-    numactl = shutil.which("numactl")
-    numactl_prefix = [numactl, "-i", "all"] if numactl else []
-
     def run_invocation(path: str, t: int):
         """One invocation. Returns (wall_s, result, timing, error, trace)."""
-        cmd = list(numactl_prefix) + [binary, "--timing", path]
+        cmd = NUMACTL_PREFIX + [binary, "--timing", path]
         env = os.environ.copy()
         env["PE_TRACE"] = "1"
         env["PARLAY_NUM_THREADS"] = str(t)
