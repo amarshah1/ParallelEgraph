@@ -14,15 +14,16 @@ namespace pe::detail {
 
 // `hash` is the 64-bit primary signature hash, used as the group_by key.
 // The trailing 4-byte slot is either `secondary_hash` (default ordered +
-// dual-hash path) or `idx` (legacy hash path, the index into the canonical
-// nodes array consumed by sigs_equal). Selected at build time via the
-// PE_GROUPBY_HASH compile-time switch (CMake option PE_GROUPBY_HASH).
-// The struct is 16 bytes either way.
+// dual-hash path) or `class_id` (legacy hash path, the e-class id of the
+// node being canonicalized; under sparse `nodes_` storage that is also
+// the index into `nodes_`, used by sigs_equal to recover the ENode).
+// Selected at build time via the PE_GROUPBY_HASH compile-time switch
+// (CMake option PE_GROUPBY_HASH). The struct is 16 bytes either way.
 struct CanonEntry {
   std::uint64_t hash;
   Id root;
 #ifdef PE_GROUPBY_HASH
-  std::uint32_t idx;
+  Id class_id;
 #else
   std::uint32_t secondary_hash;
 #endif

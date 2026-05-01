@@ -70,7 +70,7 @@ NUMACTL_PREFIX = _numactl_prefix()
 # Defaults
 # ---------------------------------------------------------------------------
 
-DEFAULT_THREADS = "1,2,4,8,16,32,64,128"
+DEFAULT_THREADS = "1,2,4,8,16,32,64,128,144"
 DEFAULT_EGG_DIR = "cc-benchmarks/smt-grounded"
 CC_BENCHMARKS_LOCAL = "cc-benchmarks"
 

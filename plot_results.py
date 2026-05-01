@@ -31,12 +31,14 @@ Usage:
 
 import argparse
 import csv
+import os
 import sys
 from collections import defaultdict
 from pathlib import Path
 from statistics import median
 
 import matplotlib.pyplot as plt
+import pandas as pd
 
 
 # ---- shared helpers --------------------------------------------------------
@@ -73,6 +75,18 @@ def _save(fig: plt.Figure, path: Path):
     print(f"  wrote {path}")
 
 
+def _should_skip(path: Path) -> bool:
+    """Return True iff `path` already exists. Set PE_PLOT_FORCE=1 to
+    overwrite. Closes any open figure to avoid leaks when callers bail
+    early."""
+    if os.environ.get("PE_PLOT_FORCE"):
+        return False
+    if path.exists():
+        print(f"  skip (exists) {path}")
+        return True
+    return False
+
+
 # ---- (A) per-round stacked bars -------------------------------------------
 
 def plot_trace_bars(trace_csv: Path, out_dir: Path, label: str):
@@ -82,69 +96,61 @@ def plot_trace_bars(trace_csv: Path, out_dir: Path, label: str):
     closure_compare repeats each workload's parallel-trial loop, so the
     same `round` index appears multiple times per (workload, threads).
     We take the median over those repetitions for each phase column.
+
+    pandas read+groupby: ~10× faster than per-row Python aggregation on
+    the 1.4M-row synthetic_trace.csv.
     """
     if not trace_csv.exists():
         return
-    rows = _read_csv(trace_csv)
-    if not rows:
+
+    phase_cols = ["consolidate_ms", "frontier_ms",
+                  "keyed_ms", "group_by_ms", "per_group_ms", "semisort_ms"]
+    usecols = ["workload", "parlay_threads", "round"] + phase_cols
+    df = pd.read_csv(trace_csv, usecols=lambda c: c in usecols)
+    if df.empty:
         return
+    # Coerce to numeric; missing trace columns get filled with NaN→0.
+    for c in phase_cols:
+        if c not in df.columns:
+            df[c] = float("nan")
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["parlay_threads"] = pd.to_numeric(df["parlay_threads"],
+                                          errors="coerce").astype("Int64")
+    df["round"] = pd.to_numeric(df["round"], errors="coerce").astype("Int64")
+    df = df.dropna(subset=["workload", "parlay_threads", "round"])
 
-    # Aggregate: (workload, threads, round) -> list[per-phase ms tuple]
-    grouped: dict[tuple[str, int, int], dict[str, list[float]]] = defaultdict(
-        lambda: defaultdict(list))
-    for r in rows:
-        try:
-            t = int(r["parlay_threads"]); rd = int(r["round"])
-        except (KeyError, ValueError):
-            continue
-        wl = r["workload"]
-        for col, _ in PHASE_STACKS[:5]:  # exclude semi_other (computed)
-            v = _f(r.get(col))
-            if v is not None:
-                grouped[(wl, t, rd)][col].append(v)
-        s = _f(r.get("semisort_ms"))
-        if s is not None:
-            grouped[(wl, t, rd)]["semisort_ms"].append(s)
-
-    # Reduce to median per (workload, threads, round, phase)
-    medians: dict[tuple[str, int, int], dict[str, float]] = {}
-    for key, phase_lists in grouped.items():
-        m = {col: (median(v) if v else 0.0)
-             for col, v in phase_lists.items()}
-        m["semi_other_ms"] = max(0.0,
-            m.get("semisort_ms", 0.0)
-            - m.get("keyed_ms", 0.0)
-            - m.get("group_by_ms", 0.0)
-            - m.get("per_group_ms", 0.0))
-        medians[key] = m
-
-    # Re-group into (workload, threads) -> ordered list of per-round dicts
-    by_wlt: dict[tuple[str, int], list[tuple[int, dict[str, float]]]] = \
-        defaultdict(list)
-    for (wl, t, rd), m in medians.items():
-        by_wlt[(wl, t)].append((rd, m))
-    for k in by_wlt:
-        by_wlt[k].sort(key=lambda x: x[0])
+    med = (df.groupby(["workload", "parlay_threads", "round"], sort=True)
+             [phase_cols].median()
+             .reset_index())
+    med = med.fillna(0.0)
+    med["semi_other_ms"] = (med["semisort_ms"]
+                             - med["keyed_ms"]
+                             - med["group_by_ms"]
+                             - med["per_group_ms"]).clip(lower=0.0)
 
     bar_dir = out_dir / "trace_bars"
-    for (wl, t), rounds in by_wlt.items():
-        if not rounds:
+    for (wl, t), grp in med.groupby(["workload", "parlay_threads"], sort=True):
+        if grp.empty:
             continue
-        xs = [rd for rd, _ in rounds]
+        # Sanitize workload for filename.
+        safe = str(wl).replace("/", "_").replace(" ", "_")
+        out_path = bar_dir / f"{label}_{safe}_T{int(t)}.png"
+        if _should_skip(out_path):
+            continue
+        grp = grp.sort_values("round")
+        xs = grp["round"].to_numpy()
         fig, ax = plt.subplots(figsize=(8.5, 5.0))
-        bottom = [0.0] * len(rounds)
+        bottom = [0.0] * len(grp)
         for col, lab in PHASE_STACKS:
-            ys = [m.get(col, 0.0) for _, m in rounds]
+            ys = grp[col].to_numpy()
             ax.bar(xs, ys, bottom=bottom, label=lab)
             bottom = [b + y for b, y in zip(bottom, ys)]
         ax.set_xlabel("round")
         ax.set_ylabel("ms (median across trials)")
-        ax.set_title(f"{label}: per-round phase breakdown — {wl}, T={t}")
+        ax.set_title(f"{label}: per-round phase breakdown — {wl}, T={int(t)}")
         ax.legend(loc="best", fontsize=8)
         ax.grid(True, alpha=0.3, axis="y")
-        # Sanitize workload for filename.
-        safe = wl.replace("/", "_").replace(" ", "_")
-        _save(fig, bar_dir / f"{label}_{safe}_T{t}.png")
+        _save(fig, out_path)
 
 
 # ---- (B) log-log speedup ---------------------------------------------------
@@ -170,14 +176,18 @@ def plot_speedup_random(csv_path: Path, out_dir: Path):
     """X=threads, Y=nelson_T1/par_T, color=workload name."""
     if not csv_path.exists():
         return
+    if _should_skip(out_dir / "random_speedup.png"):
+        return
     rows = _read_csv(csv_path)
+    # closure_compare_bench's CSV uses `workload` as the per-row label.
+    name_col = "workload" if rows and "workload" in rows[0] else "name"
     # Per (name, algorithm, threads) -> median ms
     par = _median_ms(rows,
-        key_fn=lambda r: (r["name"], int(r["parlay_threads"]))
+        key_fn=lambda r: (r[name_col], int(r["parlay_threads"]))
             if r["algorithm"] == "par_close" else None,
         ms_field="wallclock_ms")
     nel = _median_ms(rows,
-        key_fn=lambda r: (r["name"], int(r["parlay_threads"]))
+        key_fn=lambda r: (r[name_col], int(r["parlay_threads"]))
             if r["algorithm"] == "nelson_seq" else None,
         ms_field="wallclock_ms")
     # Nelson is sequential; closure_compare runs it at every thread
@@ -231,6 +241,8 @@ def _plot_synth_like_speedup(csv_path: Path, out_dir: Path,
     one thread count per (family, n, d) — we use that as the baseline.
     """
     if not csv_path.exists():
+        return
+    if _should_skip(out_dir / fig_name):
         return
     rows = _read_csv(csv_path)
 
@@ -315,6 +327,8 @@ def plot_speedup_egg(csv_path: Path, out_dir: Path, top_n: int):
     longest-close files."""
     if not csv_path.exists():
         return
+    if _should_skip(out_dir / "egg_speedup.png"):
+        return
     rows = _read_csv(csv_path)
 
     buckets: dict[tuple[str, int], list[float]] = defaultdict(list)
@@ -376,21 +390,26 @@ def _per_round_medians(trace_csv: Path) -> dict[tuple[str, int], list[tuple[int,
     """(workload, threads) → sorted list of (round, median_total_ms)."""
     if not trace_csv.exists():
         return {}
-    rows = _read_csv(trace_csv)
-    buckets: dict[tuple[str, int, int], list[float]] = defaultdict(list)
-    for r in rows:
-        try:
-            wl = r["workload"]; t = int(r["parlay_threads"])
-            rd = int(r["round"])
-            tot = (_f(r.get("consolidate_ms")) or 0.0) + \
-                  (_f(r.get("frontier_ms")) or 0.0) + \
-                  (_f(r.get("semisort_ms")) or 0.0)
-        except (KeyError, ValueError):
-            continue
-        buckets[(wl, t, rd)].append(tot)
+    sum_cols = ["consolidate_ms", "frontier_ms", "semisort_ms"]
+    usecols = ["workload", "parlay_threads", "round"] + sum_cols
+    df = pd.read_csv(trace_csv, usecols=lambda c: c in usecols)
+    if df.empty:
+        return {}
+    for c in sum_cols:
+        if c not in df.columns:
+            df[c] = float("nan")
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    df["parlay_threads"] = pd.to_numeric(df["parlay_threads"],
+                                          errors="coerce").astype("Int64")
+    df["round"] = pd.to_numeric(df["round"], errors="coerce").astype("Int64")
+    df = df.dropna(subset=["workload", "parlay_threads", "round"])
+    df["__total"] = df[sum_cols].sum(axis=1)
+    med = (df.groupby(["workload", "parlay_threads", "round"], sort=True)
+             ["__total"].median()
+             .reset_index())
     out: dict[tuple[str, int], list[tuple[int, float]]] = defaultdict(list)
-    for (wl, t, rd), vs in buckets.items():
-        out[(wl, t)].append((rd, median(vs)))
+    for wl, t, rd, tot in med.itertuples(index=False, name=None):
+        out[(str(wl), int(t))].append((int(rd), float(tot)))
     for k in out:
         out[k].sort(key=lambda x: x[0])
     return out
@@ -406,6 +425,9 @@ def plot_rounds_random(trace_csv: Path, out_dir: Path):
     t1, t_max = threads[0], threads[-1]
     workloads = sorted({w for (w, _) in by_wlt})
     for t_pick in [t1, t_max]:
+        out_path = out_dir / f"random_rounds_T{t_pick}.png"
+        if _should_skip(out_path):
+            continue
         fig, ax = plt.subplots(figsize=(8, 5))
         cmap = plt.get_cmap("tab10")
         for i, w in enumerate(workloads):
@@ -420,7 +442,7 @@ def plot_rounds_random(trace_csv: Path, out_dir: Path):
         ax.set_title(f"random — per-round time, T={t_pick}")
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8, loc="best")
-        _save(fig, out_dir / f"random_rounds_T{t_pick}.png")
+        _save(fig, out_path)
 
 
 def plot_rounds_synthlike(trace_csv: Path, out_dir: Path,
@@ -449,6 +471,9 @@ def plot_rounds_synthlike(trace_csv: Path, out_dir: Path,
     workloads = workloads[:12]
 
     for t_pick in [t1, t_max]:
+        out_path = out_dir / f"{fig_prefix}_rounds_T{t_pick}.png"
+        if _should_skip(out_path):
+            continue
         fig, ax = plt.subplots(figsize=(9, 5.5))
         cmap = plt.get_cmap("tab10")
         for i, w in enumerate(workloads):
@@ -463,7 +488,7 @@ def plot_rounds_synthlike(trace_csv: Path, out_dir: Path,
         ax.set_title(f"{title_prefix} — per-round time, T={t_pick}")
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=7, loc="best", ncol=2)
-        _save(fig, out_dir / f"{fig_prefix}_rounds_T{t_pick}.png")
+        _save(fig, out_path)
 
 
 def plot_rounds_egg(trace_csv: Path, egg_csv: Path, out_dir: Path,
@@ -498,6 +523,9 @@ def plot_rounds_egg(trace_csv: Path, egg_csv: Path, out_dir: Path,
     stems = [f.removesuffix(".smt2") for f in top_files]
 
     for t_pick in [t1, t_max]:
+        out_path = out_dir / f"egg_rounds_T{t_pick}.png"
+        if _should_skip(out_path):
+            continue
         fig, ax = plt.subplots(figsize=(9, 5.5))
         cmap = plt.get_cmap("tab10")
         for i, stem in enumerate(stems):
@@ -513,7 +541,7 @@ def plot_rounds_egg(trace_csv: Path, egg_csv: Path, out_dir: Path,
         ax.set_title(f"egg — top-{top_n} longest-close, per-round, T={t_pick}")
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=7, loc="best", ncol=2)
-        _save(fig, out_dir / f"egg_rounds_T{t_pick}.png")
+        _save(fig, out_path)
 
 
 # ---- main ------------------------------------------------------------------
