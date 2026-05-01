@@ -1,0 +1,55 @@
+=== trial 0 (T=64) ===
+[pe] round=  0 work=    89825 frontier=   157037 next=    23147 consolidate=  8.924ms frontier=  1.342ms semisort=  6.321ms (keyed= 0.000ms group_by=  4.652ms per_group= 0.480ms)
+[pe] round=  1 work=    23147 frontier=   150659 next=    15401 consolidate=  0.904ms frontier=  0.495ms semisort=  2.184ms (keyed= 0.000ms group_by=  0.783ms per_group= 0.389ms)
+[pe] round=  2 work=    15401 frontier=   155403 next=    11746 consolidate=  0.605ms frontier=  0.256ms semisort=  2.582ms (keyed= 0.000ms group_by=  0.928ms per_group= 0.464ms)
+[pe] round=  3 work=    11746 frontier=   175871 next=     9709 consolidate=  1.144ms frontier=  0.502ms semisort=  3.677ms (keyed= 0.000ms group_by=  1.914ms per_group= 0.626ms)
+[pe] round=  4 work=     9709 frontier=   190757 next=     6582 consolidate=  0.986ms frontier=  0.361ms semisort=  3.567ms (keyed= 0.000ms group_by=  2.091ms per_group= 0.588ms)
+[pe] round=  5 work=     6582 frontier=   202819 next=     4803 consolidate=  0.715ms frontier=  0.258ms semisort=  3.265ms (keyed= 0.000ms group_by=  2.078ms per_group= 0.392ms)
+[pe] round=  6 work=     4803 frontier=   206694 next=     2252 consolidate=  0.464ms frontier=  0.202ms semisort=  3.266ms (keyed= 0.000ms group_by=  2.250ms per_group= 0.397ms)
+[pe] round=  7 work=     2252 frontier=   209287 next=      647 consolidate=  0.275ms frontier=  0.154ms semisort=  3.153ms (keyed= 0.000ms group_by=  2.382ms per_group= 0.241ms)
+[pe] round=  8 work=      647 frontier=   210002 next=        0 consolidate=  0.127ms frontier=  0.112ms semisort=  2.944ms (keyed= 0.000ms group_by=  2.371ms per_group= 0.149ms)
+timing: read=13.23ms parse=285.03ms build=372.88ms close=53.72ms check=0.00ms dtor=12.39ms
+=== trial 1 (T=64) ===
+[pe] round=  0 work=    89825 frontier=   157037 next=    23147 consolidate=  9.611ms frontier=  1.856ms semisort=  4.987ms (keyed= 0.000ms group_by=  3.209ms per_group= 0.463ms)
+[pe] round=  1 work=    23147 frontier=   150659 next=    15401 consolidate=  0.778ms frontier=  0.388ms semisort=  2.136ms (keyed= 0.000ms group_by=  0.774ms per_group= 0.345ms)
+[pe] round=  2 work=    15401 frontier=   155403 next=    11746 consolidate=  0.626ms frontier=  0.247ms semisort=  2.443ms (keyed= 0.000ms group_by=  1.008ms per_group= 0.371ms)
+[pe] round=  3 work=    11746 frontier=   175871 next=     9709 consolidate=  1.219ms frontier=  0.441ms semisort=  3.667ms (keyed= 0.000ms group_by=  1.788ms per_group= 0.765ms)
+[pe] round=  4 work=     9709 frontier=   190757 next=     6582 consolidate=  0.960ms frontier=  0.461ms semisort=  3.385ms (keyed= 0.000ms group_by=  1.994ms per_group= 0.539ms)
+[pe] round=  5 work=     6582 frontier=   202819 next=     4803 consolidate=  0.720ms frontier=  0.257ms semisort=  3.417ms (keyed= 0.000ms group_by=  2.187ms per_group= 0.485ms)
+[pe] round=  6 work=     4803 frontier=   206694 next=     2252 consolidate=  0.522ms frontier=  0.216ms semisort=  3.416ms (keyed= 0.000ms group_by=  2.385ms per_group= 0.421ms)
+[pe] round=  7 work=     2252 frontier=   209287 next=      647 consolidate=  0.323ms frontier=  0.141ms semisort=  3.253ms (keyed= 0.000ms group_by=  2.466ms per_group= 0.249ms)
+[pe] round=  8 work=      647 frontier=   210002 next=        0 consolidate=  0.145ms frontier=  0.107ms semisort=  3.030ms (keyed= 0.000ms group_by=  2.488ms per_group= 0.107ms)
+timing: read=12.83ms parse=286.42ms build=385.66ms close=53.99ms check=0.00ms dtor=13.16ms
+=== trial 2 (T=64) ===
+[pe] round=  0 work=    89825 frontier=   157037 next=    23147 consolidate=  8.679ms frontier=  1.849ms semisort=  4.354ms (keyed= 0.000ms group_by=  2.598ms per_group= 0.487ms)
+[pe] round=  1 work=    23147 frontier=   150659 next=    15401 consolidate=  0.901ms frontier=  0.470ms semisort=  2.258ms (keyed= 0.000ms group_by=  0.806ms per_group= 0.442ms)
+[pe] round=  2 work=    15401 frontier=   155403 next=    11746 consolidate=  0.714ms frontier=  0.252ms semisort=  2.738ms (keyed= 0.000ms group_by=  1.200ms per_group= 0.354ms)
+[pe] round=  3 work=    11746 frontier=   175871 next=     9709 consolidate=  1.220ms frontier=  0.471ms semisort=  3.445ms (keyed= 0.000ms group_by=  1.696ms per_group= 0.621ms)
+[pe] round=  4 work=     9709 frontier=   190757 next=     6582 consolidate=  1.047ms frontier=  0.401ms semisort=  3.391ms (keyed= 0.000ms group_by=  2.056ms per_group= 0.470ms)
+[pe] round=  5 work=     6582 frontier=   202819 next=     4803 consolidate=  0.747ms frontier=  0.256ms semisort=  3.388ms (keyed= 0.000ms group_by=  2.213ms per_group= 0.396ms)
+[pe] round=  6 work=     4803 frontier=   206694 next=     2252 consolidate=  0.533ms frontier=  0.210ms semisort=  3.314ms (keyed= 0.000ms group_by=  2.309ms per_group= 0.366ms)
+[pe] round=  7 work=     2252 frontier=   209287 next=      647 consolidate=  0.307ms frontier=  0.133ms semisort=  3.199ms (keyed= 0.000ms group_by=  2.357ms per_group= 0.265ms)
+[pe] round=  8 work=      647 frontier=   210002 next=        0 consolidate=  0.121ms frontier=  0.097ms semisort=  2.943ms (keyed= 0.000ms group_by=  2.397ms per_group= 0.103ms)
+timing: read=13.61ms parse=281.57ms build=385.71ms close=52.26ms check=0.00ms dtor=14.56ms
+=== trial 3 (T=64) ===
+[pe] round=  0 work=    89825 frontier=   157037 next=    23147 consolidate=  8.934ms frontier=  1.932ms semisort=  4.651ms (keyed= 0.000ms group_by=  2.833ms per_group= 0.536ms)
+[pe] round=  1 work=    23147 frontier=   150659 next=    15401 consolidate=  0.992ms frontier=  0.415ms semisort=  2.204ms (keyed= 0.000ms group_by=  0.791ms per_group= 0.352ms)
+[pe] round=  2 work=    15401 frontier=   155403 next=    11746 consolidate=  0.656ms frontier=  0.278ms semisort=  2.628ms (keyed= 0.000ms group_by=  1.024ms per_group= 0.349ms)
+[pe] round=  3 work=    11746 frontier=   175871 next=     9709 consolidate=  1.234ms frontier=  0.529ms semisort=  3.693ms (keyed= 0.000ms group_by=  1.781ms per_group= 0.685ms)
+[pe] round=  4 work=     9709 frontier=   190757 next=     6582 consolidate=  1.072ms frontier=  0.362ms semisort=  3.523ms (keyed= 0.000ms group_by=  2.047ms per_group= 0.589ms)
+[pe] round=  5 work=     6582 frontier=   202819 next=     4803 consolidate=  0.757ms frontier=  0.267ms semisort=  3.685ms (keyed= 0.000ms group_by=  2.353ms per_group= 0.479ms)
+[pe] round=  6 work=     4803 frontier=   206694 next=     2252 consolidate=  0.518ms frontier=  0.207ms semisort=  3.491ms (keyed= 0.000ms group_by=  2.396ms per_group= 0.420ms)
+[pe] round=  7 work=     2252 frontier=   209287 next=      647 consolidate=  0.316ms frontier=  0.153ms semisort=  3.360ms (keyed= 0.000ms group_by=  2.507ms per_group= 0.262ms)
+[pe] round=  8 work=      647 frontier=   210002 next=        0 consolidate=  0.130ms frontier=  0.105ms semisort=  3.042ms (keyed= 0.000ms group_by=  2.457ms per_group= 0.113ms)
+timing: read=13.58ms parse=283.85ms build=389.69ms close=53.04ms check=0.00ms dtor=18.00ms
+=== trial 4 (T=64) ===
+[pe] round=  0 work=    89825 frontier=   157037 next=    23147 consolidate=  9.802ms frontier=  1.381ms semisort=  5.156ms (keyed= 0.000ms group_by=  3.356ms per_group= 0.510ms)
+[pe] round=  1 work=    23147 frontier=   150659 next=    15401 consolidate=  0.956ms frontier=  0.374ms semisort=  2.325ms (keyed= 0.000ms group_by=  0.779ms per_group= 0.414ms)
+[pe] round=  2 work=    15401 frontier=   155403 next=    11746 consolidate=  0.597ms frontier=  0.248ms semisort=  2.637ms (keyed= 0.000ms group_by=  1.068ms per_group= 0.362ms)
+[pe] round=  3 work=    11746 frontier=   175871 next=     9709 consolidate=  1.272ms frontier=  0.441ms semisort=  3.552ms (keyed= 0.000ms group_by=  1.795ms per_group= 0.583ms)
+[pe] round=  4 work=     9709 frontier=   190757 next=     6582 consolidate=  1.044ms frontier=  0.411ms semisort=  3.498ms (keyed= 0.000ms group_by=  2.101ms per_group= 0.479ms)
+[pe] round=  5 work=     6582 frontier=   202819 next=     4803 consolidate=  0.730ms frontier=  0.285ms semisort=  3.726ms (keyed= 0.000ms group_by=  2.528ms per_group= 0.427ms)
+[pe] round=  6 work=     4803 frontier=   206694 next=     2252 consolidate=  0.516ms frontier=  0.208ms semisort=  3.586ms (keyed= 0.000ms group_by=  2.541ms per_group= 0.400ms)
+[pe] round=  7 work=     2252 frontier=   209287 next=      647 consolidate=  0.247ms frontier=  0.149ms semisort=  3.623ms (keyed= 0.000ms group_by=  2.797ms per_group= 0.263ms)
+[pe] round=  8 work=      647 frontier=   210002 next=        0 consolidate=  0.135ms frontier=  0.104ms semisort=  3.331ms (keyed= 0.000ms group_by=  2.751ms per_group= 0.142ms)
+timing: read=13.02ms parse=285.84ms build=408.90ms close=55.71ms check=0.00ms dtor=12.88ms

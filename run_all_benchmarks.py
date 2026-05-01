@@ -405,11 +405,28 @@ def expected_from_name(path: str):
     return m.group(1) if m else None
 
 
+_UNIT_TO_SECONDS = {"s": 1.0, "ms": 1e-3, "us": 1e-6, "µs": 1e-6, "ns": 1e-9}
+
+
+def _parse_duration_seconds(token: str) -> float:
+    """Parse '35.23ms' / '1.4s' / '0.5us' → seconds. Bare numbers are seconds."""
+    m = re.match(r"^([0-9]+(?:\.[0-9]+)?)([a-zµ]*)$", token)
+    if not m:
+        raise ValueError(f"unrecognized duration token: {token!r}")
+    value, unit = float(m.group(1)), m.group(2)
+    if unit == "":
+        return value
+    if unit not in _UNIT_TO_SECONDS:
+        raise ValueError(f"unknown time unit in {token!r}")
+    return value * _UNIT_TO_SECONDS[unit]
+
+
 def parse_timing(stderr: str) -> dict | None:
     m = TIMING_RE.search(stderr)
     if not m:
         return None
-    return {k: float(m.group(i + 1)) for i, k in enumerate(TIMING_KEYS)}
+    return {k: _parse_duration_seconds(m.group(i + 1))
+            for i, k in enumerate(TIMING_KEYS)}
 
 
 def parse_result(stdout: str) -> str:
