@@ -1,5 +1,5 @@
 // In-process port of gen_bench.py's synthetic families. Builds the same
-// DAGs directly into an EGraph via bulk_init (skipping the SMT-LIB
+// DAGs directly into an EGraph via its bulk ctor (skipping the SMT-LIB
 // parse/build path) and times sequential_close_nelson vs parallel_close on
 // the resulting equality batch. Only closure time is measured — graph
 // construction is amortized out of the hot loop the same way
@@ -14,7 +14,7 @@
 //   PE_BENCH_SKIP_NELSON=1             skip sequential baseline
 //   PE_BENCH_FORMAT=csv                emit one row per (family, n, algo, trial)
 //   PE_BENCH_HEADER=1                  emit CSV header (gated for appended runs)
-//   PE_UNION_STYLE / PE_DNC_CUTOFF     tagged into CSV for plot grouping
+//   PE_DNC_CUTOFF                      tagged into CSV for plot grouping
 //   PE_SYNTH_DUMP=1                    print every generated node + initial
 //                                      union to stderr, then exit (no timing).
 //                                      Useful for sanity-checking what's in
@@ -70,8 +70,9 @@ bool parse_family(const std::string& s, Family& out) {
   return false;
 }
 
+template <typename UF>
 struct BuiltGraph {
-  std::unique_ptr<EGraph> eg;
+  std::unique_ptr<EGraph<UF>> eg;
   parlay::sequence<std::pair<Id, Id>> eqs;
   std::size_t n_classes;
   std::size_t n_eqs;
@@ -81,7 +82,7 @@ struct BuiltGraph {
 // Each generator lays out nodes in DAG order (children before parents).
 // Class id == position in the sequence, which we exploit when constructing
 // the equality batch. Generators return raw (nodes, eqs) so we can either
-// hand them to bulk_init (for benchmarking) or print them (for dumping).
+// hand them to the EGraph ctor (for benchmarking) or print them (for dumping).
 
 struct Workload {
   parlay::sequence<ENode> nodes;
@@ -110,7 +111,7 @@ Workload gen_chain(std::size_t n) {
 // a balanced binary `g`-tree wrapper on each side, mirroring
 // gen_bench.py's nest_balanced("g", ...) construction.
 //
-// Layout (children-before-parents, required by bulk_init):
+// Layout (children-before-parents, required by the EGraph ctor):
 //   [a_0 .. a_{n-1}, b_0 .. b_{n-1},                        # 2n leaves
 //    f(a-tuple_0) .. f(a-tuple_{m-1}),                       # m  a-side f-apps
 //    f(b-tuple_0) .. f(b-tuple_{m-1}),                       # m  b-side f-apps
@@ -221,7 +222,7 @@ Workload gen_poly(std::size_t n, std::size_t arity, std::size_t g_arity) {
 
   // g-tree appended sequentially. Each side's recursion is self-contained
   // and order-of-emission is bottom-up (children before parents), so
-  // bulk_init's child<parent invariant holds. The work is O(m) total —
+  // The EGraph ctor's child<parent invariant holds. The work is O(m) total —
   // small relative to the f-layer for the workload sizes we run.
   nodes.reserve(total);
   Id next_id = static_cast<Id>(f_total);
@@ -255,11 +256,12 @@ Workload gen_workload(Family f, std::size_t n, std::size_t g_arity) {
   std::abort();
 }
 
-BuiltGraph build(Family f, std::size_t n, std::size_t g_arity) {
+template <typename UF>
+BuiltGraph<UF> build(Family f, std::size_t n, std::size_t g_arity) {
   auto w = gen_workload(f, n, g_arity);
   const std::size_t total = w.nodes.size();
   const std::size_t n_eqs = w.eqs.size();
-  auto eg = EGraph::bulk_init(std::move(w.nodes));
+  auto eg = std::make_unique<EGraph<UF>>(std::move(w.nodes));
   return {std::move(eg), std::move(w.eqs), total, n_eqs};
 }
 
@@ -309,13 +311,13 @@ std::vector<double> bench_nelson(Family f, std::size_t n,
                                  std::size_t g_arity,
                                  int warmup, int trials) {
   for (int i = 0; i < warmup; ++i) {
-    auto g = build(f, n, g_arity);
+    auto g = build<SequentialUnionFind>(f, n, g_arity);
     g.eg->sequential_close_nelson(g.eqs);
   }
   std::vector<double> times;
   times.reserve(trials);
   for (int i = 0; i < trials; ++i) {
-    auto g = build(f, n, g_arity);
+    auto g = build<SequentialUnionFind>(f, n, g_arity);
     auto t0 = clk::now();
     g.eg->sequential_close_nelson(g.eqs);
     times.push_back(elapsed_ms(t0));
@@ -327,13 +329,13 @@ std::vector<double> bench_parallel_close(Family f, std::size_t n,
                                          std::size_t g_arity,
                                          int warmup, int trials) {
   for (int i = 0; i < warmup; ++i) {
-    auto g = build(f, n, g_arity);
+    auto g = build<ConcurrentUnionFind>(f, n, g_arity);
     g.eg->parallel_close(std::move(g.eqs));
   }
   std::vector<double> times;
   times.reserve(trials);
   for (int i = 0; i < trials; ++i) {
-    auto g = build(f, n, g_arity);
+    auto g = build<ConcurrentUnionFind>(f, n, g_arity);
     auto t0 = clk::now();
     g.eg->parallel_close(std::move(g.eqs));
     times.push_back(elapsed_ms(t0));
@@ -368,9 +370,7 @@ int main() {
   const char* fmt = std::getenv("PE_BENCH_FORMAT");
   const bool csv = fmt && std::strcmp(fmt, "csv") == 0;
   const bool csv_header = std::getenv("PE_BENCH_HEADER") != nullptr;
-  const char* union_style_env = std::getenv("PE_UNION_STYLE");
   const char* dnc_cutoff_env  = std::getenv("PE_DNC_CUTOFF");
-  const std::string union_style = union_style_env ? union_style_env : "dnc";
   const std::string dnc_cutoff  = dnc_cutoff_env  ? dnc_cutoff_env  : "16";
 
   // PE_SYNTH_D = decomposition rate / g-tree fan-in (>= 2). Default 2 is
@@ -460,25 +460,25 @@ int main() {
                 "nelson_seq", "par_close", "par_spd");
   } else if (csv_header) {
     std::printf("family,n,d,classes,merges,algorithm,trial,"
-                "parlay_threads,union_style,dnc_cutoff,wallclock_ms\n");
+                "parlay_threads,dnc_cutoff,wallclock_ms\n");
   }
 
   auto emit_csv = [&](Family f, std::size_t n, std::size_t classes,
                       std::size_t merges, const char* algorithm,
                       const std::vector<double>& times) {
     for (std::size_t i = 0; i < times.size(); ++i) {
-      std::printf("%s,%zu,%zu,%zu,%zu,%s,%zu,%zu,%s,%s,%.4f\n",
+      std::printf("%s,%zu,%zu,%zu,%zu,%s,%zu,%zu,%s,%.4f\n",
                   family_name(f), n, g_arity, classes, merges,
-                  algorithm, i, par_threads, union_style.c_str(),
-                  dnc_cutoff.c_str(), times[i]);
+                  algorithm, i, par_threads, dnc_cutoff.c_str(), times[i]);
     }
   };
 
   for (Family f : families) {
     for (std::size_t n : ns) {
       // Probe sizes once so we can print classes/merges even when nelson is
-      // skipped. The build is cheap relative to the timed work.
-      auto probe = build(f, n, g_arity);
+      // skipped. The build is cheap relative to the timed work; UF flavor
+      // doesn't matter — we only read n_classes / n_eqs.
+      auto probe = build<ConcurrentUnionFind>(f, n, g_arity);
       const std::size_t classes = probe.n_classes;
       const std::size_t merges  = probe.n_eqs;
 

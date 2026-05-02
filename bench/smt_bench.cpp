@@ -51,15 +51,17 @@ std::string read_file(const fs::path& path) {
 
 // Build EGraph from a parsed script's asserted equalities (skipping
 // disequalities — we don't time the sat/unsat verdict here). Construction
-// happens once: walk all assertions through the builder, then bulk_init
+// happens once: walk all assertions through the builder, then construct
 // the resulting flat ENode sequence.
+template <typename UF>
 struct Built {
-  std::unique_ptr<pe::EGraph> eg;
+  std::unique_ptr<pe::EGraph<UF>> eg;
   parlay::sequence<std::pair<pe::Id, pe::Id>> eqs;
   std::size_t classes;
 };
 
-Built build_from_script(const pe::Script& script) {
+template <typename UF>
+Built<UF> build_from_script(const pe::Script& script) {
   pe::SmtToEGraphBuilder builder;
   parlay::sequence<std::pair<pe::Id, pe::Id>> eqs;
   for (const auto& cmd : script.commands) {
@@ -73,7 +75,7 @@ Built build_from_script(const pe::Script& script) {
     // disequalities ignored for benchmarking
   }
   std::size_t classes = builder.size();
-  auto eg = pe::EGraph::bulk_init(std::move(builder).take_nodes());
+  auto eg = std::make_unique<pe::EGraph<UF>>(std::move(builder).take_nodes());
   return {std::move(eg), std::move(eqs), classes};
 }
 
@@ -89,6 +91,28 @@ std::pair<std::string, std::size_t> parse_filename(const std::string& stem) {
   std::smatch m;
   if (!std::regex_match(stem, m, re)) return {"", 0};
   return {m[1].str(), static_cast<std::size_t>(std::stoull(m[2].str()))};
+}
+
+template <typename UF, typename Close>
+void run_one(const pe::Script& script, const std::string& stem,
+             const std::string& family, std::size_t n,
+             int trials, int warmup, std::size_t par_threads,
+             const char* algorithm, Close close) {
+  for (int i = 0; i < warmup; ++i) {
+    auto b = build_from_script<UF>(script);
+    close(*b.eg, b.eqs);
+  }
+  for (int i = 0; i < trials; ++i) {
+    auto b = build_from_script<UF>(script);
+    const std::size_t neq = b.eqs.size();
+    auto t0 = clk::now();
+    close(*b.eg, b.eqs);
+    double ms = elapsed_ms(t0);
+    std::printf("%s,%s,%zu,%zu,%zu,%s,%d,%zu,%.4f\n",
+                stem.c_str(), family.c_str(), n,
+                b.classes, neq, algorithm, i, par_threads, ms);
+    std::fflush(stdout);
+  }
 }
 
 void collect_paths(const fs::path& root, std::vector<fs::path>& out) {
@@ -148,35 +172,14 @@ int main(int argc, char** argv) {
       continue;
     }
 
-    auto run_one = [&](const char* algorithm) {
-      for (int i = 0; i < warmup; ++i) {
-        auto b = build_from_script(script);
-        if (std::strcmp(algorithm, "par_close") == 0) {
-          b.eg->parallel_close(std::move(b.eqs));
-        } else {
-          b.eg->sequential_close_nelson(b.eqs);
-        }
-      }
-      for (int i = 0; i < trials; ++i) {
-        auto b = build_from_script(script);
-        const std::size_t neq = b.eqs.size();
-        auto t0 = clk::now();
-        if (std::strcmp(algorithm, "par_close") == 0) {
-          b.eg->parallel_close(std::move(b.eqs));
-        } else {
-          b.eg->sequential_close_nelson(b.eqs);
-        }
-        double ms = elapsed_ms(t0);
-        std::printf("%s,%s,%zu,%zu,%zu,%s,%d,%zu,%.4f\n",
-                    stem.c_str(), family.c_str(), n,
-                    b.classes, neq,
-                    algorithm, i, par_threads, ms);
-        std::fflush(stdout);
-      }
-    };
-
-    if (!skip_nelson) run_one("nelson_seq");
-    run_one("par_close");
+    if (!skip_nelson) {
+      run_one<pe::SequentialUnionFind>(script, stem, family, n, trials,
+          warmup, par_threads, "nelson_seq",
+          [](auto& eg, auto& eqs) { eg.sequential_close_nelson(eqs); });
+    }
+    run_one<pe::ConcurrentUnionFind>(script, stem, family, n, trials,
+        warmup, par_threads, "par_close",
+        [](auto& eg, auto& eqs) { eg.parallel_close(std::move(eqs)); });
   }
   return 0;
 }

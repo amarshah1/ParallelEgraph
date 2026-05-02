@@ -66,8 +66,9 @@ struct LevelLayout {
   std::size_t end;
 };
 
+template <typename UF>
 struct BuiltGraph {
-  std::unique_ptr<EGraph> eg;
+  std::unique_ptr<EGraph<UF>> eg;
   parlay::sequence<std::pair<Id, Id>> eqs;
 };
 
@@ -104,7 +105,8 @@ std::size_t locate_level(const std::vector<LevelLayout>& layouts, std::size_t i)
   return layouts.size() - 1;  // shouldn't happen
 }
 
-BuiltGraph build(const Workload& w) {
+template <typename UF>
+BuiltGraph<UF> build(const Workload& w) {
   const auto layouts = compute_layouts(w);
   const std::size_t total = layouts.back().end;
 
@@ -146,7 +148,7 @@ BuiltGraph build(const Workload& w) {
     return n;
   });
 
-  auto eg = EGraph::bulk_init(std::move(all_nodes));
+  auto eg = std::make_unique<EGraph<UF>>(std::move(all_nodes));
 
   // Initial unions: 60% same-arity leaf-leaf (half x-x, half y-y),
   // 40% cross-arity unary-vs-binary at level 0.
@@ -191,13 +193,13 @@ double elapsed_ms(clk::time_point t0) {
 
 std::vector<double> bench_nelson(const Workload& w) {
   for (int i = 0; i < WARMUP; ++i) {
-    auto g = build(w);
+    auto g = build<SequentialUnionFind>(w);
     g.eg->sequential_close_nelson(g.eqs);
   }
   std::vector<double> times;
   times.reserve(TRIALS);
   for (int i = 0; i < TRIALS; ++i) {
-    auto g = build(w);
+    auto g = build<SequentialUnionFind>(w);
     auto t0 = clk::now();
     g.eg->sequential_close_nelson(g.eqs);
     times.push_back(elapsed_ms(t0));
@@ -207,13 +209,13 @@ std::vector<double> bench_nelson(const Workload& w) {
 
 std::vector<double> bench_parallel_close(const Workload& w) {
   for (int i = 0; i < WARMUP; ++i) {
-    auto g = build(w);
+    auto g = build<ConcurrentUnionFind>(w);
     g.eg->parallel_close(std::move(g.eqs));
   }
   std::vector<double> times;
   times.reserve(TRIALS);
   for (int i = 0; i < TRIALS; ++i) {
-    auto g = build(w);
+    auto g = build<ConcurrentUnionFind>(w);
     auto t0 = clk::now();
     g.eg->parallel_close(std::move(g.eqs));
     times.push_back(elapsed_ms(t0));
@@ -255,9 +257,7 @@ int main() {
   const bool csv = fmt && std::strcmp(fmt, "csv") == 0;
   const bool csv_header = std::getenv("PE_BENCH_HEADER") != nullptr;
   const char* custom_spec = std::getenv("PE_BENCH_CUSTOM");
-  const char* union_style_env = std::getenv("PE_UNION_STYLE");
   const char* dnc_cutoff_env = std::getenv("PE_DNC_CUTOFF");
-  const std::string union_style = union_style_env ? union_style_env : "dnc";
   const std::string dnc_cutoff = dnc_cutoff_env ? dnc_cutoff_env : "16";
 
   Workload w = DEFAULT_WORKLOAD;
@@ -272,7 +272,7 @@ int main() {
 
   if (csv && csv_header) {
     std::printf("workload,leaves,fns,nodes,merges,depth,algorithm,trial,"
-                "parlay_threads,union_style,dnc_cutoff,wallclock_ms\n");
+                "parlay_threads,dnc_cutoff,wallclock_ms\n");
   } else if (!csv) {
     std::printf("irregular_bench  trials=%d  warmup=%d  par_threads=%zu\n",
                 TRIALS, WARMUP, par_threads);
@@ -286,10 +286,9 @@ int main() {
 
   auto emit_csv = [&](const char* algorithm, const std::vector<double>& times) {
     for (std::size_t i = 0; i < times.size(); ++i) {
-      std::printf("%s,%zu,%zu,%zu,%zu,%zu,%s,%zu,%zu,%s,%s,%.4f\n",
+      std::printf("%s,%zu,%zu,%zu,%zu,%zu,%s,%zu,%zu,%s,%.4f\n",
                   w.name, w.n_leaves, w.n_fns, w.n_nodes, w.n_merges, w.depth,
-                  algorithm, i, par_threads, union_style.c_str(),
-                  dnc_cutoff.c_str(), times[i]);
+                  algorithm, i, par_threads, dnc_cutoff.c_str(), times[i]);
     }
   };
 

@@ -13,16 +13,16 @@
 namespace pe::detail {
 
 // `hash` is the 64-bit primary signature hash, used as the group_by key.
-// The trailing 4-byte slot is either `secondary_hash` (default ordered +
-// dual-hash path) or `class_id` (legacy hash path, the e-class id of the
-// node being canonicalized; under sparse `nodes_` storage that is also
-// the index into `nodes_`, used by sigs_equal to recover the ENode).
-// Selected at build time via the PE_GROUPBY_HASH compile-time switch
-// (CMake option PE_GROUPBY_HASH). The struct is 16 bytes either way.
+// The trailing 4-byte slot is either `secondary_hash` (default; verifies
+// equality with a 32-bit compare) or `class_id` (sound path; the e-class
+// id of the node, also the index into `nodes_`, used by sigs_equal to
+// recover the ENode for a structural compare). Selected at build time
+// via the PE_SEMISORT_SOUND compile-time switch. The struct is 16 bytes
+// either way.
 struct CanonEntry {
   std::uint64_t hash;
   Id root;
-#ifdef PE_GROUPBY_HASH
+#ifdef PE_SEMISORT_SOUND
   Id class_id;
 #else
   std::uint32_t secondary_hash;
@@ -38,7 +38,7 @@ struct SemisortTimings {
 };
 
 void parallel_consolidate(
-    parlay::sequence<parlay::sequence<Id>>& parent_index,
+    parlay::sequence<parlay::sequence<Id>>& parents,
     const parlay::sequence<Id>& cs,
     const parlay::sequence<Id>& roots);
 

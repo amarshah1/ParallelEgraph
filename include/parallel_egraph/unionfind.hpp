@@ -1,10 +1,10 @@
 #pragma once
-// Lock-free concurrent union-find (Jayanti & Tarjan Listing 3) +
-// plain sequential UF. Mirrors src/unionfind.rs.
+// Lock-free concurrent union-find (Jayanti & Tarjan Listing 3) + plain
+// sequential UF.
 //
-// Departure from Rust: no dynamic resize. Construct with a known capacity;
-// make_set() bumps a single-threaded counter within that capacity. The caller
-// (solver / benchmark) knows the upper bound on class count before e-graph
+// No dynamic resize. Construct with a known capacity; make_set() bumps a
+// single-threaded counter within that capacity. The caller (solver /
+// benchmark) knows the upper bound on class count before e-graph
 // construction — for the SMT solver, a one-pass AST walk counts subterms.
 
 #include <atomic>
@@ -37,9 +37,9 @@ class ConcurrentUnionFind {
   // Bumps size_ up to capacity_. Asserts on overflow.
   Id make_set();
 
-  // One-shot equivalent of calling `make_set()` n times. Used by
-  // `EGraph::bulk_init` to populate the UF without a per-element loop.
-  // Slots are already at make_rank(0) from the ctor.
+  // One-shot equivalent of calling `make_set()` n times. Used by the
+  // EGraph<UF> ctor to populate the UF without a per-element loop. Slots
+  // are already at make_rank(0) from the ctor.
   void bulk_init(std::size_t n);
 
   // Thread-safe but non-const: CAS writes (path compression / rank bump)
@@ -67,6 +67,11 @@ class SequentialUnionFind {
       : data_(size, make_rank(0)) {}
 
   std::size_t len() const { return data_.size(); }
+
+  // Symmetric with ConcurrentUnionFind::bulk_init so the EGraph<UF> ctor
+  // can call it generically. The ctor here already populated data_; this
+  // is a no-op.
+  void bulk_init(std::size_t /*n*/) {}
 
   Id find_root(Id u);
   void union_(Id u, Id v);

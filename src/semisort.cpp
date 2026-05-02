@@ -1,15 +1,12 @@
-// Dispatcher for the two `merge_and_collect_semisort` impls. Each impl
-// lives in its own header (semisort_ordered.hpp / semisort_hash.hpp);
-// this is the single translation unit that picks one and pulls its
-// definition into the static lib. The CMake-side conditional source
-// selection that this used to require is now handled by the #ifdef
-// below, keeping CMakeLists uniform.
+// Dispatcher for `merge_and_collect_semisort`. Two variants live in
+// dedicated headers; this is the single translation unit that picks
+// one and pulls its definition into the static lib.
 //
-// Default = ordered (integer_sort + dual-hash CanonEntry).
-// PE_GROUPBY_HASH=ON  → hash kernel (group_by_key + sigs_equal).
+// Default = secondary-hash equality (h1 + h2 match).
+// PE_SEMISORT_SOUND → structural equality via sigs_equal.
 
-#ifdef PE_GROUPBY_HASH
-#include "parallel_egraph/semisort_hash.hpp"
+#ifdef PE_SEMISORT_SOUND
+#include "parallel_egraph/semisort_sound.hpp"
 #else
-#include "parallel_egraph/semisort_ordered.hpp"
+#include "parallel_egraph/semisort_secondary.hpp"
 #endif

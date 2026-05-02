@@ -25,10 +25,7 @@ namespace {
 
 // Build helper: each ENode's class id is its index in `nodes`.
 parlay::sequence<ENode> make_nodes(std::initializer_list<ENode> ns) {
-  parlay::sequence<ENode> out;
-  out.reserve(ns.size());
-  for (const auto& n : ns) out.push_back(n);
-  return out;
+  return parlay::sequence<ENode>(ns.begin(), ns.end());
 }
 
 // ---------------------------------------------------------------------------
@@ -47,7 +44,7 @@ bool test_basic_congruence() {
       ENode{"f", {0}},         // 2
       ENode{"f", {1}},         // 3
   });
-  auto eg = EGraph::bulk_init(std::move(nodes));
+  auto eg = std::make_unique<ConcurrentEGraph>(std::move(nodes));
   parlay::sequence<std::pair<Id, Id>> eqs;
   eqs.push_back({0, 1});  // a = b
   eg->parallel_close(std::move(eqs));
@@ -69,7 +66,7 @@ bool test_two_level_cascade() {
       ENode{"g", {2}},         // 4 = g(f(a))
       ENode{"g", {3}},         // 5 = g(f(b))
   });
-  auto eg = EGraph::bulk_init(std::move(nodes));
+  auto eg = std::make_unique<ConcurrentEGraph>(std::move(nodes));
   parlay::sequence<std::pair<Id, Id>> eqs;
   eqs.push_back({0, 1});
   eg->parallel_close(std::move(eqs));
@@ -92,7 +89,7 @@ bool test_no_spurious_merges() {
       ENode{"f", {1}},         // 4 = f(b)
       ENode{"g", {2}},         // 5 = g(c)
   });
-  auto eg = EGraph::bulk_init(std::move(nodes));
+  auto eg = std::make_unique<ConcurrentEGraph>(std::move(nodes));
   parlay::sequence<std::pair<Id, Id>> eqs;
   eqs.push_back({0, 1});  // only a = b
   eg->parallel_close(std::move(eqs));
@@ -118,7 +115,7 @@ bool test_mixed_arity() {
       ENode{"f2", {0, 1}},        // 4 = f2(a, b)    arity 2
       ENode{"f1", {2}},           // 5 = f1(c)       arity 1
   });
-  auto eg = EGraph::bulk_init(std::move(nodes));
+  auto eg = std::make_unique<ConcurrentEGraph>(std::move(nodes));
   parlay::sequence<std::pair<Id, Id>> eqs;
   // Cross-arity: f1(a) = f2(a, b). Direct merge, no congruence cascade
   // because they have different signatures.
@@ -163,10 +160,10 @@ bool test_par_vs_seq_agree() {
     return eqs;
   };
 
-  auto eg_par = EGraph::bulk_init(build_nodes());
+  auto eg_par = std::make_unique<ConcurrentEGraph>(build_nodes());
   eg_par->parallel_close(unions());
 
-  auto eg_seq = EGraph::bulk_init(build_nodes());
+  auto eg_seq = std::make_unique<SequentialEGraph>(build_nodes());
   eg_seq->sequential_close_nelson(unions());
 
   // Both should derive: f(a,b) ≡ f(c,d), h(a,b,e) ≡ h(c,d,g),

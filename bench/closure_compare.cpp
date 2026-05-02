@@ -46,21 +46,24 @@ const std::vector<Workload> WORKLOADS = {
   {"deep-l",  50'000,  16, 1'000'000, 100'000, 3},
 };
 
+template <typename UF>
 struct BuiltGraph {
-  // EGraph is heap-allocated because it contains atomics (non-movable).
-  std::unique_ptr<EGraph> eg;
+  // EGraph is heap-allocated because ConcurrentUnionFind contains atomics
+  // (non-movable). The same shape works for both flavors.
+  std::unique_ptr<EGraph<UF>> eg;
   parlay::sequence<std::pair<Id, Id>> eqs;
 };
 
 // Workload generation is fully parallel:
 //   * Every ENode (leaves + per-level function nodes) is built in a single
 //     parlay::tabulate.
-//   * The whole e-graph (uf_, nodes_, parent_index_) is constructed in one
-//     parallel pass via EGraph::bulk_init.
+//   * The whole e-graph (uf_, nodes_, parents_) is constructed in one
+//     parallel pass via the EGraph<UF> ctor.
 //   * Equality pairs come out of a parlay::tabulate.
 // parlay::random_generator gives per-index forked sub-generators, so each
 // node draws independent random numbers without sequential RNG state.
-BuiltGraph build(const Workload& w) {
+template <typename UF>
+BuiltGraph<UF> build(const Workload& w) {
   const std::size_t depth = std::max<std::size_t>(w.depth, 1);
   const std::size_t per_level = w.n_nodes / depth;
 
@@ -104,7 +107,7 @@ BuiltGraph build(const Workload& w) {
     return n;
   });
 
-  auto eg = EGraph::bulk_init(std::move(all_nodes));
+  auto eg = std::make_unique<EGraph<UF>>(std::move(all_nodes));
 
   // ---- Equalities: fully parallel. ----
   const std::size_t n_x_merges = w.n_merges / 2;
@@ -136,13 +139,13 @@ double elapsed_ms(clk::time_point t0) {
 
 std::vector<double> bench_nelson(const Workload& w) {
   for (int i = 0; i < WARMUP; ++i) {
-    auto g = build(w);
+    auto g = build<SequentialUnionFind>(w);
     g.eg->sequential_close_nelson(g.eqs);
   }
   std::vector<double> times;
   times.reserve(TRIALS);
   for (int i = 0; i < TRIALS; ++i) {
-    auto g = build(w);
+    auto g = build<SequentialUnionFind>(w);
     auto t0 = clk::now();
     g.eg->sequential_close_nelson(g.eqs);
     times.push_back(elapsed_ms(t0));
@@ -152,13 +155,13 @@ std::vector<double> bench_nelson(const Workload& w) {
 
 std::vector<double> bench_parallel_close(const Workload& w) {
   for (int i = 0; i < WARMUP; ++i) {
-    auto g = build(w);
+    auto g = build<ConcurrentUnionFind>(w);
     g.eg->parallel_close(std::move(g.eqs));
   }
   std::vector<double> times;
   times.reserve(TRIALS);
   for (int i = 0; i < TRIALS; ++i) {
-    auto g = build(w);
+    auto g = build<ConcurrentUnionFind>(w);
     auto t0 = clk::now();
     g.eg->parallel_close(std::move(g.eqs));
     times.push_back(elapsed_ms(t0));
@@ -211,11 +214,9 @@ int main() {
   // PE_BENCH_CUSTOM=leaves,fns,nodes,merges,depth replaces the 6 baked-in
   // workloads with a single caller-specified one.
   const char* custom_spec = std::getenv("PE_BENCH_CUSTOM");
-  // PE_UNION_STYLE / PE_DNC_CUTOFF aren't read here, but we tag CSV rows
-  // with their values so downstream plots can group correctly.
-  const char* union_style_env = std::getenv("PE_UNION_STYLE");
+  // PE_DNC_CUTOFF isn't read here, but we tag CSV rows with its value
+  // so downstream plots can group correctly.
   const char* dnc_cutoff_env = std::getenv("PE_DNC_CUTOFF");
-  const std::string union_style = union_style_env ? union_style_env : "dnc";
   const std::string dnc_cutoff = dnc_cutoff_env ? dnc_cutoff_env : "16";
 
   std::vector<Workload> workloads;
@@ -241,16 +242,15 @@ int main() {
                 "nelson_seq", "par_close", "par_spd");
   } else if (csv_header) {
     std::printf("workload,leaves,fns,nodes,merges,depth,algorithm,trial,"
-                "parlay_threads,union_style,dnc_cutoff,wallclock_ms\n");
+                "parlay_threads,dnc_cutoff,wallclock_ms\n");
   }
 
   auto emit_csv = [&](const Workload& w, const char* algorithm,
                       const std::vector<double>& times) {
     for (std::size_t i = 0; i < times.size(); ++i) {
-      std::printf("%s,%zu,%zu,%zu,%zu,%zu,%s,%zu,%zu,%s,%s,%.4f\n",
+      std::printf("%s,%zu,%zu,%zu,%zu,%zu,%s,%zu,%zu,%s,%.4f\n",
                   w.name, w.n_leaves, w.n_fns, w.n_nodes, w.n_merges, w.depth,
-                  algorithm, i, par_threads, union_style.c_str(),
-                  dnc_cutoff.c_str(), times[i]);
+                  algorithm, i, par_threads, dnc_cutoff.c_str(), times[i]);
     }
   };
 
