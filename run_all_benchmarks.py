@@ -193,6 +193,137 @@ def ensure_cc_benchmarks() -> str:
 # (a) random / closure_compare
 # ---------------------------------------------------------------------------
 
+# XL ladder: doubles n_nodes / n_merges each step, starting from a 2× scale
+# of the `large` workload's nodes/merges. depth=3 across the board (no
+# separate deep-XL family). Driven via PE_BENCH_CUSTOM so no
+# closure_compare.cpp recompile is needed.
+# Tuple layout: (n_leaves, n_fns, n_nodes, n_merges, depth).
+RANDOM_XL_LADDER: dict[str, tuple[int, int, int, int, int]] = {
+    "XL":   (50_000, 16,  2_000_000,   200_000, 3),
+    "2XL":  (50_000, 16,  4_000_000,   400_000, 3),
+    "4XL":  (50_000, 16,  8_000_000,   800_000, 3),
+    "8XL":  (50_000, 16, 16_000_000, 1_600_000, 3),
+    "16XL": (50_000, 16, 32_000_000, 3_200_000, 3),
+    "32XL": (50_000, 16, 64_000_000, 6_400_000, 3),
+}
+
+
+def _retag_random_csv_rows(stdout: str, label: str, emit_header: bool) -> str:
+    """Rewrite the `workload` column in closure_compare CSV stdout from
+    'custom' to `label`. Drops the header line unless emit_header is True
+    (so we only print one header in the merged CSV).
+
+    Note: only the very first invocation has PE_BENCH_HEADER=1, so every
+    subsequent invocation's stdout is *headerless* — we therefore retag
+    by recognizing rows that start with 'custom,' rather than gating on
+    a header sighting.
+    """
+    out: list[str] = []
+    for line in stdout.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if stripped.startswith("workload,"):
+            if emit_header:
+                out.append(line)
+            continue
+        # Data row from PE_BENCH_CUSTOM: closure_compare prints
+        # "custom,leaves,fns,..." — swap the leading token for our label.
+        if stripped.startswith("custom,"):
+            comma = line.find(",")
+            out.append(f"{label}{line[comma:]}")
+            continue
+        out.append(line)
+    return "".join(out)
+
+
+def _retag_trace_banner(stderr: str, label: str) -> str:
+    """closure_compare emits "[bench] running custom ..." per workload. The
+    XL ladder runs one invocation per label, so there's a single banner per
+    invocation — rewrite it so parse_trace_log attributes round lines to
+    the correct ladder rung instead of the constant string "custom".
+    """
+    return re.sub(r"^\[bench\] running custom \.\.\.",
+                  f"[bench] running {label} ...",
+                  stderr, flags=re.MULTILINE)
+
+
+def run_random_xl(out_dir: Path, thread_counts: list[int],
+                  labels: list[str] | None = None):
+    """Same as run_random, but iterates the XL ladder via PE_BENCH_CUSTOM.
+
+    One closure_compare_bench invocation per (label, threads) cell. The
+    stdout `workload` column gets rewritten from 'custom' to the ladder
+    label so the merged CSV is self-describing; the stderr trace banner
+    gets the same treatment so per-round attribution survives parsing.
+
+    If `labels` is given, only those rungs of RANDOM_XL_LADDER run (in
+    the requested order). Useful for resuming a partial sweep.
+    """
+    csv_path = out_dir / "random.csv"
+    trace_csv_path = out_dir / "random_trace.csv"
+    trace_dir = out_dir / "random_traces"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+
+    if labels is None:
+        ladder = list(RANDOM_XL_LADDER.items())
+    else:
+        unknown = [l for l in labels if l not in RANDOM_XL_LADDER]
+        if unknown:
+            sys.exit(f"unknown XL ladder labels: {unknown}. "
+                     f"valid: {list(RANDOM_XL_LADDER)}")
+        ladder = [(l, RANDOM_XL_LADDER[l]) for l in labels]
+
+    binary = "./build/closure_compare_bench"
+    first = True
+    all_trace_rows: list[list] = []
+    with open(csv_path, "w") as csv_out:
+        for label, params in ladder:
+            spec = ",".join(str(x) for x in params)
+            # nelson_seq is the sequential baseline — its time doesn't
+            # depend on PARLAY_NUM_THREADS, so we only run it on the first
+            # thread count for each ladder rung and skip it on the rest.
+            for i, t in enumerate(thread_counts):
+                skip_nelson = i > 0
+                tag = "par_only" if skip_nelson else "+nelson"
+                print(f"  [random-xl] {label} threads={t} ({tag})",
+                      flush=True)
+                env = os.environ.copy()
+                env["PE_BENCH_FORMAT"] = "csv"
+                if first:
+                    env["PE_BENCH_HEADER"] = "1"
+                if skip_nelson:
+                    env["PE_BENCH_SKIP_NELSON"] = "1"
+                env["PE_TRACE"] = "1"
+                env["PARLAY_NUM_THREADS"] = str(t)
+                env["PE_BENCH_CUSTOM"] = spec
+                t0 = time.perf_counter()
+                proc = subprocess.run(NUMACTL_PREFIX + [binary],
+                                      capture_output=True, text=True, env=env)
+                wall = time.perf_counter() - t0
+                if proc.returncode != 0:
+                    sys.stderr.write(proc.stderr)
+                    raise RuntimeError(
+                        f"closure_compare_bench failed at {label} T={t}")
+                csv_out.write(_retag_random_csv_rows(
+                    proc.stdout, label, emit_header=first))
+                csv_out.flush()
+                retagged_stderr = _retag_trace_banner(proc.stderr, label)
+                (trace_dir / f"{label}_T{t}.log").write_text(retagged_stderr)
+                all_trace_rows.extend(parse_trace_log(
+                    retagged_stderr, threads=t,
+                    default_workload=label,
+                    workload_re=RANDOM_BANNER_RE))
+                first = False
+                print(f"    wrote {trace_dir / f'{label}_T{t}.log'} "
+                      f"({wall:.1f}s)", flush=True)
+
+    with open(trace_csv_path, "w", newline="") as f:
+        w = csvmod.writer(f)
+        w.writerow(TRACE_COLUMNS)
+        w.writerows(all_trace_rows)
+    print(f"  → {csv_path}")
+    print(f"  → {trace_csv_path}  ({len(all_trace_rows)} rows)")
+
+
 def run_random(out_dir: Path, thread_counts: list[int]):
     """closure_compare_bench with PE_BENCH_FORMAT=csv at each thread count.
 
@@ -564,6 +695,14 @@ def main():
                     help="basename glob filter for egg files (default: '*')")
     ap.add_argument("--egg-timeout", type=float, default=120.0,
                     help="per-file wall budget for egg phase (default: 120s)")
+    ap.add_argument("--random-xl-only", action="store_true",
+                    help="run only the random phase, and only the XL→32XL "
+                         "ladder via PE_BENCH_CUSTOM. Implies --skip "
+                         "synthetic --skip cube_decomp --skip egg.")
+    ap.add_argument("--random-xl-labels", default=None,
+                    help="comma-separated subset of XL ladder rungs to run "
+                         "(e.g. '16XL,32XL'). Only meaningful with "
+                         "--random-xl-only. Defaults to the full ladder.")
     args = ap.parse_args()
 
     try:
@@ -573,6 +712,8 @@ def main():
         sys.exit("--threads-sweep expects comma-separated integers")
 
     skip = set(args.skip)
+    if args.random_xl_only:
+        skip.update({"synthetic", "cube_decomp", "egg"})
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(args.out_root) / ts
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -600,8 +741,17 @@ def main():
         ensure_cc_benchmarks()
 
     if "random" not in skip:
-        print("=== (a) random ===")
-        run_random(out_dir, thread_counts)
+        if args.random_xl_only:
+            xl_labels = None
+            if args.random_xl_labels:
+                xl_labels = [s.strip() for s in args.random_xl_labels.split(",")
+                             if s.strip()]
+            tag = (f" ({','.join(xl_labels)})" if xl_labels else "")
+            print(f"=== (a) random (XL ladder{tag}) ===")
+            run_random_xl(out_dir, thread_counts, labels=xl_labels)
+        else:
+            print("=== (a) random ===")
+            run_random(out_dir, thread_counts)
         print()
 
     if "synthetic" not in skip:
