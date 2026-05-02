@@ -52,20 +52,21 @@ if(USE_JEMALLOC)
 endif()
 
 # ---- semisort group-by variant ----
-# Default: parlay::group_by_key_ordered (integer_sort) with a 32-bit
-# secondary hash carried in each CanonEntry — fastest, with collisions
-# made effectively impossible by 96-bit combined entropy and a defensive
-# slow path for the (statistically unreachable) collision case.
-# Set PE_GROUPBY_HASH=ON to build with the legacy parlay::group_by_key
-# (open-addressing) + sigs_equal path, which is deterministically correct
-# under any hash function. CanonEntry stays at 16 bytes either way (the
-# trailing 4 bytes are h2 in the default build, idx in the legacy build).
-option(PE_GROUPBY_HASH "Use deterministic hash + sigs_equal group-by" OFF)
+# Default: secondary-hash equality. parlay::group_by_key (open-addressing
+# hash table) keyed on the 64-bit primary signature hash, with equality
+# verified by a 32-bit secondary hash carried in CanonEntry. Combined
+# 96-bit entropy makes collisions effectively impossible (~10⁻¹⁴ across
+# a 64M-element batch); we accept that probabilistic guarantee.
+# Set PE_SEMISORT_SOUND=ON to verify equality structurally via sigs_equal
+# (the children-walk comparison resolved through the UF). Slower but
+# correct under any hash function. CanonEntry stays at 16 bytes either
+# way (trailing 4 bytes are secondary_hash by default, class_id when SOUND).
+option(PE_SEMISORT_SOUND "Verify semisort equality with sigs_equal instead of secondary hash" OFF)
 
 # ---- core library ----
 # Two interchangeable `merge_and_collect_semisort` impls live as headers
-# (include/parallel_egraph/semisort_{ordered,hash}.hpp). The dispatcher
-# src/semisort.cpp #include's one based on PE_GROUPBY_HASH; CMake just
+# (include/parallel_egraph/semisort_{secondary,sound}.hpp). The dispatcher
+# src/semisort.cpp #include's one based on PE_SEMISORT_SOUND; CMake just
 # compiles that single TU.
 add_library(parallel_egraph_core STATIC
   src/unionfind.cpp
@@ -77,8 +78,8 @@ target_include_directories(parallel_egraph_core
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 target_link_libraries(parallel_egraph_core PUBLIC parlay unordered_dense::unordered_dense ${JEMALLOC_LIB})
-if(PE_GROUPBY_HASH)
-  target_compile_definitions(parallel_egraph_core PUBLIC PE_GROUPBY_HASH)
+if(PE_SEMISORT_SOUND)
+  target_compile_definitions(parallel_egraph_core PUBLIC PE_SEMISORT_SOUND)
 endif()
 
 # ---- CLI: egraph-cc <file.smt2> -> sat / unsat ----

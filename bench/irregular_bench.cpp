@@ -66,8 +66,9 @@ struct LevelLayout {
   std::size_t end;
 };
 
+template <typename UF>
 struct BuiltGraph {
-  std::unique_ptr<EGraph> eg;
+  std::unique_ptr<EGraph<UF>> eg;
   parlay::sequence<std::pair<Id, Id>> eqs;
 };
 
@@ -104,7 +105,8 @@ std::size_t locate_level(const std::vector<LevelLayout>& layouts, std::size_t i)
   return layouts.size() - 1;  // shouldn't happen
 }
 
-BuiltGraph build(const Workload& w) {
+template <typename UF>
+BuiltGraph<UF> build(const Workload& w) {
   const auto layouts = compute_layouts(w);
   const std::size_t total = layouts.back().end;
 
@@ -146,7 +148,7 @@ BuiltGraph build(const Workload& w) {
     return n;
   });
 
-  auto eg = EGraph::bulk_init(std::move(all_nodes));
+  auto eg = std::make_unique<EGraph<UF>>(std::move(all_nodes));
 
   // Initial unions: 60% same-arity leaf-leaf (half x-x, half y-y),
   // 40% cross-arity unary-vs-binary at level 0.
@@ -191,13 +193,13 @@ double elapsed_ms(clk::time_point t0) {
 
 std::vector<double> bench_nelson(const Workload& w) {
   for (int i = 0; i < WARMUP; ++i) {
-    auto g = build(w);
+    auto g = build<SequentialUnionFind>(w);
     g.eg->sequential_close_nelson(g.eqs);
   }
   std::vector<double> times;
   times.reserve(TRIALS);
   for (int i = 0; i < TRIALS; ++i) {
-    auto g = build(w);
+    auto g = build<SequentialUnionFind>(w);
     auto t0 = clk::now();
     g.eg->sequential_close_nelson(g.eqs);
     times.push_back(elapsed_ms(t0));
@@ -207,13 +209,13 @@ std::vector<double> bench_nelson(const Workload& w) {
 
 std::vector<double> bench_parallel_close(const Workload& w) {
   for (int i = 0; i < WARMUP; ++i) {
-    auto g = build(w);
+    auto g = build<ConcurrentUnionFind>(w);
     g.eg->parallel_close(std::move(g.eqs));
   }
   std::vector<double> times;
   times.reserve(TRIALS);
   for (int i = 0; i < TRIALS; ++i) {
-    auto g = build(w);
+    auto g = build<ConcurrentUnionFind>(w);
     auto t0 = clk::now();
     g.eg->parallel_close(std::move(g.eqs));
     times.push_back(elapsed_ms(t0));

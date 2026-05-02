@@ -37,9 +37,9 @@ class ConcurrentUnionFind {
   // Bumps size_ up to capacity_. Asserts on overflow.
   Id make_set();
 
-  // One-shot equivalent of calling `make_set()` n times. Used by
-  // `EGraph::bulk_init` to populate the UF without a per-element loop.
-  // Slots are already at make_rank(0) from the ctor.
+  // One-shot equivalent of calling `make_set()` n times. Used by the
+  // EGraph<UF> ctor to populate the UF without a per-element loop. Slots
+  // are already at make_rank(0) from the ctor.
   void bulk_init(std::size_t n);
 
   // Thread-safe but non-const: CAS writes (path compression / rank bump)
@@ -67,6 +67,14 @@ class SequentialUnionFind {
       : data_(size, make_rank(0)) {}
 
   std::size_t len() const { return data_.size(); }
+
+  // Symmetric with ConcurrentUnionFind::bulk_init so the EGraph<UF> ctor
+  // can call it generically. The ctor here already populated data_; this
+  // is a no-op (asserts the size matches).
+  void bulk_init(std::size_t n) {
+    (void)n;
+    // assert(n == data_.size());  // EGraph<UF> ctor guarantees this
+  }
 
   Id find_root(Id u);
   void union_(Id u, Id v);

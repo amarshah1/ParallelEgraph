@@ -1,6 +1,6 @@
 // egraph-cc — congruence closure on a QF_UF SMT-LIB 2 input.
 //
-// Parses the script, builds the e-graph (parser-side hashcons + bulk_init)
+// Parses the script, builds the e-graph (parser-side hashcons + bulk ctor)
 // from the asserted equalities, runs parallel_close on the equality list,
 // and reports sat / unsat: unsat iff any asserted disequality (a != b)
 // collapses (find_root(a) == find_root(b)) after closure.
@@ -113,7 +113,7 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  auto eg = pe::EGraph::bulk_init(std::move(builder).take_nodes());
+  auto eg = std::make_unique<pe::ConcurrentEGraph>(std::move(builder).take_nodes());
   auto t_build = clk::now();
 
   eg->parallel_close(std::move(equalities));

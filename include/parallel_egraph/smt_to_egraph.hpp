@@ -1,11 +1,12 @@
 #pragma once
-// Glue between pe::parse_smtlib and EGraph::bulk_init: walks a Term tree
+// Glue between pe::parse_smtlib and the EGraph ctor: walks a Term tree
 // iteratively, hashcons-dedupes, and emits a flat DAG-ordered ENode
-// sequence ready for bulk_init. Used by both the egraph-cc CLI
-// (src/main.cpp) and the SMT-LIB benchmark (bench/smt_bench.cpp).
+// sequence ready to feed EGraph<UF>'s bulk ctor. Used by both the
+// egraph-cc CLI (src/main.cpp) and the SMT-LIB benchmark
+// (bench/smt_bench.cpp).
 //
 // The hashcons lives here, not in EGraph itself — EGraph has no
-// incremental add()/hashcons; bulk_init expects a flat, unique ENode
+// incremental add()/hashcons; its ctor expects a flat, unique ENode
 // sequence, which this builder produces.
 
 #include <cstdint>
@@ -37,7 +38,7 @@ class SmtToEGraphBuilder {
   // Walk a Term tree iteratively, dedupe via hashcons, append unique
   // ENodes to nodes_ in DAG order. Returns the class id of the term's
   // root. After all add_term() calls, std::move(builder).take_nodes()
-  // yields the flat ENode sequence to feed EGraph::bulk_init.
+  // yields the flat ENode sequence to feed the EGraph<UF> ctor.
   Id add_term(const Term& term) {
     enum class WK { Process, Build };
     struct W {

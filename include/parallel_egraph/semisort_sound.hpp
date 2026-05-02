@@ -1,22 +1,18 @@
 #pragma once
-// Kernel `merge_and_collect_semisort` implementation: parlay's
-// open-addressing `group_by_key` with sig_hash as the hash and sigs_equal
-// as the equality predicate. Hash is recomputed from the ENode on every
-// call — no caching, no h2 fast-path, no in-bucket short-circuits. The
-// reference / fallback implementation; deterministically correct under
-// any hash function and slower than the integer-sort default (~1.2× on
-// `large` at T=192) because each `hash_fn` and `equal_fn` invocation
-// re-walks the children with UF lookups.
+// Sound `merge_and_collect_semisort`: open-addressing `parlay::group_by_key`
+// keyed on the cached 64-bit primary hash, with equality verified by the
+// structural `sigs_equal` walk over each candidate's children (resolving
+// every child id through the UF). Slower than the secondary-hash default
+// but correct under any hash function — picks up unions that the
+// probabilistic variant would miss on hash collisions.
 //
-// Selected at build time when the dispatcher (`src/semisort.cpp`) sees
-// `PE_GROUPBY_HASH` defined. Despite the .hpp extension, this header is
-// included from exactly one translation unit — never from anywhere else.
+// Selected at build time by `src/semisort.cpp` when `PE_SEMISORT_SOUND`
+// is defined. Despite the .hpp extension, this header is included from
+// exactly one translation unit.
 //
-// CanonEntry's trailing 4-byte slot stores a class id (`class_id`)
-// instead of a secondary hash (selected by the `PE_GROUPBY_HASH` define
-// in detail.hpp); the kernel uses it only to recover the ENode (via
-// `nodes[e.class_id]`) for the hash and equality probes — the cached
-// `e.hash` field is intentionally ignored for clarity.
+// CanonEntry's trailing 4-byte slot is `class_id` here (selected by the
+// PE_SEMISORT_SOUND #ifdef in detail.hpp); we use it only to recover the
+// ENode via `nodes[e.class_id]` for the equality probe.
 
 #include "parallel_egraph/detail.hpp"
 #include "parallel_egraph/dnc_union.hpp"
@@ -58,7 +54,7 @@ parlay::sequence<Id> merge_and_collect_semisort(
   // `e.hash` is ignored). Equality is the full sigs_equal — no fast path,
   // no h2 short-circuit.
   auto hash_fn = [&](const CanonEntry& e) -> std::size_t {
-    return sig_hash(nodes[e.class_id], uf);
+    return e.hash;
   };
   auto equal_fn = [&](const CanonEntry& a, const CanonEntry& b) -> bool {
     return sigs_equal(a.class_id, b.class_id, uf, nodes);

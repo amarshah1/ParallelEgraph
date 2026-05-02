@@ -46,21 +46,24 @@ const std::vector<Workload> WORKLOADS = {
   {"deep-l",  50'000,  16, 1'000'000, 100'000, 3},
 };
 
+template <typename UF>
 struct BuiltGraph {
-  // EGraph is heap-allocated because it contains atomics (non-movable).
-  std::unique_ptr<EGraph> eg;
+  // EGraph is heap-allocated because ConcurrentUnionFind contains atomics
+  // (non-movable). The same shape works for both flavors.
+  std::unique_ptr<EGraph<UF>> eg;
   parlay::sequence<std::pair<Id, Id>> eqs;
 };
 
 // Workload generation is fully parallel:
 //   * Every ENode (leaves + per-level function nodes) is built in a single
 //     parlay::tabulate.
-//   * The whole e-graph (uf_, nodes_, parent_index_) is constructed in one
-//     parallel pass via EGraph::bulk_init.
+//   * The whole e-graph (uf_, nodes_, parents_) is constructed in one
+//     parallel pass via the EGraph<UF> ctor.
 //   * Equality pairs come out of a parlay::tabulate.
 // parlay::random_generator gives per-index forked sub-generators, so each
 // node draws independent random numbers without sequential RNG state.
-BuiltGraph build(const Workload& w) {
+template <typename UF>
+BuiltGraph<UF> build(const Workload& w) {
   const std::size_t depth = std::max<std::size_t>(w.depth, 1);
   const std::size_t per_level = w.n_nodes / depth;
 
@@ -104,7 +107,7 @@ BuiltGraph build(const Workload& w) {
     return n;
   });
 
-  auto eg = EGraph::bulk_init(std::move(all_nodes));
+  auto eg = std::make_unique<EGraph<UF>>(std::move(all_nodes));
 
   // ---- Equalities: fully parallel. ----
   const std::size_t n_x_merges = w.n_merges / 2;
@@ -136,13 +139,13 @@ double elapsed_ms(clk::time_point t0) {
 
 std::vector<double> bench_nelson(const Workload& w) {
   for (int i = 0; i < WARMUP; ++i) {
-    auto g = build(w);
+    auto g = build<SequentialUnionFind>(w);
     g.eg->sequential_close_nelson(g.eqs);
   }
   std::vector<double> times;
   times.reserve(TRIALS);
   for (int i = 0; i < TRIALS; ++i) {
-    auto g = build(w);
+    auto g = build<SequentialUnionFind>(w);
     auto t0 = clk::now();
     g.eg->sequential_close_nelson(g.eqs);
     times.push_back(elapsed_ms(t0));
@@ -152,13 +155,13 @@ std::vector<double> bench_nelson(const Workload& w) {
 
 std::vector<double> bench_parallel_close(const Workload& w) {
   for (int i = 0; i < WARMUP; ++i) {
-    auto g = build(w);
+    auto g = build<ConcurrentUnionFind>(w);
     g.eg->parallel_close(std::move(g.eqs));
   }
   std::vector<double> times;
   times.reserve(TRIALS);
   for (int i = 0; i < TRIALS; ++i) {
-    auto g = build(w);
+    auto g = build<ConcurrentUnionFind>(w);
     auto t0 = clk::now();
     g.eg->parallel_close(std::move(g.eqs));
     times.push_back(elapsed_ms(t0));

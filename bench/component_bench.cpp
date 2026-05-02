@@ -48,7 +48,7 @@ const std::vector<Workload> WORKLOADS = {
 };
 
 struct BuiltGraph {
-  std::unique_ptr<EGraph> eg;
+  std::unique_ptr<ConcurrentEGraph> eg;
   parlay::sequence<std::pair<Id, Id>> eqs;
 };
 
@@ -93,7 +93,7 @@ BuiltGraph build(const Workload& w) {
     return n;
   });
 
-  auto eg = EGraph::bulk_init(std::move(all_nodes));
+  auto eg = std::make_unique<ConcurrentEGraph>(std::move(all_nodes));
 
   const std::size_t n_x_merges = w.n_merges / 2;
   auto eq_seq = parlay::tabulate(w.n_merges, [&](std::size_t i) {
@@ -125,7 +125,7 @@ struct PhaseTimes {
 PhaseTimes run_trial(const Workload& w) {
   auto g = build(w);
   auto& uf = g.eg->uf();
-  auto& parent_index = g.eg->parent_index();
+  auto& parents = g.eg->parents();
   const auto& nodes = g.eg->nodes();
 
   parlay::parallel_for(0, g.eqs.size(), [&](std::size_t i) {
@@ -139,13 +139,13 @@ PhaseTimes run_trial(const Workload& w) {
   auto roots = parlay::map(work, [&](Id c) { return uf.find_root(c); });
 
   auto t0 = clk::now();
-  detail::parallel_consolidate(parent_index, work, roots);
+  detail::parallel_consolidate(parents, work, roots);
   double consolidate_ms = elapsed_ms(t0);
 
   auto unique_roots = parlay::remove_duplicates(roots);
   auto frontier = parlay::flatten(parlay::map(unique_roots, [&](Id r) {
-    return parlay::sequence<std::uint32_t>(std::begin(parent_index[r]),
-                                           std::end(parent_index[r]));
+    return parlay::sequence<std::uint32_t>(std::begin(parents[r]),
+                                           std::end(parents[r]));
   }));
 
   if (frontier.empty()) return {consolidate_ms, 0.0};
@@ -154,7 +154,7 @@ PhaseTimes run_trial(const Workload& w) {
     // `idx` is a frontier element — under sparse `nodes_` storage it
     // is the class id of a parent node and the index into `nodes_`.
     const auto& node = nodes[idx];
-#ifdef PE_GROUPBY_HASH
+#ifdef PE_SEMISORT_SOUND
     return detail::CanonEntry{sig_hash(node, uf), uf.find_root(idx), idx};
 #else
     auto [hash, secondary_hash] = sig_hashes(node, uf);

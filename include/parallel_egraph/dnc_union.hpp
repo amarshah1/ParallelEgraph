@@ -1,17 +1,15 @@
 #pragma once
-// Internal shared helpers for the two `merge_and_collect_semisort` impls
-// (semisort_ordered.cpp = default, semisort_hash.cpp = kernel). Both go
-// through `dnc_union` to apply the per-group unions; the bucket type is
-// templated because the two impls carry different per-element payloads
-// (CanonEntry, RootH2, or plain Id) — `as_root()` overloads pick out the
-// class id regardless.
+// Internal shared helper for both `merge_and_collect_semisort` impls
+// (semisort_secondary.hpp = default, semisort_sound.hpp = sound). Both
+// go through `dnc_union` to apply the per-group unions; the bucket type
+// is templated because the impls carry different per-element payloads —
+// `as_root()` overloads pick out the class id regardless.
 //
 // Not part of the stable public API. Header-only because every helper
 // here is either `inline` or a template.
 
 #include <cstdint>
 #include <cstdlib>
-#include <string>
 
 #include <parlay/parallel.h>
 
@@ -29,19 +27,8 @@ inline std::size_t dnc_cutoff() {
   return v;
 }
 
-// PE_UNION_STYLE=adjacent uses a flat parlay::parallel_for over adjacent
-// pairs instead of the D&C tree. Higher CAS contention but trivially
-// simple; sometimes wins on small groups.
-inline bool union_style_adjacent() {
-  static const bool v = [] {
-    const char* s = std::getenv("PE_UNION_STYLE");
-    return s && std::string(s) == "adjacent";
-  }();
-  return v;
-}
-
-// Bucket-element accessors so dnc_union can dispatch over CanonEntry,
-// RootH2, and plain Id without a runtime branch.
+// Bucket-element accessors so dnc_union can dispatch over CanonEntry and
+// plain Id without a runtime branch.
 inline Id as_root(Id x) { return x; }
 inline Id as_root(const CanonEntry& e) { return e.root; }
 
@@ -49,12 +36,6 @@ template <typename Bucket>
 void dnc_union(Bucket& bucket, std::size_t lo, std::size_t hi,
                ConcurrentUnionFind& uf) {
   if (hi - lo <= 1) return;
-  if (union_style_adjacent()) {
-    parlay::parallel_for(lo, hi - 1, [&](std::size_t i) {
-      uf.union_(as_root(bucket[i]), as_root(bucket[i + 1]));
-    });
-    return;
-  }
   const std::size_t DNC_SEQ_CUTOFF = dnc_cutoff();
   if (hi - lo <= DNC_SEQ_CUTOFF) {
     for (std::size_t i = lo + 1; i < hi; ++i) {
