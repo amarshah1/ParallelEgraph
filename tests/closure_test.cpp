@@ -25,10 +25,7 @@ namespace {
 
 // Build helper: each ENode's class id is its index in `nodes`.
 parlay::sequence<ENode> make_nodes(std::initializer_list<ENode> ns) {
-  parlay::sequence<ENode> out;
-  out.reserve(ns.size());
-  for (const auto& n : ns) out.push_back(n);
-  return out;
+  return parlay::sequence<ENode>(ns.begin(), ns.end());
 }
 
 // ---------------------------------------------------------------------------

@@ -1,10 +1,10 @@
 #pragma once
-// Lock-free concurrent union-find (Jayanti & Tarjan Listing 3) +
-// plain sequential UF. Mirrors src/unionfind.rs.
+// Lock-free concurrent union-find (Jayanti & Tarjan Listing 3) + plain
+// sequential UF.
 //
-// Departure from Rust: no dynamic resize. Construct with a known capacity;
-// make_set() bumps a single-threaded counter within that capacity. The caller
-// (solver / benchmark) knows the upper bound on class count before e-graph
+// No dynamic resize. Construct with a known capacity; make_set() bumps a
+// single-threaded counter within that capacity. The caller (solver /
+// benchmark) knows the upper bound on class count before e-graph
 // construction — for the SMT solver, a one-pass AST walk counts subterms.
 
 #include <atomic>
@@ -70,11 +70,8 @@ class SequentialUnionFind {
 
   // Symmetric with ConcurrentUnionFind::bulk_init so the EGraph<UF> ctor
   // can call it generically. The ctor here already populated data_; this
-  // is a no-op (asserts the size matches).
-  void bulk_init(std::size_t n) {
-    (void)n;
-    // assert(n == data_.size());  // EGraph<UF> ctor guarantees this
-  }
+  // is a no-op.
+  void bulk_init(std::size_t /*n*/) {}
 
   Id find_root(Id u);
   void union_(Id u, Id v);

@@ -93,6 +93,28 @@ std::pair<std::string, std::size_t> parse_filename(const std::string& stem) {
   return {m[1].str(), static_cast<std::size_t>(std::stoull(m[2].str()))};
 }
 
+template <typename UF, typename Close>
+void run_one(const pe::Script& script, const std::string& stem,
+             const std::string& family, std::size_t n,
+             int trials, int warmup, std::size_t par_threads,
+             const char* algorithm, Close close) {
+  for (int i = 0; i < warmup; ++i) {
+    auto b = build_from_script<UF>(script);
+    close(*b.eg, b.eqs);
+  }
+  for (int i = 0; i < trials; ++i) {
+    auto b = build_from_script<UF>(script);
+    const std::size_t neq = b.eqs.size();
+    auto t0 = clk::now();
+    close(*b.eg, b.eqs);
+    double ms = elapsed_ms(t0);
+    std::printf("%s,%s,%zu,%zu,%zu,%s,%d,%zu,%.4f\n",
+                stem.c_str(), family.c_str(), n,
+                b.classes, neq, algorithm, i, par_threads, ms);
+    std::fflush(stdout);
+  }
+}
+
 void collect_paths(const fs::path& root, std::vector<fs::path>& out) {
   if (fs::is_regular_file(root) && root.extension() == ".smt2") {
     out.push_back(root);
@@ -150,32 +172,13 @@ int main(int argc, char** argv) {
       continue;
     }
 
-    auto run_one = [&]<typename UF>(const char* algorithm, auto close_fn) {
-      for (int i = 0; i < warmup; ++i) {
-        auto b = build_from_script<UF>(script);
-        close_fn(*b.eg, b.eqs);
-      }
-      for (int i = 0; i < trials; ++i) {
-        auto b = build_from_script<UF>(script);
-        const std::size_t neq = b.eqs.size();
-        auto t0 = clk::now();
-        close_fn(*b.eg, b.eqs);
-        double ms = elapsed_ms(t0);
-        std::printf("%s,%s,%zu,%zu,%zu,%s,%d,%zu,%.4f\n",
-                    stem.c_str(), family.c_str(), n,
-                    b.classes, neq,
-                    algorithm, i, par_threads, ms);
-        std::fflush(stdout);
-      }
-    };
-
     if (!skip_nelson) {
-      run_one.template operator()<pe::SequentialUnionFind>(
-          "nelson_seq",
+      run_one<pe::SequentialUnionFind>(script, stem, family, n, trials,
+          warmup, par_threads, "nelson_seq",
           [](auto& eg, auto& eqs) { eg.sequential_close_nelson(eqs); });
     }
-    run_one.template operator()<pe::ConcurrentUnionFind>(
-        "par_close",
+    run_one<pe::ConcurrentUnionFind>(script, stem, family, n, trials,
+        warmup, par_threads, "par_close",
         [](auto& eg, auto& eqs) { eg.parallel_close(std::move(eqs)); });
   }
   return 0;

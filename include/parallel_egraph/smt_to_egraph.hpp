@@ -24,15 +24,6 @@
 
 namespace pe {
 
-struct ENodeHash {
-  std::size_t operator()(const ENode& n) const noexcept {
-    FxHasher h;
-    h.write_str(n.op);
-    for (Id c : n.children) h.write_u32(c);
-    return static_cast<std::size_t>(h.finish());
-  }
-};
-
 class SmtToEGraphBuilder {
  public:
   // Walk a Term tree iteratively, dedupe via hashcons, append unique
@@ -96,6 +87,15 @@ class SmtToEGraphBuilder {
     hashcons_.emplace(std::move(node), id);
     return id;
   }
+
+  struct ENodeHash {
+    std::size_t operator()(const ENode& n) const noexcept {
+      FxHasher h;
+      h.write_str(n.op);
+      for (Id c : n.children) h.write_u32(c);
+      return static_cast<std::size_t>(h.finish());
+    }
+  };
 
   parlay::sequence<ENode> nodes_;
   ankerl::unordered_dense::map<ENode, Id, ENodeHash> hashcons_;

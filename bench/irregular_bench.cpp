@@ -257,9 +257,7 @@ int main() {
   const bool csv = fmt && std::strcmp(fmt, "csv") == 0;
   const bool csv_header = std::getenv("PE_BENCH_HEADER") != nullptr;
   const char* custom_spec = std::getenv("PE_BENCH_CUSTOM");
-  const char* union_style_env = std::getenv("PE_UNION_STYLE");
   const char* dnc_cutoff_env = std::getenv("PE_DNC_CUTOFF");
-  const std::string union_style = union_style_env ? union_style_env : "dnc";
   const std::string dnc_cutoff = dnc_cutoff_env ? dnc_cutoff_env : "16";
 
   Workload w = DEFAULT_WORKLOAD;
@@ -274,7 +272,7 @@ int main() {
 
   if (csv && csv_header) {
     std::printf("workload,leaves,fns,nodes,merges,depth,algorithm,trial,"
-                "parlay_threads,union_style,dnc_cutoff,wallclock_ms\n");
+                "parlay_threads,dnc_cutoff,wallclock_ms\n");
   } else if (!csv) {
     std::printf("irregular_bench  trials=%d  warmup=%d  par_threads=%zu\n",
                 TRIALS, WARMUP, par_threads);
@@ -288,10 +286,9 @@ int main() {
 
   auto emit_csv = [&](const char* algorithm, const std::vector<double>& times) {
     for (std::size_t i = 0; i < times.size(); ++i) {
-      std::printf("%s,%zu,%zu,%zu,%zu,%zu,%s,%zu,%zu,%s,%s,%.4f\n",
+      std::printf("%s,%zu,%zu,%zu,%zu,%zu,%s,%zu,%zu,%s,%.4f\n",
                   w.name, w.n_leaves, w.n_fns, w.n_nodes, w.n_merges, w.depth,
-                  algorithm, i, par_threads, union_style.c_str(),
-                  dnc_cutoff.c_str(), times[i]);
+                  algorithm, i, par_threads, dnc_cutoff.c_str(), times[i]);
     }
   };
 

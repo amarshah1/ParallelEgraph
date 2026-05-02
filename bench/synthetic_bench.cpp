@@ -14,7 +14,7 @@
 //   PE_BENCH_SKIP_NELSON=1             skip sequential baseline
 //   PE_BENCH_FORMAT=csv                emit one row per (family, n, algo, trial)
 //   PE_BENCH_HEADER=1                  emit CSV header (gated for appended runs)
-//   PE_UNION_STYLE / PE_DNC_CUTOFF     tagged into CSV for plot grouping
+//   PE_DNC_CUTOFF                      tagged into CSV for plot grouping
 //   PE_SYNTH_DUMP=1                    print every generated node + initial
 //                                      union to stderr, then exit (no timing).
 //                                      Useful for sanity-checking what's in
@@ -370,9 +370,7 @@ int main() {
   const char* fmt = std::getenv("PE_BENCH_FORMAT");
   const bool csv = fmt && std::strcmp(fmt, "csv") == 0;
   const bool csv_header = std::getenv("PE_BENCH_HEADER") != nullptr;
-  const char* union_style_env = std::getenv("PE_UNION_STYLE");
   const char* dnc_cutoff_env  = std::getenv("PE_DNC_CUTOFF");
-  const std::string union_style = union_style_env ? union_style_env : "dnc";
   const std::string dnc_cutoff  = dnc_cutoff_env  ? dnc_cutoff_env  : "16";
 
   // PE_SYNTH_D = decomposition rate / g-tree fan-in (>= 2). Default 2 is
@@ -462,17 +460,16 @@ int main() {
                 "nelson_seq", "par_close", "par_spd");
   } else if (csv_header) {
     std::printf("family,n,d,classes,merges,algorithm,trial,"
-                "parlay_threads,union_style,dnc_cutoff,wallclock_ms\n");
+                "parlay_threads,dnc_cutoff,wallclock_ms\n");
   }
 
   auto emit_csv = [&](Family f, std::size_t n, std::size_t classes,
                       std::size_t merges, const char* algorithm,
                       const std::vector<double>& times) {
     for (std::size_t i = 0; i < times.size(); ++i) {
-      std::printf("%s,%zu,%zu,%zu,%zu,%s,%zu,%zu,%s,%s,%.4f\n",
+      std::printf("%s,%zu,%zu,%zu,%zu,%s,%zu,%zu,%s,%.4f\n",
                   family_name(f), n, g_arity, classes, merges,
-                  algorithm, i, par_threads, union_style.c_str(),
-                  dnc_cutoff.c_str(), times[i]);
+                  algorithm, i, par_threads, dnc_cutoff.c_str(), times[i]);
     }
   };
 

@@ -2,7 +2,7 @@
 
 #include <cassert>
 
-// 1:1 port of src/unionfind.rs. Memory orderings mirror Rust's exactly:
+// Memory orderings:
 //   Acquire on load, Release on CAS success / store, Relaxed on CAS failure.
 
 namespace pe {
@@ -95,9 +95,8 @@ void ConcurrentUnionFind::union_(Id u, Id v) {
 
 bool ConcurrentUnionFind::same_set(Id u, Id v) {
   for (;;) {
-    auto [u_root, _ru] = find(u);
-    auto [v_root, _rv] = find(v);
-    (void)_ru; (void)_rv;
+    Id u_root = find(u).first;
+    Id v_root = find(v).first;
     if (u_root == v_root) return true;
     // Verify u_root is still a root (linearizability check).
     std::uint32_t p = data_[u_root].load(std::memory_order_acquire);

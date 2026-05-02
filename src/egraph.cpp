@@ -18,11 +18,9 @@
 
 namespace pe {
 
-// `sig_hash`, `sig_hashes`, and `sigs_equal` are templated on the UF type
-// and live in egraph.hpp — one definition serves both the parallel
-// (ConcurrentUnionFind) and sequential (SequentialUnionFind) paths. The
-// previous `_seq` variants and the dead `sig_cmp` (used by the removed
-// sample-sort variant) are gone.
+// `sig_hash`, `sig_hashes`, and `sigs_equal` are templated on the UF
+// type and live in egraph.hpp — one definition serves both the parallel
+// (ConcurrentUnionFind) and sequential (SequentialUnionFind) paths.
 //
 // `EGraph<UF>::EGraph` is defined inline in egraph.hpp; only the two
 // close methods are out-of-line here, each as an explicit specialization
@@ -31,10 +29,11 @@ namespace pe {
 // ---- parallel consolidation helper ---------------------------------------
 //
 // For each c in `cs` where c != root_of_c, migrate parents[c] into
-// parents[root_of_c]. Outer parallel: distinct root r per group, so
-// writes to parents[r] are isolated across groups. Inner parallel:
-// precompute offsets via parlay::scan, resize parents[r] once, then
-// scatter each c's entries into its pre-computed slot.
+// parents[root_of_c]. Outer parallel: group_by_key partitions the (root,
+// non_root) pairs so each root r is written by exactly one task; the
+// per-group body then concatenates parents[r] with each parents[c_i] via
+// a single parlay::flatten that allocates the destination buffer once
+// and scatters in parallel internally.
 
 namespace detail {
 

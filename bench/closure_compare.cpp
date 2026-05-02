@@ -214,11 +214,9 @@ int main() {
   // PE_BENCH_CUSTOM=leaves,fns,nodes,merges,depth replaces the 6 baked-in
   // workloads with a single caller-specified one.
   const char* custom_spec = std::getenv("PE_BENCH_CUSTOM");
-  // PE_UNION_STYLE / PE_DNC_CUTOFF aren't read here, but we tag CSV rows
-  // with their values so downstream plots can group correctly.
-  const char* union_style_env = std::getenv("PE_UNION_STYLE");
+  // PE_DNC_CUTOFF isn't read here, but we tag CSV rows with its value
+  // so downstream plots can group correctly.
   const char* dnc_cutoff_env = std::getenv("PE_DNC_CUTOFF");
-  const std::string union_style = union_style_env ? union_style_env : "dnc";
   const std::string dnc_cutoff = dnc_cutoff_env ? dnc_cutoff_env : "16";
 
   std::vector<Workload> workloads;
@@ -244,16 +242,15 @@ int main() {
                 "nelson_seq", "par_close", "par_spd");
   } else if (csv_header) {
     std::printf("workload,leaves,fns,nodes,merges,depth,algorithm,trial,"
-                "parlay_threads,union_style,dnc_cutoff,wallclock_ms\n");
+                "parlay_threads,dnc_cutoff,wallclock_ms\n");
   }
 
   auto emit_csv = [&](const Workload& w, const char* algorithm,
                       const std::vector<double>& times) {
     for (std::size_t i = 0; i < times.size(); ++i) {
-      std::printf("%s,%zu,%zu,%zu,%zu,%zu,%s,%zu,%zu,%s,%s,%.4f\n",
+      std::printf("%s,%zu,%zu,%zu,%zu,%zu,%s,%zu,%zu,%s,%.4f\n",
                   w.name, w.n_leaves, w.n_fns, w.n_nodes, w.n_merges, w.depth,
-                  algorithm, i, par_threads, union_style.c_str(),
-                  dnc_cutoff.c_str(), times[i]);
+                  algorithm, i, par_threads, dnc_cutoff.c_str(), times[i]);
     }
   };
 
