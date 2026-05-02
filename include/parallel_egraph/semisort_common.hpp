@@ -48,11 +48,19 @@ parlay::sequence<Id> semisort_with_equality(
   if (timings) timings->group_by_ms = ms_since(t1);
 
   // For each non-singleton group, union all members and emit their
-  // pre-round roots into next_work.
+  // pre-round roots into next_work. Skip groups whose members all
+  // already share a single root: the unions would be no-ops and the
+  // shared root would re-enter next_work with parents_[root] unchanged
+  // — looping the BSP forever. Reachable any time a class is merged
+  // with one of its own descendants (e.g. an asserted f(a,b) = a).
   auto t2 = timings ? clk::now() : clk::time_point{};
   auto per_group = parlay::map(groups, [&](auto& kv) -> parlay::sequence<Id> {
     auto& values = kv.second;
     if (values.size() < 2) return {};
+    const Id root_ref = values[0].root;
+    bool all_same_root = parlay::all_of(
+        values, [root_ref](const CanonEntry& e) { return e.root == root_ref; });
+    if (all_same_root) return {};
     dnc_union(values, 0, values.size(), uf);
     return parlay::map(values, [](const CanonEntry& e) { return e.root; });
   });

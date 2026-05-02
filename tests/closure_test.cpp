@@ -189,6 +189,32 @@ bool test_par_vs_seq_agree() {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Regression: parent-class merged with descendant. Asserting f(a,b) = a
+// drops the f node into the same class as its own children. After
+// parallel_consolidate, parents_[R] = [class_of_f, class_of_f] (one ref
+// from each child slot), every CanonEntry in the resulting hash group
+// shares root R, and dnc_union is a no-op. Without the all_same_root
+// skip in semisort_common.hpp, next_work = [R] each round forever.
+// ---------------------------------------------------------------------------
+bool test_self_merge_no_loop() {
+  auto nodes = make_nodes({
+      ENode{"a", {}},          // 0
+      ENode{"b", {}},          // 1
+      ENode{"f", {0, 1}},      // 2 = f(a, b) — parent of both children
+  });
+  auto eg = std::make_unique<ConcurrentEGraph>(std::move(nodes));
+  parlay::sequence<std::pair<Id, Id>> eqs;
+  eqs.push_back({0, 1});  // a = b
+  eqs.push_back({2, 0});  // f(a, b) = a  — collapses parent into children
+  eg->parallel_close(std::move(eqs));  // must not loop
+
+  EXPECT(eg->equiv(0, 1));
+  EXPECT(eg->equiv(0, 2));
+  EXPECT(eg->equiv(1, 2));
+  return true;
+}
+
 }  // namespace
 
 int main() {
@@ -199,6 +225,7 @@ int main() {
       {"no_spurious_merges", test_no_spurious_merges},
       {"mixed_arity",        test_mixed_arity},
       {"par_vs_seq_agree",   test_par_vs_seq_agree},
+      {"self_merge_no_loop", test_self_merge_no_loop},
   };
 
   int passed = 0;
