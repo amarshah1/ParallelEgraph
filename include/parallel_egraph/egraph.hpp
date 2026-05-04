@@ -92,9 +92,23 @@ bool sigs_equal(std::uint32_t ia, std::uint32_t ib, UF& uf,
 
 // ---- EGraph ---------------------------------------------------------------
 
+// Tag type selecting the auxiliary state populated by the EGraph ctor.
+// The default (no tag) is the BSP layout — `parents_` populated, used by
+// `parallel_close`. The async layout populates `last_canon_` instead and
+// is used by `parallel_close_async_rounds`. Each closure path uses only
+// its own auxiliary state, so the bench can A/B compare without paying
+// for the wrong-flavor setup.
+struct async_t { explicit async_t() = default; };
+inline constexpr async_t async{};
+
 template <typename UF>
 class EGraph {
  public:
+  // BSP-flavor ctor: populate `parents_` (the inverted child→parent
+  // index used by the BSP frontier walk). Leaves `last_canon_` empty;
+  // calling `parallel_close_async_rounds` on an instance built this way
+  // is undefined.
+  //
   // Bulk-construct from a sequence of ENodes given in DAG order: the i-th
   // node receives class id i, and every child id in node i must be < i.
   // The caller is responsible for ensuring no two nodes are structurally
@@ -121,6 +135,22 @@ class EGraph {
     nodes_ = std::move(nodes);
   }
 
+  // Async-flavor ctor: skip `parents_` setup entirely; populate
+  // `last_canon_` with the per-term signature under the *initial* UF
+  // (every class is its own root). After `parallel_close_async_rounds`
+  // applies the initial unions, those terms whose children's roots
+  // moved will have a current signature ≠ last_canon_, so they enter
+  // the first round's dirty set. Calling `parallel_close` on an
+  // instance built this way is undefined: `parents_` is empty.
+  EGraph(parlay::sequence<ENode> nodes, async_t) : uf_(nodes.size()) {
+    const std::size_t n = nodes.size();
+    uf_.bulk_init(n);
+    nodes_ = std::move(nodes);
+    last_canon_ = parlay::tabulate(n, [&](std::size_t i) -> std::uint64_t {
+      return sig_hash(nodes_[i], uf_);
+    });
+  }
+
   // Lock-free for ConcurrentUnionFind; safe to call concurrently. Path
   // compression CAS is a write, so this is non-const.
   Id find(Id id) { return uf_.find_root(id); }
@@ -131,6 +161,25 @@ class EGraph {
   // explicit specialization on `ConcurrentUnionFind` — calling it on the
   // sequential flavor is a link error.
   void parallel_close(parlay::sequence<std::pair<Id, Id>> initial_unions);
+
+  // Async-style closure (still rounds-based for now). Drops the
+  // `parents_` machinery in favor of a per-term cached canonical
+  // signature: `last_canon_[i]` records the signature `nodes_[i]` had
+  // the last time it was sorted into a bucket. Each round:
+  //   (1) apply pending unions in parallel
+  //   (2) filter all non-leaf terms to those whose CURRENT canonical
+  //       signature differs from `last_canon_` — these are "dirty"
+  //   (3) semisort the dirty set by current signature; for each bucket
+  //       of size > 1, union all members onto bucket[0] in parallel
+  //   (4) update `last_canon_` for every dirty term
+  // Termination: the loop exits when a round produces zero new unions.
+  // Per the contract that we "must end on a clean semisort step", the
+  // last iteration runs the full sort-and-merge but finds nothing to
+  // do, which proves quiescence under the current (rounds-based)
+  // execution model. Defined out-of-line as an explicit specialization
+  // on `ConcurrentUnionFind`.
+  void parallel_close_async_rounds(
+      parlay::sequence<std::pair<Id, Id>> initial_unions);
 
   // Sequential Nelson-style closure baseline. Defined out-of-line only as
   // an explicit specialization on `SequentialUnionFind`.
@@ -143,11 +192,17 @@ class EGraph {
   UF& uf() { return uf_; }
   const parlay::sequence<ENode>& nodes() const { return nodes_; }
   parlay::sequence<parlay::sequence<Id>>& parents() { return parents_; }
+  parlay::sequence<std::uint64_t>& last_canon() { return last_canon_; }
 
  private:
   UF uf_;
   parlay::sequence<ENode> nodes_;
+  // BSP-only state. Populated by the default ctor; left empty by the
+  // async ctor.
   parlay::sequence<parlay::sequence<Id>> parents_;
+  // Async-only state. Populated by the `async_t`-tagged ctor; left
+  // empty by the default ctor.
+  parlay::sequence<std::uint64_t> last_canon_;
 };
 
 using ConcurrentEGraph = EGraph<ConcurrentUnionFind>;

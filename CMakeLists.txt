@@ -71,6 +71,7 @@ option(PE_SEMISORT_SOUND "Verify semisort equality with sigs_equal instead of se
 add_library(parallel_egraph_core STATIC
   src/unionfind.cpp
   src/egraph.cpp
+  src/egraph_async.cpp
   src/smtlib.cpp
   src/semisort.cpp
 )
