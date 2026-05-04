@@ -113,10 +113,23 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  auto eg = std::make_unique<pe::ConcurrentEGraph>(std::move(builder).take_nodes());
+  // PE_USE_ASYNC=1 picks the async-rounds closure (drops parents_,
+  // tracks per-term last-canonical-sig instead). Default is BSP.
+  const bool use_async = std::getenv("PE_USE_ASYNC") != nullptr;
+  auto nodes = std::move(builder).take_nodes();
+  std::unique_ptr<pe::ConcurrentEGraph> eg;
+  if (use_async) {
+    eg = std::make_unique<pe::ConcurrentEGraph>(std::move(nodes), pe::async);
+  } else {
+    eg = std::make_unique<pe::ConcurrentEGraph>(std::move(nodes));
+  }
   auto t_build = clk::now();
 
-  eg->parallel_close(std::move(equalities));
+  if (use_async) {
+    eg->parallel_close_async_rounds(std::move(equalities));
+  } else {
+    eg->parallel_close(std::move(equalities));
+  }
   auto t_close = clk::now();
 
   bool unsat = false;

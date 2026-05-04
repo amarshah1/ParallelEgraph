@@ -64,41 +64,35 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds(
     uf_.union_(initial_unions[i].first, initial_unions[i].second);
   });
 
+  // Build the list of non-leaf indices once. Leaves never need to be
+  // sorted — their canonical sig is just their op string and can never
+  // share a bucket with a non-leaf.
+  auto all_idx = parlay::iota<std::uint32_t>(static_cast<std::uint32_t>(n));
+  auto sort_idx = parlay::filter(all_idx, [&](std::uint32_t i) {
+    return !nodes_[i].children.empty();
+  });
+
   std::size_t round = 0;
   while (true) {
-    // ---- step 2: recompute current sigs and pick dirty terms -----------
+    // ---- step 2: recompute current sigs for every non-leaf term --------
+    //
+    // We have to recompute *and re-sort* over EVERY non-leaf term, not
+    // just those whose own sig changed since last round. The dirty
+    // filter is unsound: when union-by-rank picks term X's root as the
+    // new root, X's child-roots don't change, so X's sig stays put —
+    // but a sibling term Y whose child *did* get rerooted to X now has
+    // X's sig and needs to bucket with X. If we filtered out X (stable
+    // sig), Y wouldn't find a bucket-mate.
     auto t_canon = clk::now();
     auto current_canon = parlay::tabulate(n, [&](std::size_t i) -> std::uint64_t {
-      // Leaves' signatures are constant under any UF state (no children
-      // means find_root is never called); they'll always match
-      // last_canon_ and be filtered out, so we can skip the work.
       if (nodes_[i].children.empty()) return last_canon_[i];
       return sig_hash(nodes_[i], uf_);
     });
     double canon_ms = trace ? ms_since(t_canon) : 0.0;
 
-    auto t_filter = clk::now();
-    auto all_idx = parlay::iota<std::uint32_t>(static_cast<std::uint32_t>(n));
-    auto dirty = parlay::filter(all_idx, [&](std::uint32_t i) {
-      return current_canon[i] != last_canon_[i];
-    });
-    double filter_ms = trace ? ms_since(t_filter) : 0.0;
-
-    if (dirty.empty()) {
-      // Quiescence: every term's signature still matches the one we
-      // last published into a bucket. No new congruences possible.
-      if (trace) {
-        std::fprintf(stderr,
-                     "[pe-async] round=%3zu dirty=        0 canon=%7.3fms "
-                     "filter=%7.3fms (clean break)\n",
-                     round, canon_ms, filter_ms);
-      }
-      break;
-    }
-
-    // ---- step 3: semisort dirty by sig; union per bucket --------------
+    // ---- step 3: semisort all non-leaf terms by current sig -----------
     auto t_semisort = clk::now();
-    auto canon_entries = parlay::map(dirty, [&](std::uint32_t i) {
+    auto canon_entries = parlay::map(sort_idx, [&](std::uint32_t i) {
       // CanonEntry's trailing 4-byte field differs by build flag; both
       // shapes are populated correctly via the existing helper because
       // sig_hashes() returns the same primary-hash that sig_hash() does
@@ -133,12 +127,42 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds(
 #endif
     auto groups = parlay::group_by_key(keyed, hash_fn, equal_fn);
 
+    // PE_TRACE_VERBOSE=1: dump every non-leaf term being sorted + the
+    // bucket assignment so we can diagnose missed congruences. Only
+    // useful at small scale.
+    if (std::getenv("PE_TRACE_VERBOSE")) {
+      std::fprintf(stderr, "[pe-async-v] round=%zu non-leaf terms:\n", round);
+      for (std::size_t k = 0; k < sort_idx.size(); ++k) {
+        const std::uint32_t i = sort_idx[k];
+        std::fprintf(stderr, "  [%u] op='%s' children=[", i, nodes_[i].op.c_str());
+        for (std::size_t cc = 0; cc < nodes_[i].children.size(); ++cc) {
+          if (cc) std::fputs(",", stderr);
+          std::fprintf(stderr, "%u(root=%u)", nodes_[i].children[cc],
+                       uf_.find_root(nodes_[i].children[cc]));
+        }
+        std::fprintf(stderr, "] last_canon=0x%llx current_canon=0x%llx self_root=%u\n",
+                     (unsigned long long)last_canon_[i],
+                     (unsigned long long)current_canon[i],
+                     uf_.find_root(i));
+      }
+      std::fprintf(stderr, "[pe-async-v] round=%zu groups (%zu):\n",
+                   round, groups.size());
+      for (std::size_t g = 0; g < groups.size(); ++g) {
+        std::fprintf(stderr, "  group hash=0x%llx members=[",
+                     (unsigned long long)groups[g].first.hash);
+        for (std::size_t m = 0; m < groups[g].second.size(); ++m) {
+          if (m) std::fputs(",", stderr);
+          std::fprintf(stderr, "root=%u", groups[g].second[m].root);
+        }
+        std::fputs("]\n", stderr);
+      }
+    }
+
     // For every multi-member bucket whose elements don't already share
     // a single root, union all members. dnc_union handles the actual
     // CAS pattern (same as the BSP path uses). Track whether any
-    // bucket was non-trivial — if zero, the round was a no-op even
-    // though dirty was non-empty (signatures shifted but the unions
-    // they imply are already in place). That counts as quiescence.
+    // bucket was non-trivial — if zero, no unions fired this round and
+    // we're at fixpoint.
     std::atomic<std::size_t> nontrivial_buckets{0};
     parlay::parallel_for(0, groups.size(), [&](std::size_t g) {
       auto& bucket = groups[g].second;
@@ -152,10 +176,14 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds(
     });
     double semisort_ms = trace ? ms_since(t_semisort) : 0.0;
 
-    // ---- step 4: publish new last_canon_ for every dirty term ---------
+    // ---- step 4: publish new last_canon_ for every non-leaf term ------
+    // We have to update everyone we sorted, not just terms whose canon
+    // changed: same reason we sort everyone (a term's stable sig might
+    // have peers whose sigs caught up, so we need to mark "I just got
+    // published with this sig" universally).
     auto t_publish = clk::now();
-    parlay::parallel_for(0, dirty.size(), [&](std::size_t k) {
-      const std::uint32_t i = dirty[k];
+    parlay::parallel_for(0, sort_idx.size(), [&](std::size_t k) {
+      const std::uint32_t i = sort_idx[k];
       last_canon_[i] = current_canon[i];
     });
     double publish_ms = trace ? ms_since(t_publish) : 0.0;
@@ -163,15 +191,14 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds(
     const std::size_t nb = nontrivial_buckets.load(std::memory_order_relaxed);
     if (trace) {
       std::fprintf(stderr,
-                   "[pe-async] round=%3zu dirty=%9zu groups=%9zu "
-                   "merged=%9zu canon=%7.3fms filter=%7.3fms "
-                   "semisort=%7.3fms publish=%7.3fms\n",
-                   round, dirty.size(), groups.size(), nb,
-                   canon_ms, filter_ms, semisort_ms, publish_ms);
+                   "[pe-async] round=%3zu sort_idx=%9zu groups=%9zu "
+                   "merged=%9zu canon=%7.3fms semisort=%7.3fms "
+                   "publish=%7.3fms\n",
+                   round, sort_idx.size(), groups.size(), nb,
+                   canon_ms, semisort_ms, publish_ms);
     }
     if (nb == 0) {
-      // Sigs shifted but every bucket was already merged. The dirty
-      // filter caught up to a state where no new unions are produced.
+      // No bucket fired a real union this round → fixpoint.
       // Per the contract that we "must end on a clean semisort", this
       // round was the clean one — terminate.
       break;
