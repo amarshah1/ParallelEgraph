@@ -265,6 +265,19 @@ BuiltGraph<UF> build(Family f, std::size_t n, std::size_t g_arity) {
   return {std::move(eg), std::move(w.eqs), total, n_eqs};
 }
 
+// Async-flavor build: same workload generation, but the EGraph is
+// constructed via the async ctor (skips parents_, allocates
+// last_marked_). Used by bench_parallel_close_async; never called for
+// the BSP path. Only meaningful for ConcurrentUnionFind.
+template <typename UF>
+BuiltGraph<UF> build_async(Family f, std::size_t n, std::size_t g_arity) {
+  auto w = gen_workload(f, n, g_arity);
+  const std::size_t total = w.nodes.size();
+  const std::size_t n_eqs = w.eqs.size();
+  auto eg = std::make_unique<EGraph<UF>>(std::move(w.nodes), pe::async);
+  return {std::move(eg), std::move(w.eqs), total, n_eqs};
+}
+
 // Prints every node + initial union to stderr in a human-readable form.
 // One line per node:  "id: op(child_id, child_id, ...)" or "id: op  // leaf"
 // One line per union: "  union: a_id = b_id"
@@ -343,6 +356,24 @@ std::vector<double> bench_parallel_close(Family f, std::size_t n,
   return times;
 }
 
+std::vector<double> bench_parallel_close_async(Family f, std::size_t n,
+                                                std::size_t g_arity,
+                                                int warmup, int trials) {
+  for (int i = 0; i < warmup; ++i) {
+    auto g = build_async<ConcurrentUnionFind>(f, n, g_arity);
+    g.eg->parallel_close_async_rounds(std::move(g.eqs));
+  }
+  std::vector<double> times;
+  times.reserve(trials);
+  for (int i = 0; i < trials; ++i) {
+    auto g = build_async<ConcurrentUnionFind>(f, n, g_arity);
+    auto t0 = clk::now();
+    g.eg->parallel_close_async_rounds(std::move(g.eqs));
+    times.push_back(elapsed_ms(t0));
+  }
+  return times;
+}
+
 // ---- Env parsing ----------------------------------------------------------
 
 std::vector<std::string> split_csv(const std::string& s) {
@@ -372,6 +403,12 @@ int main() {
   const bool csv_header = std::getenv("PE_BENCH_HEADER") != nullptr;
   const char* dnc_cutoff_env  = std::getenv("PE_DNC_CUTOFF");
   const std::string dnc_cutoff  = dnc_cutoff_env  ? dnc_cutoff_env  : "16";
+  // PE_USE_ASYNC=1 picks parallel_close_async_rounds (mark-based dirty
+  // filter, no parents_) instead of the BSP parallel_close. CSV
+  // `algorithm` tag becomes `par_close_async` so downstream plots can
+  // distinguish.
+  const bool use_async = std::getenv("PE_USE_ASYNC") != nullptr;
+  const char* par_algo_tag = use_async ? "par_close_async" : "par_close";
 
   // PE_SYNTH_D = decomposition rate / g-tree fan-in (>= 2). Default 2 is
   // the historical balanced binary tree. Larger d → shallower tree,
@@ -492,12 +529,14 @@ int main() {
         nel = bench_nelson(f, n, g_arity, warmup, trials);
         mn = median(nel);
       }
-      auto par = bench_parallel_close(f, n, g_arity, warmup, trials);
+      auto par = use_async
+          ? bench_parallel_close_async(f, n, g_arity, warmup, trials)
+          : bench_parallel_close(f, n, g_arity, warmup, trials);
       double mp = median(par);
 
       if (csv) {
         if (!skip_nelson) emit_csv(f, n, classes, merges, "nelson_seq", nel);
-        emit_csv(f, n, classes, merges, "par_close", par);
+        emit_csv(f, n, classes, merges, par_algo_tag, par);
       } else if (skip_nelson) {
         std::printf("%-8s %5zu %10zu %9zu |   skipped  | %9.2fms\n",
                     family_name(f), n, classes, merges, mp);
