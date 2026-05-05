@@ -134,6 +134,58 @@ bool test_mixed_arity() {
 // ---------------------------------------------------------------------------
 // par_close and sequential_close_nelson agree on a randomly-shaped input.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// sequential_close_topo agrees with Nelson on the synthetic benchmark
+// shape (initial unions only between leaves, function nodes referencing
+// only the level immediately below). Same hand-built input as
+// par_vs_seq_agree, plus the topo path.
+// ---------------------------------------------------------------------------
+bool test_topo_agrees_with_nelson() {
+  auto build_nodes = []() {
+    return make_nodes({
+        ENode{"a", {}},        // 0
+        ENode{"b", {}},        // 1
+        ENode{"c", {}},        // 2
+        ENode{"d", {}},        // 3
+        ENode{"e", {}},        // 4
+        ENode{"g", {}},        // 5
+        ENode{"f", {0, 1}},    // 6 = f(a, b)
+        ENode{"f", {2, 3}},    // 7 = f(c, d)
+        ENode{"h", {0, 1, 4}}, // 8 = h(a, b, e)
+        ENode{"h", {2, 3, 5}}, // 9 = h(c, d, g)
+        ENode{"k", {6}},       // 10 = k(f(a,b))
+        ENode{"k", {7}},       // 11 = k(f(c,d))
+    });
+  };
+  auto unions = []() {
+    parlay::sequence<std::pair<Id, Id>> eqs;
+    eqs.push_back({0, 2});  // a = c
+    eqs.push_back({1, 3});  // b = d
+    eqs.push_back({4, 5});  // e = g
+    return eqs;
+  };
+
+  auto eg_nel = std::make_unique<SequentialEGraph>(build_nodes());
+  eg_nel->sequential_close_nelson(unions());
+
+  auto eg_top = std::make_unique<SequentialEGraph>(build_nodes());
+  eg_top->sequential_close_topo(unions());
+
+  for (Id i = 0; i < 12; ++i) {
+    for (Id j = i + 1; j < 12; ++j) {
+      bool n = eg_nel->equiv(i, j);
+      bool t = eg_top->equiv(i, j);
+      if (n != t) {
+        std::fprintf(stderr,
+                     "FAIL nelson/topo disagree on (%u, %u): nel=%d topo=%d\n",
+                     i, j, int(n), int(t));
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 bool test_par_vs_seq_agree() {
   // 6 leaves, plus binary + ternary fn nodes to exercise variable arity
   auto build_nodes = []() {
@@ -225,6 +277,7 @@ int main() {
       {"no_spurious_merges", test_no_spurious_merges},
       {"mixed_arity",        test_mixed_arity},
       {"par_vs_seq_agree",   test_par_vs_seq_agree},
+      {"topo_agrees",        test_topo_agrees_with_nelson},
       {"self_merge_no_loop", test_self_merge_no_loop},
   };
 

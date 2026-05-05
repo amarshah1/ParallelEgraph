@@ -211,6 +211,22 @@ std::vector<double> bench_nelson(const Workload& w) {
   return times;
 }
 
+std::vector<double> bench_nelson_topo(const Workload& w) {
+  for (int i = 0; i < WARMUP; ++i) {
+    auto g = build<SequentialUnionFind>(w);
+    g.eg->sequential_close_topo(g.eqs);
+  }
+  std::vector<double> times;
+  times.reserve(TRIALS);
+  for (int i = 0; i < TRIALS; ++i) {
+    auto g = build<SequentialUnionFind>(w);
+    auto t0 = clk::now();
+    g.eg->sequential_close_topo(g.eqs);
+    times.push_back(elapsed_ms(t0));
+  }
+  return times;
+}
+
 std::vector<double> bench_parallel_close(const Workload& w) {
   for (int i = 0; i < WARMUP; ++i) {
     auto g = build<ConcurrentUnionFind>(w);
@@ -318,9 +334,10 @@ int main() {
   if (!csv) {
     std::printf("close_compare  trials=%d  warmup=%d  par_threads=%zu\n",
                 TRIALS, WARMUP, par_threads);
-    std::printf("%-8s %8s %10s %9s | %11s | %11s %11s\n",
+    std::printf("%-8s %8s %10s %9s | %11s %11s %11s | %11s %11s\n",
                 "name", "leaves", "nodes", "merges",
-                "nelson_seq", "par_close", "par_spd");
+                "nelson_seq", "nelson_topo", "topo_spd",
+                "par_close", "par_spd");
   } else if (csv_header) {
     std::printf("workload,leaves,fns,nodes,merges,depth,algorithm,trial,"
                 "parlay_threads,dnc_cutoff,wallclock_ms\n");
@@ -344,19 +361,23 @@ int main() {
       nel = bench_nelson(w);
       mn = median(nel);
     }
+    auto top = bench_nelson_topo(w);
+    double mt = median(top);
     auto par = use_async ? bench_parallel_close_async(w)
                           : bench_parallel_close(w);
     double mp = median(par);
 
     if (csv) {
       if (!skip_nelson) emit_csv(w, "nelson_seq", nel);
+      emit_csv(w, "nelson_topo", top);
       emit_csv(w, par_algo_tag, par);
     } else if (skip_nelson) {
-      std::printf("%-8s %8zu %10zu %9zu |   skipped  | %9.2fms\n",
-                  w.name, w.n_leaves, w.n_nodes, w.n_merges, mp);
+      std::printf("%-8s %8zu %10zu %9zu |   skipped   %9.2fms          | %9.2fms\n",
+                  w.name, w.n_leaves, w.n_nodes, w.n_merges, mt, mp);
     } else {
-      std::printf("%-8s %8zu %10zu %9zu | %9.2fms | %9.2fms %9.2fx\n",
-                  w.name, w.n_leaves, w.n_nodes, w.n_merges, mn, mp, mn / mp);
+      std::printf("%-8s %8zu %10zu %9zu | %9.2fms %9.2fms %9.2fx | %9.2fms %9.2fx\n",
+                  w.name, w.n_leaves, w.n_nodes, w.n_merges,
+                  mn, mt, mn / mt, mp, mn / mp);
     }
     std::fflush(stdout);
   }

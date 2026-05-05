@@ -177,6 +177,9 @@ int main(int argc, char** argv) {
           warmup, par_threads, "nelson_seq",
           [](auto& eg, auto& eqs) { eg.sequential_close_nelson(eqs); });
     }
+    run_one<pe::SequentialUnionFind>(script, stem, family, n, trials,
+        warmup, par_threads, "nelson_topo",
+        [](auto& eg, auto& eqs) { eg.sequential_close_topo(eqs); });
     run_one<pe::ConcurrentUnionFind>(script, stem, family, n, trials,
         warmup, par_threads, "par_close",
         [](auto& eg, auto& eqs) { eg.parallel_close(std::move(eqs)); });

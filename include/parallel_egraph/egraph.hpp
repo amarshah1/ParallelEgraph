@@ -197,6 +197,15 @@ class EGraph {
   void sequential_close_nelson(
       const parlay::sequence<std::pair<Id, Id>>& initial_unions);
 
+  // Single-pass sequential closure: walks `nodes_` in reverse topological
+  // order (children before parents — guaranteed by the EGraph ctor's DAG-
+  // order invariant, so plain forward index iteration suffices) and
+  // canonicalizes each node's signature once. Each repeated signature
+  // unions the current node's class with the prior one. Defined
+  // out-of-line as an explicit specialization on `SequentialUnionFind`.
+  void sequential_close_topo(
+      const parlay::sequence<std::pair<Id, Id>>& initial_unions);
+
   bool equiv(Id a, Id b) { return uf_.find_root(a) == uf_.find_root(b); }
 
   // Internal but exposed for tests / benches that need raw access.

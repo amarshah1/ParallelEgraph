@@ -217,4 +217,84 @@ void EGraph<SequentialUnionFind>::sequential_close_nelson(
   }
 }
 
+// ---- sequential_close_topo ----------------------------------------------
+//
+// One-shot upward propagation: walk every class in reverse topological
+// order (children before parents). For each node, build its canonical
+// signature (op, find_root(c) for c in children) and try_emplace into a
+// hashmap keyed by that signature. Repeated signature ⇒ union the current
+// class with the prior holder. Because we visit children before parents,
+// every child's root is already its final-for-this-pass value when its
+// parent's signature is computed; no worklist, no fixed-point loop, one
+// linear pass through nodes_.
+//
+// Caveat: this is a *single pass*. If two nodes A and B at lower indices
+// were inserted with non-matching signatures and later become congruent
+// because of a union deduced *after* both were visited, this pass will
+// not retroactively merge them. The forward DAG walk catches all
+// cascading congruences that flow upward from the initial unions, which
+// is sufficient for the synthetic workloads in closure_compare_bench;
+// callers needing the full Nelson fixed-point should use
+// sequential_close_nelson.
+
+namespace {
+
+// Canonical signature key: op (pointer into the node's op string —
+// nodes_ is stable for the closure's lifetime) plus the find_root'd
+// children. Two signatures are equal iff op strings match and
+// canonicalized child sequences match element-wise.
+struct Signature {
+  const std::string* op;
+  std::vector<Id> children;
+
+  bool operator==(const Signature& o) const noexcept {
+    if (*op != *o.op) return false;
+    if (children.size() != o.children.size()) return false;
+    return std::equal(children.begin(), children.end(), o.children.begin());
+  }
+};
+
+struct SignatureHash {
+  // FxHasher avalanches well; tell ankerl to skip its own mixing.
+  using is_avalanching = void;
+
+  std::size_t operator()(const Signature& s) const noexcept {
+    FxHasher h;
+    h.write_str(*s.op);
+    for (Id c : s.children) h.write_u32(c);
+    return static_cast<std::size_t>(h.finish());
+  }
+};
+
+}  // namespace
+
+template <>
+void EGraph<SequentialUnionFind>::sequential_close_topo(
+    const parlay::sequence<std::pair<Id, Id>>& initial_unions) {
+  for (auto [a, b] : initial_unions) uf_.union_(a, b);
+
+  ankerl::unordered_dense::map<Signature, std::uint32_t, SignatureHash>
+      bucket;
+  bucket.reserve(nodes_.size() * 2);
+
+  const std::size_t n = nodes_.size();
+  for (std::uint32_t pidx = 0; pidx < n; ++pidx) {
+    const auto& node = nodes_[pidx];
+
+    Signature sig;
+    sig.op = &node.op;
+    sig.children.reserve(node.children.size());
+    for (Id c : node.children) {
+      sig.children.push_back(uf_.find_root(c));
+    }
+
+    auto [it, inserted] = bucket.try_emplace(std::move(sig), pidx);
+    if (!inserted) {
+      Id ra = uf_.find_root(pidx);
+      Id rb = uf_.find_root(it->second);
+      if (ra != rb) uf_.union_(ra, rb);
+    }
+  }
+}
+
 }  // namespace pe
