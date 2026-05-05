@@ -172,11 +172,23 @@ def _median_ms(rows: list[dict[str, str]],
     return {k: median(v) for k, v in buckets.items() if v}
 
 
-def plot_speedup_random(csv_path: Path, out_dir: Path):
-    """X=threads, Y=nelson_T1/par_T, color=workload name."""
+def plot_speedup_random(csv_path: Path, out_dir: Path,
+                         par_algo: str = "par_close",
+                         out_name: str | None = None):
+    """X=threads, Y=nelson_T1/par_T, color=workload name.
+
+    `par_algo` selects which parallel algorithm column to use as the
+    numerator in the speedup ratio: "par_close" (BSP, default) or
+    "par_close_async" (async-rounds). Output filename is derived from
+    `par_algo` unless `out_name` is given.
+    """
     if not csv_path.exists():
         return
-    if _should_skip(out_dir / "random_speedup.png"):
+    if out_name is None:
+        out_name = ("random_speedup.png" if par_algo == "par_close"
+                    else f"random_speedup_{par_algo}.png")
+    out_path = out_dir / out_name
+    if _should_skip(out_path):
         return
     rows = _read_csv(csv_path)
     # closure_compare_bench's CSV uses `workload` as the per-row label.
@@ -184,12 +196,14 @@ def plot_speedup_random(csv_path: Path, out_dir: Path):
     # Per (name, algorithm, threads) -> median ms
     par = _median_ms(rows,
         key_fn=lambda r: (r[name_col], int(r["parlay_threads"]))
-            if r["algorithm"] == "par_close" else None,
+            if r["algorithm"] == par_algo else None,
         ms_field="wallclock_ms")
     nel = _median_ms(rows,
         key_fn=lambda r: (r[name_col], int(r["parlay_threads"]))
             if r["algorithm"] == "nelson_seq" else None,
         ms_field="wallclock_ms")
+    if not par:
+        return  # nothing to plot for this algorithm
     # Nelson is sequential; closure_compare runs it at every thread
     # count anyway. Take the min thread's median as the baseline (or
     # any — they should match within noise).
@@ -226,19 +240,21 @@ def plot_speedup_random(csv_path: Path, out_dir: Path):
     ax.set_xscale("log", base=2); ax.set_yscale("log", base=2)
     ax.set_xticks(threads); ax.set_xticklabels([str(t) for t in threads])
     ax.set_xlabel("threads")
-    ax.set_ylabel("speedup (nelson_seq / par_close)")
-    ax.set_title("random — strong-scaling speedup vs sequential")
+    ax.set_ylabel(f"speedup (nelson_seq / {par_algo})")
+    ax.set_title(f"random — strong-scaling speedup vs sequential ({par_algo})")
     ax.grid(True, which="both", alpha=0.3)
     ax.legend(fontsize=8, loc="best")
-    _save(fig, out_dir / "random_speedup.png")
+    _save(fig, out_path)
 
 
 def _plot_synth_like_speedup(csv_path: Path, out_dir: Path,
-                              fig_name: str, title: str):
+                              fig_name: str, title: str,
+                              par_algo: str = "par_close"):
     """Common (synthetic / cube_decomp) speedup plot.
 
     color = (family, n) and linestyle/marker = d. nelson_seq is run at
     one thread count per (family, n, d) — we use that as the baseline.
+    `par_algo` selects "par_close" (BSP, default) or "par_close_async".
     """
     if not csv_path.exists():
         return
@@ -258,12 +274,15 @@ def _plot_synth_like_speedup(csv_path: Path, out_dir: Path,
             ms  = float(r["wallclock_ms"])
         except (KeyError, ValueError):
             continue
-        if r["algorithm"] == "par_close":
+        if r["algorithm"] == par_algo:
             par_buckets[(fam, n, d, t)].append(ms)
         elif r["algorithm"] == "nelson_seq":
             nel_buckets[(fam, n, d)].append(ms)
     par_med = {k: median(v) for k, v in par_buckets.items()}
     nel_med = {k: median(v) for k, v in nel_buckets.items()}
+
+    if not par_med:
+        return  # no rows for this algorithm
 
     threads = sorted({t for (_, _, _, t) in par_med})
     if not threads:
@@ -303,36 +322,57 @@ def _plot_synth_like_speedup(csv_path: Path, out_dir: Path,
     ax.set_xscale("log", base=2); ax.set_yscale("log", base=2)
     ax.set_xticks(threads); ax.set_xticklabels([str(t) for t in threads])
     ax.set_xlabel("threads")
-    ax.set_ylabel("speedup (nelson_seq / par_close)")
+    ax.set_ylabel(f"speedup (nelson_seq / {par_algo})")
     ax.set_title(title)
     ax.grid(True, which="both", alpha=0.3)
     ax.legend(fontsize=7, loc="best", ncol=2)
     _save(fig, out_dir / fig_name)
 
 
-def plot_speedup_synthetic(csv_path: Path, out_dir: Path):
+def plot_speedup_synthetic(csv_path: Path, out_dir: Path,
+                            par_algo: str = "par_close"):
+    suffix = "" if par_algo == "par_close" else f"_{par_algo}"
     _plot_synth_like_speedup(csv_path, out_dir,
-        fig_name="synthetic_speedup.png",
-        title="synthetic — speedup vs nelson_seq (color=(family,n), style=d)")
+        fig_name=f"synthetic_speedup{suffix}.png",
+        title=f"synthetic — speedup vs nelson_seq, {par_algo} "
+              f"(color=(family,n), style=d)",
+        par_algo=par_algo)
 
 
-def plot_speedup_cube_decomp(csv_path: Path, out_dir: Path):
+def plot_speedup_cube_decomp(csv_path: Path, out_dir: Path,
+                              par_algo: str = "par_close"):
+    suffix = "" if par_algo == "par_close" else f"_{par_algo}"
     _plot_synth_like_speedup(csv_path, out_dir,
-        fig_name="cube_decomp_speedup.png",
-        title="cube_decomp — speedup vs nelson_seq (color=(cube,k), style=d)")
+        fig_name=f"cube_decomp_speedup{suffix}.png",
+        title=f"cube_decomp — speedup vs nelson_seq, {par_algo} "
+              f"(color=(cube,k), style=d)",
+        par_algo=par_algo)
 
 
-def plot_speedup_egg(csv_path: Path, out_dir: Path, top_n: int):
+def plot_speedup_egg(csv_path: Path, out_dir: Path, top_n: int,
+                      par_algo: str = "par_close"):
     """Egg has no nelson baseline → use self-relative (T1/T) on top-N
-    longest-close files."""
+    longest-close files. `par_algo` selects which algorithm's rows to
+    use (par_close = BSP, par_close_async = async).
+
+    egg.csv before --also-async had no `algorithm` column; this function
+    handles both schemas: if no `algorithm` column is present, every
+    row is treated as par_close.
+    """
     if not csv_path.exists():
         return
-    if _should_skip(out_dir / "egg_speedup.png"):
+    suffix = "" if par_algo == "par_close" else f"_{par_algo}"
+    out_path = out_dir / f"egg_speedup{suffix}.png"
+    if _should_skip(out_path):
         return
     rows = _read_csv(csv_path)
 
+    has_algo_col = bool(rows) and "algorithm" in rows[0]
+
     buckets: dict[tuple[str, int], list[float]] = defaultdict(list)
     for r in rows:
+        if has_algo_col and r.get("algorithm", "par_close") != par_algo:
+            continue
         try:
             f = r["file"]; t = int(r["threads"])
             close = float(r["close_s"])
@@ -342,6 +382,8 @@ def plot_speedup_egg(csv_path: Path, out_dir: Path, top_n: int):
             continue
         buckets[(f, t)].append(close)
     close_med = {k: median(v) for k, v in buckets.items()}
+    if not close_med:
+        return
     threads = sorted({t for (_, t) in close_med})
     if not threads:
         return
@@ -377,11 +419,12 @@ def plot_speedup_egg(csv_path: Path, out_dir: Path, top_n: int):
     ax.set_xscale("log", base=2); ax.set_yscale("log", base=2)
     ax.set_xticks(threads); ax.set_xticklabels([str(t) for t in threads])
     ax.set_xlabel("threads")
-    ax.set_ylabel("self-relative speedup (T1 / T)")
-    ax.set_title(f"egg — top-{top_n} longest-close files (self-relative)")
+    ax.set_ylabel(f"self-relative speedup (T1 / T) — {par_algo}")
+    ax.set_title(f"egg — top-{top_n} longest-close files, {par_algo} "
+                 "(self-relative)")
     ax.grid(True, which="both", alpha=0.3)
     ax.legend(fontsize=7, loc="best", ncol=2)
-    _save(fig, out_dir / "egg_speedup.png")
+    _save(fig, out_path)
 
 
 # ---- (C) per-round time lines ---------------------------------------------
@@ -569,12 +612,35 @@ def main():
     plot_trace_bars(run_dir / "cube_decomp_trace.csv", figs, "cube_decomp")
     plot_trace_bars(run_dir / "egg_trace.csv", figs, "egg")
 
-    # (B) log-log speedup
+    # (B) log-log speedup. Each phase gets a BSP plot. If the phase's
+    # CSV also contains async rows (from --also-async runs), an async
+    # plot is generated alongside.
     print("[B] speedup vs threads")
-    plot_speedup_random(run_dir / "random.csv", figs)
-    plot_speedup_synthetic(run_dir / "synthetic.csv", figs)
-    plot_speedup_cube_decomp(run_dir / "cube_decomp.csv", figs)
-    plot_speedup_egg(run_dir / "egg.csv", figs, args.top_n)
+
+    def _has_async(csv: Path) -> bool:
+        if not csv.exists():
+            return False
+        try:
+            return any(r.get("algorithm") == "par_close_async"
+                       for r in _read_csv(csv))
+        except Exception:
+            return False
+
+    for csv_name, plot_fn in [
+        ("random.csv",      plot_speedup_random),
+        ("synthetic.csv",   plot_speedup_synthetic),
+        ("cube_decomp.csv", plot_speedup_cube_decomp),
+    ]:
+        csv = run_dir / csv_name
+        plot_fn(csv, figs)  # BSP
+        if _has_async(csv):
+            plot_fn(csv, figs, par_algo="par_close_async")
+
+    egg_csv = run_dir / "egg.csv"
+    plot_speedup_egg(egg_csv, figs, args.top_n)
+    if _has_async(egg_csv):
+        plot_speedup_egg(egg_csv, figs, args.top_n,
+                         par_algo="par_close_async")
 
     # (C) per-round time
     print("[C] per-round time lines")

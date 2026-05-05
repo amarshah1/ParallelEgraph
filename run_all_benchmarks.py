@@ -347,18 +347,28 @@ def run_random(out_dir: Path, thread_counts: list[int],
     binary = "./build/closure_compare_bench"
     first = True
     all_trace_rows: list[list] = []
-    # Pass spec: (label, env_overrides). BSP first (carries nelson),
-    # then async (parallel-only, no double-counting of nelson).
-    passes: list[tuple[str, dict[str, str]]] = [("bsp", {})]
-    if also_async:
-        passes.append(("async", {
-            "PE_USE_ASYNC": "1",
-            "PE_BENCH_SKIP_NELSON": "1",
-        }))
     with open(csv_path, "w") as csv_out:
-        for t in thread_counts:
+        for i, t in enumerate(thread_counts):
+            # nelson_seq is sequential — its time doesn't depend on
+            # PARLAY_NUM_THREADS. Run it only on the first thread count
+            # for each (workload) and skip on subsequent thread counts
+            # via PE_BENCH_SKIP_NELSON=1.
+            bsp_skip_nelson = i > 0
+            passes: list[tuple[str, dict[str, str]]] = [
+                ("bsp", {"PE_BENCH_SKIP_NELSON": "1"} if bsp_skip_nelson
+                        else {}),
+            ]
+            if also_async:
+                passes.append(("async", {
+                    "PE_USE_ASYNC": "1",
+                    "PE_BENCH_SKIP_NELSON": "1",
+                }))
             for pass_label, pass_env in passes:
-                print(f"  [random] threads={t} ({pass_label})", flush=True)
+                tag = ""
+                if pass_label == "bsp":
+                    tag = " (par_only)" if bsp_skip_nelson else " (+nelson)"
+                print(f"  [random] threads={t} ({pass_label}{tag})",
+                      flush=True)
                 env = os.environ.copy()
                 env["PE_BENCH_FORMAT"] = "csv"
                 if first:
