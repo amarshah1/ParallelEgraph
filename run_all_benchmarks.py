@@ -324,7 +324,8 @@ def run_random_xl(out_dir: Path, thread_counts: list[int],
     print(f"  → {trace_csv_path}  ({len(all_trace_rows)} rows)")
 
 
-def run_random(out_dir: Path, thread_counts: list[int]):
+def run_random(out_dir: Path, thread_counts: list[int],
+               also_async: bool = False):
     """closure_compare_bench with PE_BENCH_FORMAT=csv at each thread count.
 
     The binary runs all 6 baked-in workloads in one invocation. Header is
@@ -332,6 +333,11 @@ def run_random(out_dir: Path, thread_counts: list[int]):
     Per-round PE_TRACE output is captured to random_traces/T<n>.log AND
     parsed into random_trace.csv (one row per workload×thread×round trial)
     so the existing per-round bar-chart plotter can consume it.
+
+    When `also_async`, runs a second pass per thread count with
+    PE_USE_ASYNC=1 and PE_BENCH_SKIP_NELSON=1 so the async closure is
+    timed alongside BSP. The CSV's `algorithm` column distinguishes them
+    (nelson_seq / par_close / par_close_async).
     """
     csv_path = out_dir / "random.csv"
     trace_csv_path = out_dir / "random_trace.csv"
@@ -341,30 +347,41 @@ def run_random(out_dir: Path, thread_counts: list[int]):
     binary = "./build/closure_compare_bench"
     first = True
     all_trace_rows: list[list] = []
+    # Pass spec: (label, env_overrides). BSP first (carries nelson),
+    # then async (parallel-only, no double-counting of nelson).
+    passes: list[tuple[str, dict[str, str]]] = [("bsp", {})]
+    if also_async:
+        passes.append(("async", {
+            "PE_USE_ASYNC": "1",
+            "PE_BENCH_SKIP_NELSON": "1",
+        }))
     with open(csv_path, "w") as csv_out:
         for t in thread_counts:
-            print(f"  [random] threads={t}", flush=True)
-            env = os.environ.copy()
-            env["PE_BENCH_FORMAT"] = "csv"
-            if first:
-                env["PE_BENCH_HEADER"] = "1"
-            env["PE_TRACE"] = "1"
-            env["PARLAY_NUM_THREADS"] = str(t)
-            t0 = time.perf_counter()
-            proc = subprocess.run(NUMACTL_PREFIX + [binary],
-                                  capture_output=True, text=True, env=env)
-            wall = time.perf_counter() - t0
-            if proc.returncode != 0:
-                sys.stderr.write(proc.stderr)
-                raise RuntimeError(f"closure_compare_bench failed at T={t}")
-            csv_out.write(proc.stdout)
-            csv_out.flush()
-            (trace_dir / f"T{t}.log").write_text(proc.stderr)
-            all_trace_rows.extend(parse_trace_log(
-                proc.stderr, threads=t, workload_re=RANDOM_BANNER_RE))
-            first = False
-            print(f"    wrote {trace_dir / f'T{t}.log'}  ({wall:.1f}s)",
-                  flush=True)
+            for pass_label, pass_env in passes:
+                print(f"  [random] threads={t} ({pass_label})", flush=True)
+                env = os.environ.copy()
+                env["PE_BENCH_FORMAT"] = "csv"
+                if first:
+                    env["PE_BENCH_HEADER"] = "1"
+                env["PE_TRACE"] = "1"
+                env["PARLAY_NUM_THREADS"] = str(t)
+                env.update(pass_env)
+                t0 = time.perf_counter()
+                proc = subprocess.run(NUMACTL_PREFIX + [binary],
+                                      capture_output=True, text=True, env=env)
+                wall = time.perf_counter() - t0
+                if proc.returncode != 0:
+                    sys.stderr.write(proc.stderr)
+                    raise RuntimeError(
+                        f"closure_compare_bench failed at T={t} {pass_label}")
+                csv_out.write(proc.stdout)
+                csv_out.flush()
+                (trace_dir / f"T{t}_{pass_label}.log").write_text(proc.stderr)
+                all_trace_rows.extend(parse_trace_log(
+                    proc.stderr, threads=t, workload_re=RANDOM_BANNER_RE))
+                first = False
+                print(f"    wrote {trace_dir / f'T{t}_{pass_label}.log'} "
+                      f"({wall:.1f}s)", flush=True)
 
     with open(trace_csv_path, "w", newline="") as f:
         w = csvmod.writer(f)
@@ -388,13 +405,20 @@ SYNTH_FAMILY_NS = {
 }
 
 
-def run_synthetic(out_dir: Path, thread_counts: list[int]):
+def run_synthetic(out_dir: Path, thread_counts: list[int],
+                  also_async: bool = False):
     """synthetic_bench binary, one invocation per (family, n, threads).
 
     Per-round PE_TRACE output is captured per-invocation to
     synthetic_traces/<family>/<family>_n<N>_T<thr>.log AND merged into
     synthetic_trace.csv with workload="<family>_n<N>" so the bar-chart
     plotter can consume it.
+
+    When `also_async`, runs a second invocation per (family, n, threads)
+    with PE_USE_ASYNC=1 and PE_BENCH_SKIP_NELSON=1 — nelson is captured
+    once in the BSP pass per (family, n) so the async pass always skips
+    it. CSV's `algorithm` column distinguishes par_close vs
+    par_close_async.
     """
     csv_path = out_dir / "synthetic.csv"
     trace_csv_path = out_dir / "synthetic_trace.csv"
@@ -410,35 +434,52 @@ def run_synthetic(out_dir: Path, thread_counts: list[int]):
             (trace_root / fam).mkdir(parents=True, exist_ok=True)
             for n in ns:
                 for t in thread_counts:
+                    # Pass spec: (label, extra_env). BSP first (may carry
+                    # nelson on the first thread count for this (fam,n));
+                    # async second, always parallel-only.
                     skip_nelson = (fam, n) in nelson_done
-                    label = f"+nelson" if not skip_nelson else "par_only"
-                    print(f"  [synthetic] {fam} n={n} threads={t} ({label})",
-                          flush=True)
-                    env = os.environ.copy()
-                    env["PE_SYNTH_FAMILIES"] = fam
-                    env["PE_SYNTH_NS"] = str(n)
-                    env["PE_BENCH_FORMAT"] = "csv"
-                    if first:
-                        env["PE_BENCH_HEADER"] = "1"
-                    if skip_nelson:
-                        env["PE_BENCH_SKIP_NELSON"] = "1"
-                    env["PE_TRACE"] = "1"
-                    env["PARLAY_NUM_THREADS"] = str(t)
-                    proc = subprocess.run(NUMACTL_PREFIX + [binary],
-                                          capture_output=True,
-                                          text=True, env=env)
-                    if proc.returncode != 0:
-                        sys.stderr.write(proc.stderr)
-                        raise RuntimeError(
-                            f"synthetic_bench failed at {fam} n={n} T={t}")
-                    csv_out.write(proc.stdout)
-                    csv_out.flush()
-                    trace_path = trace_root / fam / f"{fam}_n{n}_T{t}.log"
-                    trace_path.write_text(proc.stderr)
-                    all_trace_rows.extend(parse_trace_log(
-                        proc.stderr, threads=t,
-                        default_workload=f"{fam}_n{n}"))
-                    first = False
+                    bsp_label = "+nelson" if not skip_nelson else "par_only"
+                    passes: list[tuple[str, dict[str, str], str]] = [
+                        ("bsp", {} if not skip_nelson else
+                                {"PE_BENCH_SKIP_NELSON": "1"},
+                         bsp_label),
+                    ]
+                    if also_async:
+                        passes.append(("async", {
+                            "PE_USE_ASYNC": "1",
+                            "PE_BENCH_SKIP_NELSON": "1",
+                        }, "async"))
+                    for pass_label, pass_env, status in passes:
+                        print(f"  [synthetic] {fam} n={n} threads={t} "
+                              f"({pass_label} {status})", flush=True)
+                        env = os.environ.copy()
+                        env["PE_SYNTH_FAMILIES"] = fam
+                        env["PE_SYNTH_NS"] = str(n)
+                        env["PE_BENCH_FORMAT"] = "csv"
+                        if first:
+                            env["PE_BENCH_HEADER"] = "1"
+                        env["PE_TRACE"] = "1"
+                        env["PARLAY_NUM_THREADS"] = str(t)
+                        env.update(pass_env)
+                        proc = subprocess.run(NUMACTL_PREFIX + [binary],
+                                              capture_output=True,
+                                              text=True, env=env)
+                        if proc.returncode != 0:
+                            sys.stderr.write(proc.stderr)
+                            raise RuntimeError(
+                                f"synthetic_bench failed at {fam} n={n} "
+                                f"T={t} {pass_label}")
+                        csv_out.write(proc.stdout)
+                        csv_out.flush()
+                        trace_name = (f"{fam}_n{n}_T{t}_{pass_label}.log"
+                                      if also_async
+                                      else f"{fam}_n{n}_T{t}.log")
+                        trace_path = trace_root / fam / trace_name
+                        trace_path.write_text(proc.stderr)
+                        all_trace_rows.extend(parse_trace_log(
+                            proc.stderr, threads=t,
+                            default_workload=f"{fam}_n{n}"))
+                        first = False
                     nelson_done.add((fam, n))
 
     with open(trace_csv_path, "w", newline="") as f:
@@ -460,7 +501,8 @@ CUBE_DECOMP_DS = [2, 3, 4, 5]
 CUBE_DECOMP_KS = [5, 55, 105, 155]
 
 
-def run_cube_decomp(out_dir: Path, thread_counts: list[int]):
+def run_cube_decomp(out_dir: Path, thread_counts: list[int],
+                    also_async: bool = False):
     """synthetic_bench (cube only) swept over d ∈ CUBE_DECOMP_DS and
     k ∈ CUBE_DECOMP_KS at every thread count. CSV row schema matches
     synthetic.csv (same binary), with the `d` column carrying the axis.
@@ -468,6 +510,10 @@ def run_cube_decomp(out_dir: Path, thread_counts: list[int]):
 
     nelson_seq runs once per (d, k) on the first thread count; subsequent
     thread counts skip nelson via PE_BENCH_SKIP_NELSON=1.
+
+    When `also_async`, each (d, k, threads) cell does a second invocation
+    with PE_USE_ASYNC=1, always skipping nelson (already captured by
+    BSP pass).
     """
     csv_path = out_dir / "cube_decomp.csv"
     trace_csv_path = out_dir / "cube_decomp_trace.csv"
@@ -483,36 +529,48 @@ def run_cube_decomp(out_dir: Path, thread_counts: list[int]):
             for k in CUBE_DECOMP_KS:
                 for t in thread_counts:
                     skip_nelson = (d, k) in nelson_done
-                    label = "+nelson" if not skip_nelson else "par_only"
-                    print(f"  [cube_decomp] d={d} k={k} threads={t} ({label})",
-                          flush=True)
-                    env = os.environ.copy()
-                    env["PE_SYNTH_FAMILIES"] = "cube"
-                    env["PE_SYNTH_NS"] = str(k)
-                    env["PE_SYNTH_D"]  = str(d)
-                    env["PE_BENCH_FORMAT"] = "csv"
-                    if first:
-                        env["PE_BENCH_HEADER"] = "1"
-                    if skip_nelson:
-                        env["PE_BENCH_SKIP_NELSON"] = "1"
-                    env["PE_TRACE"] = "1"
-                    env["PARLAY_NUM_THREADS"] = str(t)
-                    proc = subprocess.run(NUMACTL_PREFIX + [binary],
-                                          capture_output=True,
-                                          text=True, env=env)
-                    if proc.returncode != 0:
-                        sys.stderr.write(proc.stderr)
-                        raise RuntimeError(
-                            f"synthetic_bench failed at d={d} k={k} T={t}")
-                    csv_out.write(proc.stdout)
-                    csv_out.flush()
-                    trace_path = trace_dir / f"d{d}_k{k}_T{t}.log"
-                    trace_path.write_text(proc.stderr)
-                    # Workload tag carries d so plotters can group across d.
-                    all_trace_rows.extend(parse_trace_log(
-                        proc.stderr, threads=t,
-                        default_workload=f"cube_d{d}_k{k}"))
-                    first = False
+                    bsp_label = "+nelson" if not skip_nelson else "par_only"
+                    passes: list[tuple[str, dict[str, str], str]] = [
+                        ("bsp", {} if not skip_nelson else
+                                {"PE_BENCH_SKIP_NELSON": "1"},
+                         bsp_label),
+                    ]
+                    if also_async:
+                        passes.append(("async", {
+                            "PE_USE_ASYNC": "1",
+                            "PE_BENCH_SKIP_NELSON": "1",
+                        }, "async"))
+                    for pass_label, pass_env, status in passes:
+                        print(f"  [cube_decomp] d={d} k={k} threads={t} "
+                              f"({pass_label} {status})", flush=True)
+                        env = os.environ.copy()
+                        env["PE_SYNTH_FAMILIES"] = "cube"
+                        env["PE_SYNTH_NS"] = str(k)
+                        env["PE_SYNTH_D"]  = str(d)
+                        env["PE_BENCH_FORMAT"] = "csv"
+                        if first:
+                            env["PE_BENCH_HEADER"] = "1"
+                        env["PE_TRACE"] = "1"
+                        env["PARLAY_NUM_THREADS"] = str(t)
+                        env.update(pass_env)
+                        proc = subprocess.run(NUMACTL_PREFIX + [binary],
+                                              capture_output=True,
+                                              text=True, env=env)
+                        if proc.returncode != 0:
+                            sys.stderr.write(proc.stderr)
+                            raise RuntimeError(
+                                f"synthetic_bench failed at d={d} k={k} "
+                                f"T={t} {pass_label}")
+                        csv_out.write(proc.stdout)
+                        csv_out.flush()
+                        trace_name = (f"d{d}_k{k}_T{t}_{pass_label}.log"
+                                      if also_async
+                                      else f"d{d}_k{k}_T{t}.log")
+                        (trace_dir / trace_name).write_text(proc.stderr)
+                        all_trace_rows.extend(parse_trace_log(
+                            proc.stderr, threads=t,
+                            default_workload=f"cube_d{d}_k{k}"))
+                        first = False
                     nelson_done.add((d, k))
 
     with open(trace_csv_path, "w", newline="") as f:
@@ -569,7 +627,17 @@ def parse_result(stdout: str) -> str:
 
 
 def run_egg(out_dir: Path, thread_counts: list[int],
-            egg_dir: str, pattern: str, timeout: float):
+            egg_dir: str, pattern: str, timeout: float,
+            also_async: bool = False):
+    """egraph-cc per (file, threads, trial) under egg_dir.
+
+    When `also_async`, each (file, threads) cell runs a second sweep of
+    1 warmup + 5 trials with PE_USE_ASYNC=1. CSV gains an `algorithm`
+    column = `par_close` or `par_close_async` so downstream plots can
+    group correctly. egraph-cc has no sequential mode, so there is no
+    nelson_seq row in egg.csv (intentionally; sequential lives in the
+    synthetic / random phases).
+    """
     csv_path = out_dir / "egg.csv"
     trace_csv_path = out_dir / "egg_trace.csv"
     trace_dir = out_dir / "egg_traces"
@@ -583,15 +651,18 @@ def run_egg(out_dir: Path, thread_counts: list[int],
     if not files:
         print(f"  [egg] no .smt2 files matched in {egg_dir}", flush=True)
         return
-    print(f"  [egg] {len(files)} files × {len(thread_counts)} threads",
+    print(f"  [egg] {len(files)} files × {len(thread_counts)} threads"
+          + (" × {bsp,async}" if also_async else ""),
           flush=True)
 
-    def run_invocation(path: str, t: int):
+    def run_invocation(path: str, t: int, use_async: bool):
         """One invocation. Returns (wall_s, result, timing, error, trace)."""
         cmd = NUMACTL_PREFIX + [binary, "--timing", path]
         env = os.environ.copy()
         env["PE_TRACE"] = "1"
         env["PARLAY_NUM_THREADS"] = str(t)
+        if use_async:
+            env["PE_USE_ASYNC"] = "1"
         t0 = time.perf_counter()
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True,
@@ -611,59 +682,66 @@ def run_egg(out_dir: Path, thread_counts: list[int],
             return (wall, "TIMEOUT", None, f"exceeded {timeout}s", partial)
 
     binary = "./build/egraph-cc"
+    algos = [("par_close", False)]
+    if also_async:
+        algos.append(("par_close_async", True))
+
     all_trace_rows: list[list] = []
     with open(csv_path, "w", newline="") as f:
         writer = csvmod.writer(f)
-        writer.writerow(["file", "expected", "threads", "trial", "result",
-                         "wall_s", *[f"{k}_s" for k in TIMING_KEYS], "error"])
+        writer.writerow(["file", "expected", "algorithm", "threads", "trial",
+                         "result", "wall_s",
+                         *[f"{k}_s" for k in TIMING_KEYS], "error"])
         for path in files:
             name = os.path.basename(path)
             stem = name[:-len(".smt2")] if name.endswith(".smt2") else name
             expected = expected_from_name(path) or ""
             for t in thread_counts:
-                # Warmup invocations: page-cache solver, prime the parlay
-                # scheduler, but don't record. If a warmup hits TIMEOUT or
-                # ERROR, skip this (file, t) cell — trials would just spin
-                # for the same reason.
-                bail = False
-                for w in range(EGG_WARMUP):
-                    _, w_result, _, _, _ = run_invocation(path, t)
-                    if w_result in ("TIMEOUT", "ERROR"):
-                        # Record one row so the CSV still reflects the
-                        # cell. Trials are skipped.
-                        writer.writerow([name, expected, t, -1, w_result,
-                                         "", "", "", "", "", "", "",
-                                         "warmup failed"])
+                for algo_name, use_async in algos:
+                    # Warmup invocations: page-cache solver, prime the
+                    # parlay scheduler, but don't record. If a warmup hits
+                    # TIMEOUT or ERROR, skip this (file, t, algo) cell.
+                    bail = False
+                    for w in range(EGG_WARMUP):
+                        _, w_result, _, _, _ = run_invocation(
+                            path, t, use_async)
+                        if w_result in ("TIMEOUT", "ERROR"):
+                            writer.writerow([name, expected, algo_name, t, -1,
+                                             w_result, "", "", "", "", "",
+                                             "", "", "warmup failed"])
+                            f.flush()
+                            print(f"  [egg] {name} algo={algo_name} "
+                                  f"T={t:<3} warmup={w_result} "
+                                  f"(skipping trials)", flush=True)
+                            bail = True
+                            break
+                    if bail:
+                        continue
+                    # Measured trials. One log file per (file, t, algo).
+                    trace_chunks: list[str] = []
+                    for trial in range(EGG_TRIALS):
+                        wall, result, timing, error, trace_text = \
+                            run_invocation(path, t, use_async)
+                        trace_chunks.append(
+                            f"=== trial {trial} (T={t} {algo_name}) ===\n"
+                            f"{trace_text}")
+                        all_trace_rows.extend(parse_trace_log(
+                            trace_text, threads=t, default_workload=stem))
+                        row = [name, expected, algo_name, t, trial, result,
+                               f"{wall:.6f}"]
+                        row += [f"{timing[k]:.6f}" if timing else ""
+                                for k in TIMING_KEYS]
+                        row.append(error)
+                        writer.writerow(row)
                         f.flush()
-                        print(f"  [egg] {name} T={t:<3} warmup={w_result} "
-                              f"(skipping trials)", flush=True)
-                        bail = True
-                        break
-                if bail:
-                    continue
-                # Measured trials. One log file per (file, t) covering all
-                # trials, with banner lines so each trial's rounds can be
-                # disambiguated downstream if needed.
-                trace_chunks: list[str] = []
-                for trial in range(EGG_TRIALS):
-                    wall, result, timing, error, trace_text = \
-                        run_invocation(path, t)
-                    trace_chunks.append(
-                        f"=== trial {trial} (T={t}) ===\n{trace_text}")
-                    all_trace_rows.extend(parse_trace_log(
-                        trace_text, threads=t, default_workload=stem))
-                    row = [name, expected, t, trial, result, f"{wall:.6f}"]
-                    row += [f"{timing[k]:.6f}" if timing else ""
-                            for k in TIMING_KEYS]
-                    row.append(error)
-                    writer.writerow(row)
-                    f.flush()
-                    close_s = f"{timing['close']:.4f}s" if timing else "-"
-                    print(f"  [egg] {name} T={t:<3} trial={trial} "
-                          f"{result:<8} close={close_s} wall={wall:.2f}s",
-                          flush=True)
-                (trace_dir / f"{stem}_T{t}.log").write_text(
-                    "".join(trace_chunks))
+                        close_s = f"{timing['close']:.4f}s" if timing else "-"
+                        print(f"  [egg] {name} algo={algo_name} "
+                              f"T={t:<3} trial={trial} "
+                              f"{result:<8} close={close_s} wall={wall:.2f}s",
+                              flush=True)
+                    log_name = (f"{stem}_T{t}_{algo_name}.log"
+                                if also_async else f"{stem}_T{t}.log")
+                    (trace_dir / log_name).write_text("".join(trace_chunks))
 
     with open(trace_csv_path, "w", newline="") as f:
         w = csvmod.writer(f)
@@ -703,6 +781,14 @@ def main():
                     help="comma-separated subset of XL ladder rungs to run "
                          "(e.g. '16XL,32XL'). Only meaningful with "
                          "--random-xl-only. Defaults to the full ladder.")
+    ap.add_argument("--also-async", action="store_true",
+                    help="run the async-rounds closure alongside BSP at "
+                         "every (workload, threads) cell. Roughly doubles "
+                         "the wall-clock of each phase. CSVs gain an "
+                         "`algorithm` column distinguishing par_close vs "
+                         "par_close_async (egg.csv) — random/synthetic/"
+                         "cube_decomp already had one, populated by the "
+                         "binaries themselves.")
     args = ap.parse_args()
 
     try:
@@ -751,23 +837,23 @@ def main():
             run_random_xl(out_dir, thread_counts, labels=xl_labels)
         else:
             print("=== (a) random ===")
-            run_random(out_dir, thread_counts)
+            run_random(out_dir, thread_counts, also_async=args.also_async)
         print()
 
     if "synthetic" not in skip:
         print("=== (b) synthetic ===")
-        run_synthetic(out_dir, thread_counts)
+        run_synthetic(out_dir, thread_counts, also_async=args.also_async)
         print()
 
     if "cube_decomp" not in skip:
         print("=== (c) cube_decomp ===")
-        run_cube_decomp(out_dir, thread_counts)
+        run_cube_decomp(out_dir, thread_counts, also_async=args.also_async)
         print()
 
     if "egg" not in skip:
         print("=== (d) egg / cc-benchmarks ===")
         run_egg(out_dir, thread_counts, args.egg_dir, args.egg_pattern,
-                args.egg_timeout)
+                args.egg_timeout, also_async=args.also_async)
         print()
 
     print(f"Done. All artifacts under: {out_dir}")
