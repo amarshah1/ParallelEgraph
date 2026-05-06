@@ -115,6 +115,14 @@ fi
 T_MAX=${T_MAX:-144}
 echo "T_max=$T_MAX"
 
+# EGGCC_ONLY=1 skips closure_compare, synthetic_bench, and the strong-
+# scaling sweeps — runs just the full 507-file eggcc sweep + aggregator.
+# Use when you've already run the headlines / scaling sweeps and only
+# want to refresh the eggcc data, or when you're debugging an eggcc-
+# specific regression and don't want to wait through the synthetic
+# stages each time.
+EGGCC_ONLY=${EGGCC_ONLY:-0}
+
 # Per-step timeout. Defaults to 30 minutes per bench-binary invocation.
 # Override with STEP_TIMEOUT=Xm (e.g. "5m" for 5 minutes, "1h" for 1 hour,
 # "0" or empty to disable). Used to bound any single workload-trial that
@@ -153,6 +161,10 @@ run_step() {
   return 0
 }
 
+if [ "$EGGCC_ONLY" = "1" ]; then
+  echo "[skip] EGGCC_ONLY=1 — skipping headlines + strong-scaling sweeps"
+else
+
 # ------------------- Headline at T_max -------------------
 echo "[2/6] closure_compare headline at T=$T_MAX"
 run_step "closure_compare T=$T_MAX" \
@@ -190,6 +202,8 @@ for T in 1 2 4 8 16 32 48 64 96 128 144 192; do
     $NUMACTL ./build/synthetic_bench >> "$OUT/quintic20_scaling.csv"
   HDR=
 done
+
+fi  # EGGCC_ONLY guard
 
 # ------------------- Full eggcc sweep at T_max -------------------
 # eggcc gets a longer ceiling — it's the longest stage and one slow file
