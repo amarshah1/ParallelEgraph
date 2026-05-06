@@ -265,19 +265,6 @@ BuiltGraph<UF> build(Family f, std::size_t n, std::size_t g_arity) {
   return {std::move(eg), std::move(w.eqs), total, n_eqs};
 }
 
-// Async-flavor build: same workload generation, but the EGraph is
-// constructed via the async ctor (skips parents_, allocates
-// last_marked_). Used by bench_parallel_close_async; never called for
-// the BSP path. Only meaningful for ConcurrentUnionFind.
-template <typename UF>
-BuiltGraph<UF> build_async(Family f, std::size_t n, std::size_t g_arity) {
-  auto w = gen_workload(f, n, g_arity);
-  const std::size_t total = w.nodes.size();
-  const std::size_t n_eqs = w.eqs.size();
-  auto eg = std::make_unique<EGraph<UF>>(std::move(w.nodes), pe::async);
-  return {std::move(eg), std::move(w.eqs), total, n_eqs};
-}
-
 // Topo-flavor build: same workload generation, EGraph constructed via
 // the topo-tagged ctor (precomputes depth_buckets_, skips parents_/
 // last_marked_). Used by bench_parallel_close_topo.
@@ -368,24 +355,6 @@ std::vector<double> bench_nelson_topo(Family f, std::size_t n,
   return times;
 }
 
-std::vector<double> bench_parallel_close(Family f, std::size_t n,
-                                         std::size_t g_arity,
-                                         int warmup, int trials) {
-  for (int i = 0; i < warmup; ++i) {
-    auto g = build<ConcurrentUnionFind>(f, n, g_arity);
-    g.eg->parallel_close(std::move(g.eqs));
-  }
-  std::vector<double> times;
-  times.reserve(trials);
-  for (int i = 0; i < trials; ++i) {
-    auto g = build<ConcurrentUnionFind>(f, n, g_arity);
-    auto t0 = clk::now();
-    g.eg->parallel_close(std::move(g.eqs));
-    times.push_back(elapsed_ms(t0));
-  }
-  return times;
-}
-
 std::vector<double> bench_parallel_close_topo(Family f, std::size_t n,
                                                 std::size_t g_arity,
                                                 int warmup, int trials) {
@@ -399,24 +368,6 @@ std::vector<double> bench_parallel_close_topo(Family f, std::size_t n,
     auto g = build_topo<ConcurrentUnionFind>(f, n, g_arity);
     auto t0 = clk::now();
     g.eg->parallel_close_topo(std::move(g.eqs));
-    times.push_back(elapsed_ms(t0));
-  }
-  return times;
-}
-
-std::vector<double> bench_parallel_close_async(Family f, std::size_t n,
-                                                std::size_t g_arity,
-                                                int warmup, int trials) {
-  for (int i = 0; i < warmup; ++i) {
-    auto g = build_async<ConcurrentUnionFind>(f, n, g_arity);
-    g.eg->parallel_close_async_rounds(std::move(g.eqs));
-  }
-  std::vector<double> times;
-  times.reserve(trials);
-  for (int i = 0; i < trials; ++i) {
-    auto g = build_async<ConcurrentUnionFind>(f, n, g_arity);
-    auto t0 = clk::now();
-    g.eg->parallel_close_async_rounds(std::move(g.eqs));
     times.push_back(elapsed_ms(t0));
   }
   return times;
@@ -451,13 +402,6 @@ int main() {
   const bool csv_header = std::getenv("PE_BENCH_HEADER") != nullptr;
   const char* dnc_cutoff_env  = std::getenv("PE_DNC_CUTOFF");
   const std::string dnc_cutoff  = dnc_cutoff_env  ? dnc_cutoff_env  : "16";
-  // PE_USE_ASYNC=1 picks parallel_close_async_rounds (mark-based dirty
-  // filter, no parents_) instead of the BSP parallel_close. CSV
-  // `algorithm` tag becomes `par_close_async` so downstream plots can
-  // distinguish.
-  const bool use_async = std::getenv("PE_USE_ASYNC") != nullptr;
-  const char* par_algo_tag = use_async ? "par_close_async" : "par_close";
-
   // PE_SYNTH_D = decomposition rate / g-tree fan-in (>= 2). Default 2 is
   // the historical balanced binary tree. Larger d → shallower tree,
   // frontier shrinks by a factor of d each round.
@@ -540,11 +484,10 @@ int main() {
   if (!csv) {
     std::printf("synthetic_bench  trials=%d  warmup=%d  par_threads=%zu\n",
                 trials, warmup, par_threads);
-    std::printf("(par_close/par_topo speedup columns are relative to nelson_topo)\n");
-    std::printf("%-8s %5s %10s %9s | %11s %11s %8s | %11s %8s | %11s %8s\n",
+    std::printf("(par_topo \"spd\" is vs nelson_topo)\n");
+    std::printf("%-8s %5s %10s %9s | %11s %11s %8s | %11s %8s\n",
                 "family", "n", "classes", "merges",
                 "nelson_seq", "nelson_topo", "vs_nel",
-                "par_close", "vs_top",
                 "par_topo", "vs_top");
   } else if (csv_header) {
     std::printf("family,n,d,classes,merges,algorithm,trial,"
@@ -582,25 +525,20 @@ int main() {
       }
       auto top = bench_nelson_topo(f, n, g_arity, warmup, trials);
       double mt = median(top);
-      auto par = use_async
-          ? bench_parallel_close_async(f, n, g_arity, warmup, trials)
-          : bench_parallel_close(f, n, g_arity, warmup, trials);
-      double mp = median(par);
       auto ptp = bench_parallel_close_topo(f, n, g_arity, warmup, trials);
       double mpt = median(ptp);
 
       if (csv) {
         if (!skip_nelson) emit_csv(f, n, classes, merges, "nelson_seq", nel);
         emit_csv(f, n, classes, merges, "nelson_topo", top);
-        emit_csv(f, n, classes, merges, par_algo_tag, par);
         emit_csv(f, n, classes, merges, "par_topo", ptp);
       } else if (skip_nelson) {
-        std::printf("%-8s %5zu %10zu %9zu |   skipped   %9.2fms          | %9.2fms %6.2fx | %9.2fms %6.2fx\n",
-                    family_name(f), n, classes, merges, mt, mp, mt / mp, mpt, mt / mpt);
+        std::printf("%-8s %5zu %10zu %9zu |   skipped   %9.2fms          | %9.2fms %6.2fx\n",
+                    family_name(f), n, classes, merges, mt, mpt, mt / mpt);
       } else {
-        std::printf("%-8s %5zu %10zu %9zu | %9.2fms %9.2fms %6.2fx | %9.2fms %6.2fx | %9.2fms %6.2fx\n",
+        std::printf("%-8s %5zu %10zu %9zu | %9.2fms %9.2fms %6.2fx | %9.2fms %6.2fx\n",
                     family_name(f), n, classes, merges,
-                    mn, mt, mn / mt, mp, mt / mp, mpt, mt / mpt);
+                    mn, mt, mn / mt, mpt, mt / mpt);
       }
       std::fflush(stdout);
     }

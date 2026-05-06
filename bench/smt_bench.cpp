@@ -193,9 +193,6 @@ int main(int argc, char** argv) {
         warmup, par_threads, "nelson_topo", std::monostate{},
         [](auto& eg, auto& eqs) { eg.sequential_close_topo(eqs); });
     run_one<pe::ConcurrentUnionFind>(script, stem, family, n, trials,
-        warmup, par_threads, "par_close", std::monostate{},
-        [](auto& eg, auto& eqs) { eg.parallel_close(std::move(eqs)); });
-    run_one<pe::ConcurrentUnionFind>(script, stem, family, n, trials,
         warmup, par_threads, "par_topo", pe::topo,
         [](auto& eg, auto& eqs) { eg.parallel_close_topo(std::move(eqs)); });
   }

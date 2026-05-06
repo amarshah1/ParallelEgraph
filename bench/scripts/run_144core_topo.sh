@@ -140,14 +140,12 @@ NR == 1 { next }
 END {
   for (f in files) {
     if (!((f, "nelson_seq") in ms && (f, "nelson_topo") in ms &&
-          (f, "par_close") in ms && (f, "par_topo") in ms)) continue
+          (f, "par_topo") in ms)) continue
     n_paired++
     sum_nel += ms[f, "nelson_seq"]
     sum_top += ms[f, "nelson_topo"]
-    sum_par += ms[f, "par_close"]
     sum_pt  += ms[f, "par_topo"]
     if (ms[f, "par_topo"] < ms[f, "nelson_topo"]) pt_wins_top++
-    if (ms[f, "par_topo"] < ms[f, "par_close"])  pt_wins_par++
     if (ms[f, "par_topo"] < ms[f, "nelson_seq"]) pt_wins_nel++
     if (classes[f] < 1000)         { b = "<1K"     }
     else if (classes[f] < 10000)   { b = "1-10K"   }
@@ -161,16 +159,13 @@ END {
   printf "Files paired: %d / 507\n\n", n_paired
   printf "Σ nelson_seq:  %10.2f ms\n", sum_nel
   printf "Σ nelson_topo: %10.2f ms\n", sum_top
-  printf "Σ par_close:   %10.2f ms\n", sum_par
   printf "Σ par_topo:    %10.2f ms\n\n", sum_pt
   printf "par_topo aggregate (sum):\n"
   printf "  vs nelson_seq:  %.2fx\n", sum_nel/sum_pt
-  printf "  vs nelson_topo: %.2fx\n", sum_top/sum_pt
-  printf "  vs par_close:   %.2fx\n\n", sum_par/sum_pt
+  printf "  vs nelson_topo: %.2fx\n\n", sum_top/sum_pt
   printf "win rates:\n"
   printf "  par_topo < nelson_seq:  %d / %d (%.1f%%)\n", pt_wins_nel, n_paired, 100*pt_wins_nel/n_paired
-  printf "  par_topo < nelson_topo: %d / %d (%.1f%%)\n", pt_wins_top, n_paired, 100*pt_wins_top/n_paired
-  printf "  par_topo < par_close:   %d / %d (%.1f%%)\n\n", pt_wins_par, n_paired, 100*pt_wins_par/n_paired
+  printf "  par_topo < nelson_topo: %d / %d (%.1f%%)\n\n", pt_wins_top, n_paired, 100*pt_wins_top/n_paired
   printf "by classes-per-file (vs nelson_topo):\n"
   printf "%-10s %5s | %12s %12s %8s | %5s\n", "bucket", "files", "Σnel_topo", "Σpar_topo", "ratio", "wins"
   order = "<1K 1-10K 10-100K >=100K"
