@@ -1,10 +1,18 @@
 # ParallelEgraph (C++/parlay) — design and correctness
 
-A parallel e-graph: lock-free concurrent union-find + bulk-synchronous-
-parallel (BSP) congruence closure. Originally a Rust prototype; now C++
-with parallel primitives from [parlaylib](https://github.com/cmuparlay/parlaylib)
-and `parlay::sequence` throughout the hot path. The codebase is trimmed to
-exactly what the closure algorithm benchmark needs.
+A parallel e-graph: lock-free concurrent union-find + several closure
+algorithms (BSP-frontier, depth-stratified BSP, async-rounds with
+round-stamp tracking) plus three sequential baselines for correctness
+checking. Originally a Rust prototype; now C++ with parallel primitives
+from [parlaylib](https://github.com/cmuparlay/parlaylib) and
+`parlay::sequence` throughout the hot path.
+
+The codebase has been deliberately constrained to what the closure
+benchmark needs: a single bulk e-graph constructor, a small set of
+closure algorithms, and a benchmark harness comparing them across three
+workload corpora (`closure_compare`'s random-uniform DAGs,
+`synthetic_bench`'s polynomial cascades, and `smt_bench`'s SMT-LIB
+inputs).
 
 ## Layout
 
@@ -17,140 +25,203 @@ include/parallel_egraph/
   unionfind.hpp                           — ConcurrentUnionFind +
                                             SequentialUnionFind
   smtlib.hpp                              — QF_UF SMT-LIB 2 parser
+  smt_to_egraph.hpp                       — SMT-LIB -> e-graph builder
   egraph.hpp                              — EGraph + ENode + sig helpers
+                                            + ctor tags (default / async / topo)
+  detail.hpp                              — CanonEntry, SemisortTimings,
+                                            internal helper signatures
+  dnc_union.hpp                           — divide-and-conquer per-bucket union
+                                            (templated on Bucket and
+                                            optionally on the union method)
+  semisort_common.hpp                     — semisort body shared by both
+                                            equality variants
+  semisort_secondary.hpp                  — default: 32-bit secondary-hash
+                                            equality
+  semisort_sound.hpp                      — sound: structural sigs_equal
 src/
-  unionfind.cpp
+  unionfind.cpp                           — Concurrent / Sequential UF impl
+                                            (incl. union_min_id, union_into)
   smtlib.cpp                              — recursive-descent parser
-  egraph.cpp                              — add, parallel_close,
-                                            sequential_close_nelson,
-                                            parallel_consolidate,
-                                            merge_and_collect_semisort,
-                                            dnc_union
-  main.cpp                                — egraph-cc CLI driver
+  egraph.cpp                              — sequential closures + parallel
+                                            BSP + parallel topo + topo_iter
+  egraph_async.cpp                        — parallel async-rounds (by-rank
+                                            and MIN_ID variants)
+  semisort.cpp                            — TU dispatcher: includes
+                                            semisort_secondary.hpp by default
+                                            or semisort_sound.hpp when
+                                            PE_SEMISORT_SOUND is defined
+  main.cpp                                — egraph-cc CLI
 bench/
-  closure_compare.cpp                     — closure-vs-baseline bench
+  closure_compare.cpp                     — random uniform DAGs (small/medium/
+                                            large × depth=1/3)
+  synthetic_bench.cpp                     — polynomial-family cascades
+                                            (chain, grid, cube, quartic, quintic)
+  smt_bench.cpp                           — sweeps a directory of .smt2 files
+  component_bench.cpp                     — isolated phase timings
+  irregular_bench.cpp                     — variable-arity workloads
+  scripts/
+    run_144core_topo.sh                   — full sweep driver (closure_compare,
+                                            synthetic, scaling, eggcc; per-step
+                                            timeouts; aggregator)
 tests/
   unionfind_test.cpp                      — UF unit tests
-  regression_test.cpp                     — every examples/regression/*.smt2
-                                            in parser→close mode
-examples/
-  regression/                             — 17 hand-written QF_UF tests
-  synthetic/                              — gen_bench.py output (gitignored)
+  closure_test.cpp                        — algorithm-vs-oracle correctness
+                                            (incl. cross-depth scenarios)
+cc-benchmarks/                            — git submodule: 507-file eggcc
+                                            (cc-benchmarks) corpus
+synthetic_benchmarks/                     — gen_bench.py output (chain/grid/
+                                            cube/quartic/quintic .smt2)
 ```
 
 ## Core data structures
 
 ```
-ConcurrentUnionFind   std::vector<std::atomic<u32>>; high bit = rank flag.
-                      find/union/same_set are *non-const* (CAS writes).
-                      Fixed capacity at construction. make_set() bumps
-                      a single-threaded counter; bulk_init(n) sets the
-                      counter to n in one shot.
+Id = std::uint32_t
 
-EGraph
-  nodes_              parlay::sequence<pair<ENode, Id>>
-                      Flat array of every non-leaf e-node, in add order.
-                      Append-only during build, immutable during closure.
+ConcurrentUnionFind   parlay::sequence<std::atomic<u32>>; high bit = rank flag
+                      (root stores rank; internal node stores parent ptr).
+                      Lock-free find/union (Jayanti & Tarjan listing 3).
+                      Three union variants:
+                        union_(u, v)        by-rank tie-break (higher id on ties)
+                        union_min_id(u, v)  always swing higher-id slot to lower
+                        same_set(u, v)      linearizable membership check
+                      union_min_id returns bool: true on real merge,
+                      false on already-same-class. Used by the
+                      MIN_ID-linking variants.
+                      Fixed capacity at construction; bulk_init(n) sets
+                      size_ = n in one shot.
 
-  parent_index_       parlay::sequence<parlay::sequence<Id>>
-                      parent_index_[c] = list of indices into nodes_ whose
-                      direct child was c at add time. Mutated only by
-                      parallel_consolidate.
+SequentialUnionFind   plain std::vector<u32>, same encoding. Path
+                      compression in find_root. union_(u, v) by-rank,
+                      union_into(dying, survivor) splices unconditionally
+                      (no rank update — used by smaller-into-larger
+                      merging in sequential_close_dst).
 
-  uf_                 ConcurrentUnionFind, fixed capacity = #classes.
+EGraph<UF>            templated on the union-find type so the
+                      sequential and parallel paths share one ENode +
+                      Signature implementation.
 
-  hashcons_           std::unordered_map<ENode, Id, ENodeHash>
-                      Sequential dedup during add(); empty after bulk_init.
+  uf_                 UF instance (Concurrent or Sequential).
+  nodes_              parlay::sequence<ENode>.
+                      Class-id-indexed: nodes_[i] is the ENode for class i.
+                      Constructed from caller-supplied DAG-ordered input
+                      (every child id < parent id). No hashcons dedup —
+                      caller is responsible for uniqueness. Immutable
+                      after construction.
+  parents_            parlay::sequence<parlay::sequence<Id>>
+                      Inverted child→parent index; populated only by the
+                      default ctor (BSP flavor). parents_[c] = list of
+                      class ids whose ENode has c among its children.
+                      Used by parallel_close (BSP frontier walk),
+                      sequential_close_nelson (worklist), and
+                      sequential_close_dst (smaller-into-larger).
+  last_marked_        parlay::sequence<std::atomic<u64>>
+                      Populated only by the async-tagged ctor. Per-class
+                      round-stamps used by parallel_close_async_rounds
+                      to filter "dirty" terms each round.
+  depth_buckets_      parlay::sequence<parlay::sequence<Id>>
+                      Populated only by the topo-tagged ctor. Class ids
+                      grouped by static node depth (longest path from any
+                      leaf to the node in the input DAG; child < parent
+                      ordering is required). Used by parallel_close_topo
+                      and parallel_close_topo_iter.
 ```
 
-`nodes_`, `parent_index_`, and `uf_` are sized to a known upper bound at
-`EGraph` construction. No dynamic growth in the hot path.
+Three ctor flavors select which auxiliary state gets populated:
 
-### Two ways to populate the e-graph
+```cpp
+EGraph<UF>(nodes)               // default: parents_
+EGraph<UF>(nodes, pe::async)    // async-rounds: last_marked_
+EGraph<UF>(nodes, pe::topo)     // depth-stratified: depth_buckets_
+```
 
-1. **`add(node)` (sequential)** — canonicalize, dedupe via hashcons,
-   `make_set` on miss, append to `nodes_`, push the node-idx into each
-   child's `parent_index_` slot. Used by the CLI driver
-   ([src/main.cpp](src/main.cpp)) where one node arrives at a time from
-   the parser.
-2. **`bulk_init(parlay::sequence<ENode>)` (parallel)** — when every node
-   is known up-front and uniqueness is guaranteed by the caller. Skips
-   the hashcons map; all of `uf_` / `nodes_` / `parent_index_` are
-   constructed in one parallel pass:
-   - `uf_.bulk_init(n)` sets `size_ = n`.
-   - `parlay::scan` over `is_nonleaf[]` assigns each non-leaf its
-     `node_idx` in `nodes_`.
-   - `parlay::flatten(parlay::tabulate(...))` emits the
-     `(child_class, node_idx)` pairs for every child of every non-leaf.
-   - `parlay::group_by_index` groups those pairs by child class →
-     `parent_index_` directly.
-   - `parlay::parallel_for` scatters non-leaf ENodes into `nodes_`.
-
-   Used by the closure benchmark ([bench/closure_compare.cpp](bench/closure_compare.cpp))
-   to construct ~1M-node workloads without paying for a sequential
-   `add()` loop.
+Each closure path uses only its own auxiliary state, so the bench can
+A/B compare without paying for the wrong-flavor setup.
 
 ## Closure algorithms
 
-Two paths exposed:
+Nine algorithms, summarized in [src/egraph.cpp](src/egraph.cpp) and
+[src/egraph_async.cpp](src/egraph_async.cpp). The table below is the
+quickest way to navigate which one to use.
 
-| API                        | description                                                                  |
-|----------------------------|------------------------------------------------------------------------------|
-| `EGraph::sequential_close_nelson(initial_unions)` | Nelson-style sequential baseline (signature table + worklist), used by the bench's reference column. |
-| `EGraph::parallel_close(initial_unions)`          | BSP round-based parallel closure. The vehicle for everything that follows.   |
+| algorithm | seq/par | sound? | notes |
+|---|---|---|---|
+| `sequential_close_nelson` | seq | sound | Original Nelson worklist baseline (signature table + parents_ frontier). Drains parents_ on first visit; **has its own latent bug on cross-depth inits** because re-pushed classes find their parents_ already empty. Kept as historical baseline. |
+| `sequential_close_topo` | seq | **unsound** | Single forward pass over `nodes_` in DAG order. Per-class signature → hashmap; collisions trigger union. Order-dependent: only correct when input ordering puts canonical (lowest-id) members structurally first. Even with MIN_ID linking, fails on adversarial DAG orderings. Documented as failing test `seq_topo_adversarial`. |
+| `sequential_close_topo_iter` | seq | sound | Wraps `sequential_close_topo` in a fixpoint loop with MIN_ID linking. Re-walks `nodes_` until a full pass yields no new unions. On Family C polynomial cascades converges in 2 passes (1 work + 1 verification); on irregular inputs needs more passes. |
+| `sequential_close_dst` | seq | sound | Nelson-Oppen-style worklist + structural hashcons + smaller-into-larger merging (`union_into`). Seeds the hashcons with every node up front; each merge re-pends `parents_` of the dying class. Stale hashcons entries are tolerated (still semantically valid by congruence monotonicity). Correct on arbitrary inputs; expensive seed sweep on workloads with deep-cascade structure (`O(N log N)` due to parents migration). |
+| `parallel_close` | par | sound | BSP-frontier algorithm. Each round: parallel-apply pending unions, parallel-consolidate `parents_` from dead-roots into surviving-roots, semisort frontier by 96-bit signature hash, dnc_union per bucket, emit next-round work. Loops until frontier is empty. The reference for cross-depth correctness. |
+| `parallel_close_topo` | par | **unsound** | Depth-stratified BSP: round d processes every class at depth d in parallel. Same intra-batch staleness bug as `sequential_close_topo` — in-round unions can change find_root of children referenced by other depth-d sigs that were already computed. Documented as failing test `par_topo_cross_depth`. Kept in the codebase as a reference/baseline; **not wired into any bench driver**. |
+| `parallel_close_topo_iter` | par | sound | Sound iterated variant of `parallel_close_topo`. Same depth-stratified structure, but every union is MIN_ID and the entire depth walk is wrapped in a fixpoint loop. On Family C cascades converges in 2 rounds (1 work + 1 verification); the depth-stratified scheduling batches the entire cascade into one big parallel pass per depth, which beats async on regular cascades. |
+| `parallel_close_async_rounds` | par | sound | Round-stamp dirty-filter algorithm using `last_marked_`. Each round: filter terms with at least one child whose root was recently rerooted (mark in {R-1, R}), semisort dirty by sig, dnc_union per bucket, stamp surviving roots with R. Loops until dirty is empty. By-rank linking. |
+| `parallel_close_async_rounds_min_id` | par | sound | Same as async-rounds but every union uses `union_min_id`. Modest 5–15% improvement on regular cascades from the canonical-id-stable invariant; essentially neutral on irregular inputs. |
 
-`parallel_close`'s outer skeleton:
+## Soundness story: cross-depth initial unions
 
-```
-apply initial_unions in parallel
-work := flatten initial_unions
-loop {
-  work := dedup(work)
-  roots := map(c -> uf.find_root(c)) over work
-  parallel_consolidate(parent_index, work, roots)        // §1
-  frontier := flatten(parent_index[r] for r in dedup(roots))
-  canon := map(idx -> (h1, h2 or idx, root)) over frontier  // see §2
-  next  := merge_and_collect_semisort(canon)             // §2
-  work  := dedup(next)
-}
-```
+The two unsound algorithms share a structural failure mode worth
+documenting because the fix shaped the rest of the algorithm catalog.
 
-`CanonEntry` is 16 bytes either way:
+**Setup.** Consider an e-graph with leaves `a, b, ta1, ta2, t` plus
+`f(a), f(b), g(ta1, t), g(ta2, t)`, and initial unions
+`{a = b, ta1 = f(a), ta2 = f(b)}`. The middle two are "cross-depth":
+they equate a leaf class with a depth-1 (function-application) class.
 
-| field | default build       | `PE_GROUPBY_HASH=ON` build |
-|-------|---------------------|---------------------------|
-| `h`   | 64-bit primary hash | 64-bit primary hash       |
-| `root`| pre-round root id   | pre-round root id         |
-| `h2` / `idx` | 32-bit secondary hash | 32-bit node index in `nodes_` |
+The mathematical closure: `a = b ⇒ f(a) ≡ f(b)` by congruence, then
+through the cross-depth inits `ta1 ≡ ta2`, then `g(ta1, t) ≡ g(ta2, t)`
+by congruence on `t`.
 
-The trailing 4-byte slot is an `#ifdef`-selected union: we never need both
-fields in the same build. The default carries `h2`; the legacy build
-carries `idx` so its equality predicate (`sigs_equal`) can recover the
-ENode.
+**Why single-pass topo misses it.** Forward-walk processes `f(a)` and
+`f(b)` first; they match and union into one class. But the g's were
+processed earlier (or in parallel for `parallel_close_topo`) with sigs
+referencing distinct find_roots for `ta1` and `ta2`. After the f-union,
+those find_roots become equal — but the g sigs were already inserted
+into the hashmap with stale values. No re-check fires.
 
----
+**The fixpoint fix.** Wrap the depth walk in a loop that repeats until a
+full pass yields zero unions. Caught congruences from pass `k` enable
+new sig matches in pass `k+1`. Bounded by total class count.
 
-## §1 `parallel_consolidate`  ([src/egraph.cpp](src/egraph.cpp))
+**The MIN_ID structural fix.** With rank-based union, the canonical
+representative of an equivalence class is unpredictable; sigs computed
+across in-pass merges reference different ids. With MIN_ID linking, the
+lowest-id member of every class is always the root, so on
+DAG-ordered inputs where the structurally-canonical sub-DAG is emitted
+first (Family C, by construction), single-pass topo is correct.
+
+**Combined**: `sequential_close_topo_iter` and
+`parallel_close_topo_iter` use both — MIN_ID linking + fixpoint loop —
+so they are correct on arbitrary inputs (the loop catches anything MIN_ID
+misses) and fast on regular cascades (MIN_ID makes 1 work pass suffice).
+
+Empirical impact: on synthetic quintic-n=20 (12.8M classes, g-tree
+depth 22), pre-MIN_ID `topo_iter` needed 18 rounds and ~107 s (one full
+N-walk per cascade level). Post-MIN_ID: 2 rounds, ~3 s. Same workload at
+144 cores with `parallel_close_topo_iter`: ~500 ms in 2 rounds.
+
+## §1 `parallel_consolidate` ([src/egraph.cpp](src/egraph.cpp))
+
+Used only by `parallel_close` (the BSP-frontier path). The other
+parallel algorithms either don't use `parents_` at all (topo, async) or
+use it differently (dst's smaller-into-larger).
 
 ### Why it exists
 
-`parent_index_[c]` is keyed by the *add-time root* of the child class. After
+`parents_[c]` is keyed by the *add-time root* of the child class. After
 `union(a, b)`, one of `a` or `b` becomes a non-root; whichever loses the
-rank tiebreak still owns its add-time `parent_index` entries, but the new
-root's slot does not. If a future round only iterates the *current* root's
-slot, it misses every parent registered under the old, now-stale id —
-exactly the soundness bug the `exp_n11` family of inputs exposed in
-earlier implementations.
+tie-break still owns its add-time `parents_` entries, but the new
+root's slot does not. If a future round only iterates the *current*
+root's slot, it misses every parent registered under the old, now-stale
+id — exactly the soundness bug the `exp_n11` family of inputs exposed
+in earlier implementations.
 
-The fix migrates entries from non-root slots into the current root at the
-start of every round.
+The fix migrates entries from non-root slots into the current root at
+the start of every round.
 
 ### What it does
 
-For every `c` in this round's work list whose current root differs (`c !=
-root_of(c)`), append `parent_index[c]` to `parent_index[root_of_c]` and
-clear `parent_index[c]`. Subsequent rounds only need to read the root's
-slot.
+For every `c` in this round's work list whose current root differs (`c
+!= root_of(c)`), append `parents_[c]` to `parents_[root_of_c]` and clear
+`parents_[c]`. Subsequent rounds only need to read the root's slot.
 
 ### How it parallelizes
 
@@ -160,209 +231,155 @@ Three nested levels, all parlay-native:
 1. (root_of_c, c) pairs for non-root c           parlay::map_maybe
 2. groups[g] = (root, [cs sharing this root])    parlay::group_by_key
 3. for each group (parallel — distinct root):
-     sizes[i]   = parent_index[cs[i]].size()     parlay::tabulate
-     offsets, total = scan(sizes)                parlay::scan
-     dst.resize(old + total)                     one-shot, exclusive
-     for each c in group (parallel):
-       for each j in parent_index[c]:            parlay::parallel_for
-                                                 (or sequential below
-                                                  COPY_SEQ_CUTOFF=1024)
-         dst[old + offsets[i] + j] = src[j]
-       src.clear()
+     parents[rep] = parlay::flatten(
+         parlay::map(sources, [&](Id c) { return std::move(parents[c]); })
+     );
 ```
 
 ### Race-freedom argument
 
-* **Across groups**: each group's destination is a distinct root, so writes
-  to `parent_index[r]` never collide.
-* **Within a group**: the cs are distinct (group_by_key keys are unique),
-  source slots don't collide either, and the prefix-scan partitions the
-  destination into disjoint offset ranges.
-* **Resize**: happens exactly once per group, *before* any concurrent
-  writes — the writes only touch already-allocated tail slots.
+* **Across groups**: each group's destination is a distinct root, so
+  writes to `parents_[r]` never collide.
+* **Within a group**: the cs are distinct (group_by_key keys are
+  unique), and `parlay::flatten` allocates the destination buffer once
+  and scatters in parallel internally — no contention.
 
-Span: `O(log N)` per round (dominated by `parlay::scan`).
+Span: `O(log N)` per round.
 
----
+## §2 `merge_and_collect_semisort` ([src/semisort.cpp](src/semisort.cpp))
 
-## §2 `merge_and_collect_semisort`  ([src/egraph.cpp](src/egraph.cpp))
+The grouping primitive shared by every parallel BSP variant.
 
 ### What it does
 
-Given a `canon` sequence (one entry per parent node in the frontier — `(h,
-root, h2|idx)` where `h = sig_hash(node)` and `root =
-find_root(class_of_node)`), it merges every set of class roots whose
-entries share a signature and returns the set of touched class ids for the
-next round.
+Given a `canon` sequence (one entry per class in the round's frontier
+— `(hash, root, secondary_hash | class_id)` where `hash =
+sig_hash(node)` and `root = find_root(class_of_node)`), it merges every
+set of class roots whose entries share a signature and returns the set
+of touched class ids for the next round.
 
-### Two implementations, one selected at build time
+### Two equality variants, build-time selectable
 
-The grouping is the dominant phase of `parallel_close` on dense workloads
-(e.g. round-0 of the synthetic quintic-n23 input has a 64.4M-element
-frontier with ~12.87M unique signatures, all consumed in a single
-semisort). We ship two implementations and pick at compile time:
+| build                       | algorithm                                         | correctness                                        |
+|-----------------------------|---------------------------------------------------|----------------------------------------------------|
+| default                     | semisort by primary hash + 32-bit secondary check | hash-quality argument (96-bit combined entropy)    |
+| `-DPE_SEMISORT_SOUND=ON`    | semisort by primary hash + structural `sigs_equal`| deterministic under any hash function              |
 
-| build                            | algorithm                                    | correctness                                        | speed (16xl-d3, T=192) |
-|----------------------------------|-----------------------------------------------|----------------------------------------------------|-------|
-| default                          | `parlay::group_by_key_ordered` (radix sort)  | hash-quality argument (96-bit combined entropy)    | 350 ms |
-| `-DPE_GROUPBY_HASH=ON`           | `parlay::group_by_key` + `sigs_equal`        | deterministic under any hash function              | 422 ms |
+The default uses a 32-bit secondary FxHash (different seed) computed in
+the same children-roots pass as the primary — no extra UF lookups,
+costs effectively zero. Combined entropy across the two hashes is 96
+bits; expected number of distinct signatures sharing both hashes in a
+64M-element batch is ≈ 10⁻¹⁴, much smaller than any other failure mode
+in the system.
 
-The default is ~1.2× faster because parlay's `group_by_key_ordered` hits
-the `integer_sort` (radix) fast path when the key is an unsigned integral
-and `sizeof(pair) ≤ 16` — both of which we ensure by keying on the 64-bit
-hash and keeping the value half slim.
+The sound variant calls `sigs_equal` (the children-walk comparison
+resolved through the UF) at every equality probe. Slower but provably
+correct under any hash function. `CanonEntry` stays at 16 bytes either
+way; the trailing 4-byte slot is `secondary_hash` by default,
+`class_id` when sound.
 
-### Default implementation (ordered + dual hash)
+### Two output flavors
+
+| function                       | output                                     | used by |
+|--------------------------------|--------------------------------------------|---------|
+| `merge_and_collect_semisort`   | returns next-round work (touched roots)    | `parallel_close`, `parallel_close_async_rounds*` |
+| `apply_congruence_semisort`    | unions only; no return                     | `parallel_close_topo`, `parallel_close_topo_iter` |
+
+The lean variant skips the per-group `parlay::map(values, .root)` and
+the outer `parlay::flatten` — the topo path drives rounds from
+precomputed `depth_buckets_` rather than reading next-round work, so
+that work is wasted.
+
+The lean variant uses a faster bucketing path: `parlay::integer_sort`
+in place by primary hash, find run boundaries via
+`parlay::tabulate + pack_index`, then `parlay::parallel_for` over the
+runs. No keyed-pair allocation, no per-group `parlay::sequence<value>`
+allocation.
+
+### `dnc_union` and `dnc_union_with`
+
+Per-bucket merging is divide-and-conquer:
 
 ```cpp
-// Computed once during the consolidation map: h is the 64-bit primary
-// signature hash, h2 is a 32-bit secondary computed by FxHasher with a
-// different seed in the same children-roots pass (no extra UF lookups).
-auto keyed = parlay::delayed_tabulate(n, [&](size_t i) {
-  return std::pair<uint64_t, RootH2>{canon[i].h,
-                                     RootH2{canon[i].root, canon[i].h2}};
-});
-
-// Radix-sort by h, group runs of equal h, return (h, sequence<RootH2>).
-auto groups = parlay::group_by_key_ordered(keyed);
-
-auto per_group = parlay::map(groups, [&](auto& kv) {
-  auto& values = kv.second;
-  if (values.size() < 2) return parlay::sequence<Id>{};
-
-  // Fast path: every element shares h2 with the first → same signature.
-  bool same = true;
-  uint32_t h2_ref = values[0].h2;
-  for (size_t i = 1; i < values.size(); ++i)
-    if (values[i].h2 != h2_ref) { same = false; break; }
-  if (same) {
-    dnc_union(values, 0, values.size(), uf);
-    return parlay::tabulate(values.size(),
-                            [&](size_t i) { return values[i].root; });
+template <typename Bucket>
+void dnc_union(Bucket& bucket, std::size_t lo, std::size_t hi,
+               ConcurrentUnionFind& uf) {
+  if (hi - lo <= 1) return;
+  if (hi - lo <= dnc_cutoff()) {
+    for (std::size_t i = lo + 1; i < hi; ++i)
+      uf.union_(as_root(bucket[lo]), as_root(bucket[i]));
+    return;
   }
-  // Slow path: sub-bucket by h2 (defensive — should never fire on real
-  // inputs given 96-bit combined entropy; expected count of distinct
-  // signatures with both hashes colliding in a 64M-element batch is
-  // ≈10⁻¹⁴). Keeps the algorithm correct on adversarial inputs.
-  ...
-});
-return parlay::flatten(per_group);
+  std::size_t mid = lo + (hi - lo) / 2;
+  parlay::par_do([&] { dnc_union(bucket, lo, mid, uf); },
+                 [&] { dnc_union(bucket, mid, hi, uf); });
+  uf.union_(as_root(bucket[lo]), as_root(bucket[mid]));
+}
 ```
 
-#### 2a. Why dual hash
+`PE_DNC_CUTOFF` (default 16) tunes the leaf-call sequential threshold.
 
-`group_by_key_ordered` defines group boundaries solely by the sort
-comparator on the key. With a 64-bit hash and 64M elements, the expected
-number of distinct signatures sharing a hash is ≈ 64M² / 2⁶⁴ ≈ 2×10⁻⁴ —
-non-zero, and a single collision would silently merge unrelated classes,
-corrupting the equivalence forever. So the key alone isn't enough.
-
-`sigs_equal` is correct but expensive: each call does N `find_root`
-lookups per child, and parlay's open-addressing hash table calls it once
-per probe in a bucket. Empirically that single phase eats ~1.4× of the
-algorithm's total wallclock at high T on quintic-n23.
-
-The trick: compute a *second* 64-bit FxHash with a different seed in the
-same children-roots pass (no extra UF lookups), truncate to 32 bits, and
-carry it as the value half of the keyed pair. Per-group equality becomes
-a single `uint32` compare per element — no UF lookups, no node lookup, no
-predicate at all.
-
-Combined entropy is 64 + 32 = 96 bits. Across a 64M-element batch the
-expected number of distinct signatures sharing both hashes is
-≈ 64M² / 2⁹⁶ ≈ 10⁻¹⁴, *much* smaller than the per-batch noise floor of
-literally any other failure mode in the system. The slow-path subdivision
-is kept as a defensive net so correctness is unconditional, not
-probabilistic.
-
-#### 2b. Legacy implementation (deterministic)
-
-`-DPE_GROUPBY_HASH=ON` selects the original code path:
-
-```cpp
-auto keyed = parlay::delayed_tabulate(n, [&](size_t i) {
-  return std::pair<CanonEntry, Id>{canon[i], canon[i].root};
-});
-auto hash_fn  = [](const CanonEntry& e) { return e.h; };
-auto equal_fn = [&](const CanonEntry& a, const CanonEntry& b) {
-  return a.h == b.h && sigs_equal(a.idx, b.idx, uf, nodes);
-};
-auto groups = parlay::group_by_key(keyed, hash_fn, equal_fn);
-```
-
-`parlay::group_by_key(R, hash, equal)` is the hash-distribute-then-
-equality-resolve primitive. Feeding it `sigs_equal` filters 64-bit hash
-collisions by actually walking the children — slower per probe, but
-provably correct under any hash function. Useful when the hash-quality
-argument isn't acceptable (e.g. fuzzing harnesses).
-
-#### 2c. Within-group union
-
-Two strategies, env-selectable via `PE_UNION_STYLE`:
-
-* **D&C** (default; `dnc_union` recursive `parlay::par_do`): the union
-  tree has depth `O(log n)` and `n - 1` total unions. Sibling unions at
-  the bottom of the tree target *disjoint* class ids — no CAS contention.
-  Below `PE_DNC_CUTOFF` (default 16), falls through to a sequential
-  pairwise sweep.
-* **`adjacent`** (`PE_UNION_STYLE=adjacent`): a flat
-  `parlay::parallel_for(i, ...) { union(bucket[i], bucket[i+1]); }`.
-  Trivially simple; every adjacent pair shares an endpoint with its
-  neighbour, so the lock-free CAS retries more under load. Empirically
-  wins on `large` (~10–15% faster) because group sizes are small enough
-  that the contention is bounded.
-
-### Touched ids
-
-Every entry's `.root` (the *pre-round* root, captured at canon
-construction) goes into the touched output. The next round picks them up,
-the consolidation step migrates their `parent_index` slots into whatever
-root absorbed them, and the cycle continues.
-
----
+`dnc_union_with` is a templated variant that takes a caller-supplied
+union method (lambda). Used by the MIN_ID-linking variants
+(`parallel_close_async_rounds_min_id`, `parallel_close_topo_iter`) to
+substitute `union_min_id` for `union_` without duplicating the dnc
+structure.
 
 ## Correctness invariants
 
-1. **`parent_index[c]` always reflects "nodes whose direct child was `c`
-   at add time."** Never overwritten in a way that loses entries; only
+For `parallel_close` (BSP-frontier):
+
+1. **`parents_[c]` always reflects "nodes whose direct child was `c` at
+   add time."** Never overwritten in a way that loses entries; only
    moved (consolidation) or appended-to. After consolidation,
-   `parent_index[c]` may be empty, but its entries live in
-   `parent_index[root_of_c]`, so iterating roots covers everything.
+   `parents_[c]` may be empty, but its entries live in
+   `parents_[root_of_c]`, so iterating roots covers everything.
 
 2. **Every class id whose root changes in round R is in the work list of
-   round R+1.** True because `merge_and_collect_semisort` returns *every
-   `.root` of every same-sig group entry* — both endpoints of every union
-   it issued. The lock-free UF's `union` also covers any chain that
-   transitively merges classes, so after a round all touched classes'
-   new roots show up.
+   round R+1.** True because `merge_and_collect_semisort` returns every
+   `.root` of every same-sig group entry — both endpoints of every
+   union it issued. Lock-free union also covers transitive merges.
 
-(1) and (2) together rule out the soundness bug in which a non-root `c`
-whose root just changed gets orphaned: it ends up in the work list, so
-consolidation migrates `parent_index[c]` into the new root, so the root
-iteration finds every parent that needs re-canonicalization.
+For `parallel_close_topo_iter` (depth-stratified iterated):
 
----
+3. **Within each round of the depth walk, sigs are computed against a
+   snapshot of the UF state.** `parlay::map` join-barrier separates the
+   read phase from the write phase. Phase 1 only does path-compression
+   CAS (idempotent w.r.t. find_root return values). Phase 2 does the
+   unions.
+
+4. **Outer fixpoint loop terminates.** Each iteration that fires any
+   real union strictly reduces the number of distinct equivalence
+   classes. So the loop runs at most `N` times in the worst case.
+
+For `sequential_close_dst`:
+
+5. **Stale hashcons entries are harmless.** A `(sig → pidx)` entry can
+   become stale if `pidx`'s child roots change. A future structurally-
+   matching insertion that hits the stale entry yields a valid merge by
+   monotonicity of congruence (once two terms were congruent, they stay
+   congruent). The new entry is also inserted, so no information is
+   lost — just possibly redundant work.
 
 ## How to build and run
 
 ### Build
 
 ```
-cmake -B build -S .
-cmake --build build
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
 ```
 
-Parlay is pulled by CMake's `FetchContent`. C++20 required.
-`libjemalloc-dev` is also required by default (Ubuntu/Debian:
-`sudo apt-get install libjemalloc-dev`); see the `USE_JEMALLOC` option
-below to opt out.
+Parlay and ankerl::unordered_dense are pulled by CMake's `FetchContent`.
+C++20 required. `libjemalloc-dev` is required by default (Ubuntu/Debian:
+`sudo apt-get install libjemalloc-dev`); see `USE_JEMALLOC` to opt out.
 
 ### CMake options
 
-| option              | default | effect |
-|---------------------|---------|--------|
-| `USE_JEMALLOC`      | `ON`    | Link against jemalloc to bypass glibc's per-arena lock contention. ~1.2× speedup on closure_compare 16xl-d3 at T=192, ~1.8× on the synthetic wide-shallow workloads. Set `OFF` to fall back to system malloc (dev package not required). |
-| `PE_GROUPBY_HASH`   | `OFF`   | Switch `merge_and_collect_semisort` from the default `group_by_key_ordered` + dual-hash path to the legacy `group_by_key` + `sigs_equal` path. The legacy path is deterministically correct under any hash function but ~1.2× slower on closure_compare. `CanonEntry` stays at 16 B in either build. |
+| option                | default | effect |
+|-----------------------|---------|--------|
+| `USE_JEMALLOC`        | `ON`    | Link against jemalloc to bypass glibc per-arena lock contention. ~1.2× speedup on closure_compare 16xl-d3 at T=192, ~1.8× on wide-shallow synthetic workloads. |
+| `PE_SEMISORT_SOUND`   | `OFF`   | Switch the semisort equality check from secondary-hash to structural `sigs_equal`. Deterministic under any hash function but ~1.2× slower. `CanonEntry` stays at 16 B in either build. |
 
 ### Test
 
@@ -371,11 +388,14 @@ cd build && ctest --output-on-failure
 ```
 
 Two suites:
-- `unionfind_test` — lock-free concurrent UF (basic single-thread ops,
-  transitive chain, a 1000-element `parlay::parallel_for` union check).
-- `regression_test` — runs every `examples/regression/*.smt2` through
-  the parser → e-graph → `parallel_close` pipeline; verifies sat/unsat
-  against the `_sat`/`_unsat` filename suffix.
+- `unionfind_test` — lock-free concurrent UF (basic ops, transitive
+  chain, parallel_for stress).
+- `closure_test` — algorithm correctness against `parallel_close` as
+  oracle. **14 of 16 tests pass; two are intentional regression markers
+  documenting known unsound algorithms** (`par_topo_cross_depth` and
+  `seq_topo_adversarial`). Those two cases stay failing on purpose; the
+  bench-driver script tolerates them and aborts only on unexpected
+  failures.
 
 ### CLI
 
@@ -384,12 +404,8 @@ Two suites:
 ```
 
 Reads a QF_UF SMT-LIB 2 instance, builds the e-graph from the asserted
-equalities and disequalities, runs `parallel_close` on the equality list,
-and prints `sat` or `unsat`. The parser handles `set-logic`,
-`declare-sort/fun/const`, `assert (= a b)`, `assert (not (= a b))`, and
-`check-sat`. Boolean connectives (`and`/`or`/`=>`/`xor`/`ite`/`distinct`)
-are not modeled — easy to add back to `Term::Kind` and `parse_term` when
-a downstream consumer needs them.
+equalities and disequalities, runs `parallel_close` on the equality
+list, and prints `sat` or `unsat`.
 
 ### Generating synthetic inputs
 
@@ -399,18 +415,19 @@ python3 gen_bench.py all <n>
 python3 gen_bench.py sweep <n1> <n2> <step>
 ```
 
-Four families: `chain` (O(n) sequential cascade), `grid` (n²), `cube`
-(n³), `exp` (2ⁿ exponential cascade through layered functions). Default
-output is `examples/synthetic/`. Each file has a known UNSAT disequality
-requiring the entire formula to derive.
+Five families: `chain` (O(n) sequential cascade), `grid` (n²), `cube`
+(n³), `quartic` (n⁴), `quintic` (n⁵). Output defaults to
+`synthetic_benchmarks/`.
 
-### Benchmark
+## Benchmarks
 
-```
-./build/closure_compare_bench
-```
+Three drivers; each emits human-readable text by default and CSV under
+`PE_BENCH_FORMAT=csv`. They share `PE_BENCH_HEADER=1` (emit CSV header)
+and `PE_BENCH_SKIP_NELSON=1` (skip the original `nelson_seq` baseline).
 
-Six workloads, comparing `sequential_close_nelson` vs `parallel_close`:
+### `closure_compare_bench`
+
+Six random uniform-DAG workloads at depth 1 or 3:
 
 | name    | leaves | nodes     | merges  | depth |
 |---------|--------|-----------|---------|-------|
@@ -421,93 +438,124 @@ Six workloads, comparing `sequential_close_nelson` vs `parallel_close`:
 | deep-m  | 10 000 | 200 000   | 20 000  | 3     |
 | deep-l  | 50 000 | 1 000 000 | 100 000 | 3     |
 
+Initial unions are leaf-leaf only (half x↔x, half y↔y) — *no
+cross-depth inits*, so the unsound algorithms happen to produce correct
+results on this corpus.
+
 Output columns:
 ```
-name    leaves    nodes    merges  | nelson_seq |  par_close   par_spd
+nelson_seq | nelson_topo* | topo_iter | nelson_dst | par_close | par_topo_iter | par_async | par_async_min
 ```
+(`*` = unsound; kept for reference)
 
-`nelson_seq` is the median of 11 trials (3 warmup) of
-`EGraph::sequential_close_nelson`; `par_close` the same for
-`EGraph::parallel_close`; `par_spd = nelson_seq / par_close`.
+### `synthetic_bench`
 
-Workload construction itself is also fully parallel: a single
-`parlay::tabulate` over `total = 2*n_leaves + n_nodes` produces every
-ENode (leaves and per-level function nodes), then `EGraph::bulk_init`
-builds `uf_` / `nodes_` / `parent_index_` in one parallel pass. Random
-draws use `parlay::random_generator` with `gen[i]` to fork an
-independent sub-generator per tabulate index — no sequential RNG state.
-The 14 builds per workload (3 warmup + 11 trials) are why this matters:
-without the parallel build, build dominated wall time on `large` and
-`deep-l`.
+Five polynomial families (`chain`, `grid`, `cube`, `quartic`, `quintic`)
+at default sizes `n ∈ {5, 10, 20}`. Override via `PE_SYNTH_FAMILIES`,
+`PE_SYNTH_NS`, `PE_SYNTH_D` (g-tree fan-in).
 
-#### Tunables (env vars)
+The polynomial families construct:
+- 2n leaves (a-side and b-side)
+- 2 × n^arity f-applications (one per multi-index, both sides)
+- A balanced binary g-tree wrapper on each side (~m / (d-1) g-nodes
+  where d = g-tree fan-in, default 2).
+
+Initial unions: `a_i = b_i` for `i ∈ [0, n)` (leaf-leaf only).
+
+The g-tree depth is `⌈log_d(n^arity)⌉`. For quintic n=20 with d=2,
+that's 22 levels — the largest synthetic cascade we run, ~12.8M classes.
+
+### `smt_bench`
+
+Sweeps a directory of `.smt2` files (one bench per file). Filename
+convention `<family>_n<N>_(sat|unsat).smt2` (matching `gen_bench.py`)
+gets `family` and `n` columns; other names get blank `family`. Used for
+the eggcc corpus at `cc-benchmarks/smt-grounded`.
+
+### Tunables (env vars)
 
 | var                       | values            | effect                                                       |
 |---------------------------|-------------------|--------------------------------------------------------------|
-| `PARLAY_NUM_THREADS`      | `1, 2, 4, 8, 12…` | parlay scheduler thread count (default = logical CPUs).      |
-| `PE_BENCH_ONLY`           | `large` etc.      | Run only the named workload (faster iteration during sweeps).|
-| `PE_BENCH_SKIP_NELSON`    | `1`               | Skip the `sequential_close_nelson` baseline.                 |
-| `PE_UNION_STYLE`          | `adjacent`        | Use flat `parallel_for` inside groups instead of D&C.        |
-| `PE_DNC_CUTOFF`           | `16` (default)    | Group-size threshold below which `dnc_union` falls through to a sequential pairwise sweep. |
-| `PE_TRACE`                | `1`               | Per-round timing trace from `parallel_close` to stderr.      |
+| `PARLAY_NUM_THREADS`      | `1, 2, 4, …`      | parlay scheduler thread count (default = logical CPUs).      |
+| `PE_BENCH_ONLY`           | `large` etc.      | closure_compare: run only the named workload.                |
+| `PE_BENCH_SKIP_NELSON`    | `1`               | skip the `nelson_seq` baseline.                              |
+| `PE_BENCH_FORMAT`         | `csv`             | emit one row per (workload, algorithm, trial).               |
+| `PE_BENCH_HEADER`         | `1`               | emit the CSV header row (gated for appended runs).           |
+| `PE_BENCH_TRIALS`         | `1, 2, …`         | override default trials (5 for closure_compare/synthetic, 11 for smt_bench). |
+| `PE_BENCH_WARMUP`         | `0, 1, …`         | override default warmup count.                               |
+| `PE_SYNTH_FAMILIES`       | `chain,quintic`   | synthetic_bench: comma-separated subset of families.         |
+| `PE_SYNTH_NS`             | `5,10,20`         | synthetic_bench: comma-separated n values.                   |
+| `PE_SYNTH_D`              | `2, 3, …`         | g-tree fan-in for polynomial families (default 2).           |
+| `PE_SMT_TRIALS`           | `1, …`            | smt_bench: trials per file (default 11).                     |
+| `PE_SMT_WARMUP`           | `0, …`            | smt_bench: warmup per file (default 3).                      |
+| `PE_DNC_CUTOFF`           | `16` (default)    | sequential cutoff inside `dnc_union`.                        |
+| `PE_TRACE`                | `1`               | per-round timing trace from `parallel_close*` to stderr.      |
+| `PE_TRACE_ITER`           | `1`               | per-pass union counts for `*_topo_iter` to stderr.           |
 
-Examples:
+## The 144-core benchmark script
 
-```
-# Scaling sweep on `large` only:
-for T in 1 2 4 8 12; do
-  PARLAY_NUM_THREADS=$T PE_BENCH_ONLY=large ./build/closure_compare_bench \
-    | grep '^large' | sed "s/^/T=$T  /"
-done
+[bench/scripts/run_144core_topo.sh](bench/scripts/run_144core_topo.sh)
+drives the full sweep on a many-core machine: closure_compare and
+synthetic at T=144, strong-scaling sweeps across T ∈ {1, 2, 4, 8, 16,
+32, 48, 64, 96, 128, 144, 192}, and the full 507-file eggcc corpus.
 
-# DNC vs adjacent head-to-head:
-for s in '' adjacent; do
-  PE_UNION_STYLE=$s PE_BENCH_ONLY=large PE_BENCH_SKIP_NELSON=1 \
-    ./build/closure_compare_bench | grep '^large'
-done
-```
-
-## Eval (reproducing the plots)
-
-The bench infra under [bench/scripts/](bench/scripts/) drives sweeps and
-emits plots. CSV output from `closure_compare_bench` is opt-in
-(`PE_BENCH_FORMAT=csv`); the human-readable text format is unchanged
-when the env var is unset.
-
-```
-cmake --build build
-pip install -r bench/requirements.txt
-python3 bench/scripts/run.py all
-python3 bench/scripts/plot.py all
-python3 bench/scripts/summarize.py > bench/results/summary.txt
+```bash
+./bench/scripts/run_144core_topo.sh
 ```
 
-Outputs land in `bench/results/` (gitignored). `run.py` has
-subcommands you can run individually — `strong-scaling`,
-`workload-sweep`, `trace`, `components`, `smt`, `all` — each writes one
-CSV; `plot.py` renders PNGs; `summarize.py` prints the headline tables
-(median wallclock, speedup vs T=min, per-phase attribution, etc.) to
-stdout.
+Outputs land in `bench/results/topo144/`:
 
-| plot                           | what it shows                                                                              |
-|--------------------------------|--------------------------------------------------------------------------------------------|
-| `fig_strong_scaling.png`       | speedup vs PARLAY_NUM_THREADS, one line per workload, with an ideal `y=x` reference        |
-| `fig_wallclock.png`            | par_close wallclock vs threads, log-log; companion to the speedup plot                     |
-| `fig_trace_rounds_<w>_T<n>.png`| per-round time broken into consolidate / frontier / semisort (stacked bar)                 |
-| `fig_components.png`           | round-0 `parallel_consolidate` and `merge_and_collect_semisort` wallclock vs threads       |
-| `fig_workload_depth.png`       | par_close ms vs depth, one line per merge_frac                                              |
-| `fig_workload_merge_frac.png`  | par_close ms vs merge_frac, one line per depth                                              |
-| `fig_smt_scaling.png`          | par_close ms vs `n` for the four `gen_bench.py` families (`chain`, `grid`, `cube`, `exp`)   |
+```
+build_info.txt              git SHA, CPU info, NUMA topo, compiler
+sanity.log                  closure_test results
+closure_compare_144T.csv    closure_compare at T_max
+synthetic_144T.csv          synthetic_bench at T_max
+closure_scaling.csv         closure_compare across T
+quintic20_scaling.csv       synthetic quintic-20 (12.8M classes) across T
+eggcc_144T.csv              full 507-file cc-benchmarks/smt-grounded sweep
+eggcc_summary_144T.txt      aggregate ratios + win rates by class-bucket
+```
 
-Two new bench binaries:
+### Knobs
 
-- `./build/component_bench` — times `parallel_consolidate` and
-  `merge_and_collect_semisort` in isolation on round-0 mid-state.
-  CSV mode under `PE_BENCH_FORMAT=csv`; workload via `PE_COMPONENT_WORKLOAD`.
-- `./build/smt_bench <dir-or-file> ...` — runs `parallel_close` over
-  every `.smt2` under the given paths, emitting CSV. Filename pattern
-  `<family>_n<N>_(sat|unsat).smt2` (matching `gen_bench.py`) gets
-  `family` and `n` columns; other names get blank `family`.
+| env var               | default | effect |
+|-----------------------|---------|--------|
+| `T_MAX`               | `144`   | thread budget for headlines + scaling ceiling. |
+| `NUMACTL`             | `numactl -i all` | wraps each parallel binary. Override with empty string to disable, or `'numactl --cpunodebind=0'` to pin. |
+| `STEP_TIMEOUT`        | `30m`   | per-step timeout for non-eggcc bench invocations. Set `0` to disable. |
+| `STEP_TIMEOUT_EGG`    | `1h`    | timeout for the full eggcc sweep. |
+| `EGGCC_ONLY`          | `0`     | skip closure_compare + synthetic + scaling sweeps; run just eggcc + aggregator. Useful for debugging eggcc-specific regressions. |
 
-Both share `PE_BENCH_HEADER=1` (emit CSV header) and
-`PE_BENCH_SKIP_NELSON=1` (skip the sequential baseline).
+The script uses `set -euo pipefail` but tolerates the two
+intentionally-failing closure_test cases (it parses the test output and
+aborts only on *unexpected* failures). The per-step `timeout` wrapper
+prevents any single misbehaving workload from hanging the whole sweep.
+
+### Aggregator output
+
+The eggcc summary surfaces:
+- Σ wallclock per algorithm.
+- Speedup ratios for each parallel algorithm vs the best correct
+  sequential (`nelson_topo_iter` vs `nelson_dst`).
+- Per-file win rates (par_async vs nelson_topo_iter, par_topo_iter vs
+  par_async, par_async_min_id vs par_async, etc.).
+- Per-class-bucket table (<1K, 1-10K, 10-100K, ≥100K classes) showing
+  par_async_min_id ratio against the better of the two correct
+  sequentials per file.
+
+## Practical recommendations (current state)
+
+| input shape | recommended sound algorithm |
+|---|---|
+| <10K classes, any structure | `nelson_topo_iter` (with MIN_ID) — sequential overhead-free. |
+| 10K–500K, regular cascade (Family C, leaf-only inits) | `par_topo_iter` — depth-stratified scheduling beats async on regular shapes. |
+| 10K–500K, irregular (eggcc) | `par_async_min_id` — async dirty-filter handles imbalanced fanout. |
+| ≥500K, regular | `par_topo_iter` decisively (`5–10×` over best sequential). |
+| ≥500K, irregular | `par_async` or `par_async_min_id` (~5% spread between them). |
+| arbitrary correctness with no parallel infrastructure | `nelson_dst` — sound, correct on any input, `O(N log N)` per merge with smaller-into-larger. Slower on Family C (deep cascade) than `topo_iter` but avoids the `O(N × depth)` worst case. |
+
+The crossover for parallel-vs-sequential at 144 cores sits around
+**30K–100K classes** depending on workload shape. Below that, sequential
+wins on overhead alone; above, parallel scales but framework cost is
+non-trivial and the choice between async and depth-stratified depends
+on cascade regularity.
