@@ -174,13 +174,17 @@ def _median_ms(rows: list[dict[str, str]],
 
 def plot_speedup_random(csv_path: Path, out_dir: Path,
                          par_algo: str = "par_close",
+                         seq_algo: str = "nelson_topo",
                          out_name: str | None = None):
-    """X=threads, Y=nelson_T1/par_T, color=workload name.
+    """X=threads, Y=seq_T1/par_T, color=workload name.
 
     `par_algo` selects which parallel algorithm column to use as the
     numerator in the speedup ratio: "par_close" (BSP, default) or
-    "par_close_async" (async-rounds). Output filename is derived from
-    `par_algo` unless `out_name` is given.
+    "par_close_async" (async-rounds). `seq_algo` selects the
+    sequential baseline: "nelson_topo" (default — usually faster, more
+    representative of "what a real sequential solver runs") or
+    "nelson_seq" (the classic Nelson worklist baseline). Output
+    filename is derived from `par_algo` unless `out_name` is given.
     """
     if not csv_path.exists():
         return
@@ -200,22 +204,32 @@ def plot_speedup_random(csv_path: Path, out_dir: Path,
         ms_field="wallclock_ms")
     nel = _median_ms(rows,
         key_fn=lambda r: (r[name_col], int(r["parlay_threads"]))
-            if r["algorithm"] == "nelson_seq" else None,
+            if r["algorithm"] == seq_algo else None,
         ms_field="wallclock_ms")
     if not par:
         return  # nothing to plot for this algorithm
-    # Nelson is sequential; closure_compare runs it at every thread
-    # count anyway. Take the min thread's median as the baseline (or
-    # any — they should match within noise).
-    nelson_baseline: dict[str, float] = {}
-    for (name, _t), v in nel.items():
-        nelson_baseline.setdefault(name, v)
-        nelson_baseline[name] = min(nelson_baseline[name], v)
-    # alternative: keep all-threads median
+    if not nel:
+        # Requested seq_algo missing (e.g. older CSV without nelson_topo
+        # rows). Try the other sequential as a fallback so we still get
+        # a plot.
+        fallback = "nelson_seq" if seq_algo == "nelson_topo" else "nelson_topo"
+        nel = _median_ms(rows,
+            key_fn=lambda r: (r[name_col], int(r["parlay_threads"]))
+                if r["algorithm"] == fallback else None,
+            ms_field="wallclock_ms")
+        if nel:
+            print(f"  [random] {seq_algo} not in csv; falling back to {fallback}")
+            seq_algo = fallback
+        else:
+            print(f"  [random] no sequential rows; skipping speedup")
+            return
+
+    # Sequential is thread-count-independent; take a global median per
+    # workload across whatever (name, threads) cells we have.
     nel_per_name: dict[str, list[float]] = defaultdict(list)
     for (name, _t), v in nel.items():
         nel_per_name[name].append(v)
-    nelson_med: dict[str, float] = {n: median(vs) for n, vs in nel_per_name.items()}
+    seq_med: dict[str, float] = {n: median(vs) for n, vs in nel_per_name.items()}
 
     threads = sorted({t for (_, t) in par})
     names   = sorted({n for (n, _) in par})
@@ -226,7 +240,7 @@ def plot_speedup_random(csv_path: Path, out_dir: Path,
     ax.plot(threads, threads, color="grey", linestyle=":", linewidth=1,
             label="linear (ideal)", zorder=0)
     for i, n in enumerate(names):
-        baseline = nelson_med.get(n)
+        baseline = seq_med.get(n)
         if baseline is None:
             continue
         ys, xs = [], []
@@ -240,8 +254,8 @@ def plot_speedup_random(csv_path: Path, out_dir: Path,
     ax.set_xscale("log", base=2); ax.set_yscale("log", base=2)
     ax.set_xticks(threads); ax.set_xticklabels([str(t) for t in threads])
     ax.set_xlabel("threads")
-    ax.set_ylabel(f"speedup (nelson_seq / {par_algo})")
-    ax.set_title(f"random — strong-scaling speedup vs sequential ({par_algo})")
+    ax.set_ylabel(f"speedup ({seq_algo} / {par_algo})")
+    ax.set_title(f"random — strong-scaling speedup vs {seq_algo} ({par_algo})")
     ax.grid(True, which="both", alpha=0.3)
     ax.legend(fontsize=8, loc="best")
     _save(fig, out_path)
@@ -249,12 +263,15 @@ def plot_speedup_random(csv_path: Path, out_dir: Path,
 
 def _plot_synth_like_speedup(csv_path: Path, out_dir: Path,
                               fig_name: str, title: str,
-                              par_algo: str = "par_close"):
+                              par_algo: str = "par_close",
+                              seq_algo: str = "nelson_topo"):
     """Common (synthetic / cube_decomp) speedup plot.
 
-    color = (family, n) and linestyle/marker = d. nelson_seq is run at
-    one thread count per (family, n, d) — we use that as the baseline.
-    `par_algo` selects "par_close" (BSP, default) or "par_close_async".
+    color = (family, n) and linestyle/marker = d. The chosen sequential
+    algorithm is run at one thread count per (family, n, d) — we use
+    that as the baseline. `par_algo` selects "par_close" (BSP, default)
+    or "par_close_async". `seq_algo` selects the sequential baseline
+    ("nelson_topo" default, "nelson_seq" alternative).
     """
     if not csv_path.exists():
         return
@@ -267,6 +284,8 @@ def _plot_synth_like_speedup(csv_path: Path, out_dir: Path,
 
     par_buckets: dict[tuple, list[float]] = defaultdict(list)
     nel_buckets: dict[tuple, list[float]] = defaultdict(list)
+    nel_buckets_fallback: dict[tuple, list[float]] = defaultdict(list)
+    fallback_seq = "nelson_seq" if seq_algo == "nelson_topo" else "nelson_topo"
     for r in rows:
         try:
             fam = r["family"]; n = int(r["n"]); d = int(r["d"])
@@ -276,13 +295,21 @@ def _plot_synth_like_speedup(csv_path: Path, out_dir: Path,
             continue
         if r["algorithm"] == par_algo:
             par_buckets[(fam, n, d, t)].append(ms)
-        elif r["algorithm"] == "nelson_seq":
+        elif r["algorithm"] == seq_algo:
             nel_buckets[(fam, n, d)].append(ms)
+        elif r["algorithm"] == fallback_seq:
+            nel_buckets_fallback[(fam, n, d)].append(ms)
     par_med = {k: median(v) for k, v in par_buckets.items()}
     nel_med = {k: median(v) for k, v in nel_buckets.items()}
 
     if not par_med:
         return  # no rows for this algorithm
+
+    if not nel_med and nel_buckets_fallback:
+        nel_med = {k: median(v) for k, v in nel_buckets_fallback.items()}
+        print(f"  [{fig_name}] {seq_algo} not in csv; "
+              f"falling back to {fallback_seq}")
+        seq_algo = fallback_seq
 
     threads = sorted({t for (_, _, _, t) in par_med})
     if not threads:
@@ -322,7 +349,7 @@ def _plot_synth_like_speedup(csv_path: Path, out_dir: Path,
     ax.set_xscale("log", base=2); ax.set_yscale("log", base=2)
     ax.set_xticks(threads); ax.set_xticklabels([str(t) for t in threads])
     ax.set_xlabel("threads")
-    ax.set_ylabel(f"speedup (nelson_seq / {par_algo})")
+    ax.set_ylabel(f"speedup ({seq_algo} / {par_algo})")
     ax.set_title(title)
     ax.grid(True, which="both", alpha=0.3)
     ax.legend(fontsize=7, loc="best", ncol=2)
@@ -330,23 +357,25 @@ def _plot_synth_like_speedup(csv_path: Path, out_dir: Path,
 
 
 def plot_speedup_synthetic(csv_path: Path, out_dir: Path,
-                            par_algo: str = "par_close"):
+                            par_algo: str = "par_close",
+                            seq_algo: str = "nelson_topo"):
     suffix = "" if par_algo == "par_close" else f"_{par_algo}"
     _plot_synth_like_speedup(csv_path, out_dir,
         fig_name=f"synthetic_speedup{suffix}.png",
-        title=f"synthetic — speedup vs nelson_seq, {par_algo} "
+        title=f"synthetic — speedup vs {seq_algo}, {par_algo} "
               f"(color=(family,n), style=d)",
-        par_algo=par_algo)
+        par_algo=par_algo, seq_algo=seq_algo)
 
 
 def plot_speedup_cube_decomp(csv_path: Path, out_dir: Path,
-                              par_algo: str = "par_close"):
+                              par_algo: str = "par_close",
+                              seq_algo: str = "nelson_topo"):
     suffix = "" if par_algo == "par_close" else f"_{par_algo}"
     _plot_synth_like_speedup(csv_path, out_dir,
         fig_name=f"cube_decomp_speedup{suffix}.png",
-        title=f"cube_decomp — speedup vs nelson_seq, {par_algo} "
+        title=f"cube_decomp — speedup vs {seq_algo}, {par_algo} "
               f"(color=(cube,k), style=d)",
-        par_algo=par_algo)
+        par_algo=par_algo, seq_algo=seq_algo)
 
 
 def plot_speedup_egg(csv_path: Path, out_dir: Path, top_n: int,

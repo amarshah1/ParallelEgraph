@@ -799,7 +799,36 @@ def main():
                          "par_close_async (egg.csv) — random/synthetic/"
                          "cube_decomp already had one, populated by the "
                          "binaries themselves.")
+    ap.add_argument("--warmup", type=int, default=None,
+                    help="warmup runs per (workload, threads, algorithm) "
+                         "cell. Default: 1 (matches existing benches). "
+                         "Applied uniformly to all four phases via "
+                         "PE_BENCH_WARMUP env (random/synthetic/"
+                         "cube_decomp) and the egg-phase loop variable.")
+    ap.add_argument("--trials", type=int, default=None,
+                    help="measured trials per cell (default 5). Applied "
+                         "uniformly to all four phases via "
+                         "PE_BENCH_TRIALS env and the egg-phase loop "
+                         "variable.")
     args = ap.parse_args()
+
+    # Apply warmup/trials overrides:
+    #   - C++ binaries (closure_compare_bench, synthetic_bench, smt_bench)
+    #     read PE_BENCH_WARMUP / PE_BENCH_TRIALS from env. Set those once
+    #     globally so every subprocess inherits them.
+    #   - The egg phase's loop is in this driver — patch the module-level
+    #     EGG_WARMUP / EGG_TRIALS so run_egg picks up the new values.
+    global EGG_WARMUP, EGG_TRIALS
+    if args.warmup is not None:
+        if args.warmup < 0:
+            sys.exit("--warmup must be >= 0")
+        os.environ["PE_BENCH_WARMUP"] = str(args.warmup)
+        EGG_WARMUP = args.warmup
+    if args.trials is not None:
+        if args.trials < 1:
+            sys.exit("--trials must be >= 1")
+        os.environ["PE_BENCH_TRIALS"] = str(args.trials)
+        EGG_TRIALS = args.trials
 
     try:
         thread_counts = [int(t) for t in args.threads_sweep.split(",") if t]
