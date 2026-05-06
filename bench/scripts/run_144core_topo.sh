@@ -115,15 +115,53 @@ fi
 T_MAX=${T_MAX:-144}
 echo "T_max=$T_MAX"
 
+# Per-step timeout. Defaults to 30 minutes per bench-binary invocation.
+# Override with STEP_TIMEOUT=Xm (e.g. "5m" for 5 minutes, "1h" for 1 hour,
+# "0" or empty to disable). Used to bound any single workload-trial that
+# misbehaves (e.g., a CAS livelock at high contention) so the rest of the
+# sweep still completes.
+STEP_TIMEOUT=${STEP_TIMEOUT:-30m}
+TIMEOUT=""
+if [ -n "$STEP_TIMEOUT" ] && [ "$STEP_TIMEOUT" != "0" ]; then
+  if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT="timeout --foreground $STEP_TIMEOUT"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    # macOS: coreutils' gtimeout (brew install coreutils)
+    TIMEOUT="gtimeout --foreground $STEP_TIMEOUT"
+  else
+    echo "[warn] timeout/gtimeout not available; runs are unbounded" >&2
+  fi
+fi
+
+# Helper: run a bench step with the timeout wrapper. Logs on failure /
+# timeout but does not abort the script — `set +e` around the call.
+# Caller is responsible for redirecting stdout (the CSV) themselves;
+# all status messages from this function go to stderr to keep the
+# CSV stream clean.
+run_step() {
+  local label=$1; shift
+  echo "[run_step] $label" >&2
+  set +e
+  $TIMEOUT "$@"
+  local rc=$?
+  set -e
+  if [ $rc -eq 124 ]; then
+    echo "[run_step] $label TIMED OUT after $STEP_TIMEOUT" >&2
+  elif [ $rc -ne 0 ]; then
+    echo "[run_step] $label exit=$rc" >&2
+  fi
+  return 0
+}
+
 # ------------------- Headline at T_max -------------------
 echo "[2/6] closure_compare headline at T=$T_MAX"
-PARLAY_NUM_THREADS=$T_MAX \
-  PE_BENCH_FORMAT=csv PE_BENCH_HEADER=1 \
+run_step "closure_compare T=$T_MAX" \
+  env PARLAY_NUM_THREADS=$T_MAX PE_BENCH_FORMAT=csv PE_BENCH_HEADER=1 \
   $NUMACTL ./build/closure_compare_bench > "$OUT/closure_compare_144T.csv"
 
 echo "[3/6] synthetic_bench headline at T=$T_MAX"
-PARLAY_NUM_THREADS=$T_MAX \
-  PE_BENCH_FORMAT=csv PE_BENCH_HEADER=1 \
+run_step "synthetic_bench T=$T_MAX" \
+  env PARLAY_NUM_THREADS=$T_MAX PE_BENCH_FORMAT=csv PE_BENCH_HEADER=1 \
   $NUMACTL ./build/synthetic_bench > "$OUT/synthetic_144T.csv"
 
 # ------------------- Strong scaling: closure_compare across T -------------------
@@ -133,8 +171,8 @@ HDR=1
 for T in 1 2 4 8 16 32 48 64 96 128 144 192; do
   [ $T -gt $T_MAX ] && continue
   echo "  T=$T"
-  PARLAY_NUM_THREADS=$T \
-    PE_BENCH_FORMAT=csv PE_BENCH_HEADER=$HDR \
+  run_step "closure_compare T=$T" \
+    env PARLAY_NUM_THREADS=$T PE_BENCH_FORMAT=csv PE_BENCH_HEADER=$HDR \
     $NUMACTL ./build/closure_compare_bench >> "$OUT/closure_scaling.csv"
   HDR=
 done
@@ -146,18 +184,38 @@ HDR=1
 for T in 1 2 4 8 16 32 48 64 96 128 144 192; do
   [ $T -gt $T_MAX ] && continue
   echo "  T=$T"
-  PARLAY_NUM_THREADS=$T \
-    PE_SYNTH_FAMILIES=quintic PE_SYNTH_NS=20 \
+  run_step "quintic-20 T=$T" \
+    env PARLAY_NUM_THREADS=$T PE_SYNTH_FAMILIES=quintic PE_SYNTH_NS=20 \
     PE_BENCH_FORMAT=csv PE_BENCH_HEADER=$HDR \
     $NUMACTL ./build/synthetic_bench >> "$OUT/quintic20_scaling.csv"
   HDR=
 done
 
 # ------------------- Full eggcc sweep at T_max -------------------
-echo "[6/6] full eggcc sweep at T=$T_MAX (507 files; ~10-20 min)"
-PARLAY_NUM_THREADS=$T_MAX \
+# eggcc gets a longer ceiling — it's the longest stage and one slow file
+# shouldn't kill the rest. Use STEP_TIMEOUT_EGG to override (default 1h).
+EGG_TIMEOUT=${STEP_TIMEOUT_EGG:-1h}
+EGG_TIMEOUT_CMD=""
+if [ -n "$EGG_TIMEOUT" ] && [ "$EGG_TIMEOUT" != "0" ]; then
+  if command -v timeout >/dev/null 2>&1; then
+    EGG_TIMEOUT_CMD="timeout --foreground $EGG_TIMEOUT"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    EGG_TIMEOUT_CMD="gtimeout --foreground $EGG_TIMEOUT"
+  fi
+fi
+
+echo "[6/6] full eggcc sweep at T=$T_MAX (507 files; ~10-20 min, capped at $EGG_TIMEOUT)"
+set +e
+$EGG_TIMEOUT_CMD env PARLAY_NUM_THREADS=$T_MAX \
   PE_SMT_TRIALS=1 PE_SMT_WARMUP=0 PE_BENCH_HEADER=1 \
   $NUMACTL ./build/smt_bench cc-benchmarks/smt-grounded > "$OUT/eggcc_144T.csv"
+egg_rc=$?
+set -e
+if [ $egg_rc -eq 124 ]; then
+  echo "[run_step] eggcc sweep TIMED OUT after $EGG_TIMEOUT (CSV is partial)" >&2
+elif [ $egg_rc -ne 0 ]; then
+  echo "[run_step] eggcc sweep exit=$egg_rc" >&2
+fi
 
 # ------------------- Aggregate eggcc -------------------
 echo "[6/6] aggregating eggcc results"
@@ -192,6 +250,8 @@ END {
     if (ms[f, "par_async"]        < ms[f, "nelson_dst"])       wins_async_dst++
     if (ms[f, "par_close"]        < ms[f, "nelson_topo_iter"]) wins_close_iter++
     if (ms[f, "par_async_min_id"] < ms[f, "par_async"])        wins_min_over_async++
+    if (ms[f, "par_topo_iter"]    < ms[f, "nelson_topo_iter"]) wins_topo_iter_iter++
+    if (ms[f, "par_topo_iter"]    < ms[f, "par_async"])        wins_topo_iter_async++
 
     if (classes[f] < 1000)         b = "<1K"
     else if (classes[f] < 10000)   b = "1-10K"
@@ -213,20 +273,25 @@ END {
     printf "  Σ %-22s %10.2f ms\n", a[i] ":", sum[a[i]]
   }
   printf "\nspeedups (sum-of-medians):\n"
-  printf "  par_async        / nelson_topo_iter:      %.2fx     (sound seq → sound par)\n", sum["nelson_topo_iter"] / sum["par_async"]
+  printf "  par_topo_iter    / nelson_topo_iter:      %.2fx     (depth-strat parallel vs sound seq)\n", sum["nelson_topo_iter"] / sum["par_topo_iter"]
+  printf "  par_async        / nelson_topo_iter:      %.2fx     (async parallel vs sound seq)\n", sum["nelson_topo_iter"] / sum["par_async"]
   printf "  par_async_min_id / nelson_topo_iter:      %.2fx     (MIN_ID variant)\n", sum["nelson_topo_iter"] / sum["par_async_min_id"]
+  printf "  par_topo_iter    / nelson_dst:            %.2fx\n", sum["nelson_dst"] / sum["par_topo_iter"]
   printf "  par_async        / nelson_dst:            %.2fx\n", sum["nelson_dst"] / sum["par_async"]
   printf "  par_async_min_id / nelson_dst:            %.2fx\n", sum["nelson_dst"] / sum["par_async_min_id"]
   printf "  par_close        / nelson_topo_iter:      %.2fx\n", sum["nelson_topo_iter"] / sum["par_close"]
+  printf "  par_topo_iter    / par_async:             %.2fx     (depth-strat vs async)\n", sum["par_async"] / sum["par_topo_iter"]
   printf "  par_async        / par_close:             %.2fx     (async vs BSP-frontier)\n", sum["par_close"] / sum["par_async"]
   printf "  par_async_min_id / par_async:             %.2fx     (MIN_ID gain over by-rank)\n", sum["par_async"] / sum["par_async_min_id"]
   printf "  nelson_topo      / nelson_topo_iter:      %.2fx     (cost of correctness — unsound vs sound seq)\n", sum["nelson_topo_iter"] / sum["nelson_topo"]
 
   printf "\nwin rates over %d files:\n", n_paired
+  printf "  par_topo_iter     < nelson_topo_iter: %d (%.1f%%)\n", wins_topo_iter_iter, 100*wins_topo_iter_iter/n_paired
   printf "  par_async         < nelson_topo_iter: %d (%.1f%%)\n", wins_async_iter, 100*wins_async_iter/n_paired
   printf "  par_async         < nelson_dst:       %d (%.1f%%)\n", wins_async_dst, 100*wins_async_dst/n_paired
   printf "  par_close         < nelson_topo_iter: %d (%.1f%%)\n", wins_close_iter, 100*wins_close_iter/n_paired
   printf "  par_async_min_id  < par_async:        %d (%.1f%%)\n", wins_min_over_async, 100*wins_min_over_async/n_paired
+  printf "  par_topo_iter     < par_async:        %d (%.1f%%)\n", wins_topo_iter_async, 100*wins_topo_iter_async/n_paired
 
   printf "\npar_async_min_id vs best correct sequential, by classes-per-file:\n"
   printf "%-10s %5s | %12s %12s %12s %8s | %5s\n",
