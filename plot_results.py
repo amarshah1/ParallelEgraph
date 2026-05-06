@@ -596,6 +596,8 @@ def main():
     ap.add_argument("run_dir", help="runs/<ts>/ folder")
     ap.add_argument("--top-n", type=int, default=10,
                     help="N for top-N longest-close egg files (default 10)")
+    ap.add_argument("--no-trace-bars", action="store_true",
+                    help="skip (A) per-round stacked-bar charts")
     args = ap.parse_args()
 
     run_dir = Path(args.run_dir)
@@ -606,11 +608,14 @@ def main():
     print(f"writing figures under {figs}")
 
     # (A) per-round bar charts
-    print("[A] per-round stacked bars")
-    plot_trace_bars(run_dir / "random_trace.csv", figs, "random")
-    plot_trace_bars(run_dir / "synthetic_trace.csv", figs, "synthetic")
-    plot_trace_bars(run_dir / "cube_decomp_trace.csv", figs, "cube_decomp")
-    plot_trace_bars(run_dir / "egg_trace.csv", figs, "egg")
+    if args.no_trace_bars:
+        print("[A] per-round stacked bars — skipped (--no-trace-bars)")
+    else:
+        print("[A] per-round stacked bars")
+        plot_trace_bars(run_dir / "random_trace.csv", figs, "random")
+        plot_trace_bars(run_dir / "synthetic_trace.csv", figs, "synthetic")
+        plot_trace_bars(run_dir / "cube_decomp_trace.csv", figs, "cube_decomp")
+        plot_trace_bars(run_dir / "egg_trace.csv", figs, "egg")
 
     # (B) log-log speedup. Each phase gets a BSP plot. If the phase's
     # CSV also contains async rows (from --also-async runs), an async
