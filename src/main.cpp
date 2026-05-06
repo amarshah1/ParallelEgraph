@@ -30,7 +30,15 @@
 namespace {
 
 int usage(const char* prog) {
-  std::fprintf(stderr, "usage: %s [--timing] <file.smt2>\n", prog);
+  std::fprintf(stderr,
+      "usage: %s [--timing] [--sequential[=nelson|topo]] <file.smt2>\n"
+      "  --sequential          run sequential_close_nelson (default seq algo)\n"
+      "  --sequential=nelson   same as --sequential\n"
+      "  --sequential=topo     run sequential_close_topo\n"
+      "Without --sequential, the parallel path is used; selector via env:\n"
+      "  PE_USE_ASYNC=1   parallel_close_async_rounds\n"
+      "  PE_USE_TOPO=1    parallel_close_topo\n"
+      "  (neither)        parallel_close (BSP)\n", prog);
   return 2;
 }
 
@@ -52,11 +60,20 @@ double elapsed_ms(clk::time_point t0, clk::time_point t1) {
 int main(int argc, char** argv) {
   bool emit_timing = false;
   const char* path = nullptr;
+  // --sequential family: 0=parallel (default), 1=nelson, 2=topo
+  enum class SeqAlgo { None, Nelson, Topo };
+  SeqAlgo seq_algo = SeqAlgo::None;
   for (int i = 1; i < argc; ++i) {
-    if (std::strcmp(argv[i], "--timing") == 0) {
+    const char* a = argv[i];
+    if (std::strcmp(a, "--timing") == 0) {
       emit_timing = true;
+    } else if (std::strcmp(a, "--sequential") == 0 ||
+               std::strcmp(a, "--sequential=nelson") == 0) {
+      seq_algo = SeqAlgo::Nelson;
+    } else if (std::strcmp(a, "--sequential=topo") == 0) {
+      seq_algo = SeqAlgo::Topo;
     } else if (path == nullptr) {
-      path = argv[i];
+      path = a;
     } else {
       return usage(argv[0]);
     }
@@ -113,37 +130,85 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // PE_USE_ASYNC=1 picks the async-rounds closure (drops parents_,
-  // tracks per-term last-canonical-sig instead). Default is BSP.
+  // Closure-algorithm selector.
+  //   --sequential[=nelson|topo] → sequential path (single-threaded;
+  //                                independent of PARLAY_NUM_THREADS).
+  //   PE_USE_ASYNC=1 → parallel_close_async_rounds (mark-based dirty
+  //                    filter, no parents_).
+  //   PE_USE_TOPO=1  → parallel_close_topo (topological-sort-based;
+  //                    matches what closure_compare_bench /
+  //                    synthetic_bench / smt_bench tag as `par_topo`).
+  // Default: parallel_close (BSP, parents_-driven).
   const bool use_async = std::getenv("PE_USE_ASYNC") != nullptr;
+  const bool use_topo  = std::getenv("PE_USE_TOPO")  != nullptr;
+  if (use_async && use_topo) {
+    std::fprintf(stderr,
+                 "PE_USE_ASYNC and PE_USE_TOPO are mutually exclusive\n");
+    return 2;
+  }
+  if (seq_algo != SeqAlgo::None && (use_async || use_topo)) {
+    std::fprintf(stderr,
+                 "--sequential and PE_USE_ASYNC/PE_USE_TOPO are mutually "
+                 "exclusive\n");
+    return 2;
+  }
   auto nodes = std::move(builder).take_nodes();
-  std::unique_ptr<pe::ConcurrentEGraph> eg;
-  if (use_async) {
-    eg = std::make_unique<pe::ConcurrentEGraph>(std::move(nodes), pe::async);
-  } else {
-    eg = std::make_unique<pe::ConcurrentEGraph>(std::move(nodes));
-  }
-  auto t_build = clk::now();
-
-  if (use_async) {
-    eg->parallel_close_async_rounds(std::move(equalities));
-  } else {
-    eg->parallel_close(std::move(equalities));
-  }
-  auto t_close = clk::now();
 
   bool unsat = false;
-  for (auto [a, b] : disequalities) {
-    if (eg->equiv(a, b)) { unsat = true; break; }
+  clk::time_point t_build, t_close, t_check, t_dtor;
+
+  if (seq_algo != SeqAlgo::None) {
+    // Sequential path: EGraph<SequentialUnionFind>. Built unconditionally
+    // with the default ctor (parents_); both sequential closures consume
+    // it. Convert disequalities -> drop after verdict.
+    auto eg = std::make_unique<pe::SequentialEGraph>(std::move(nodes));
+    t_build = clk::now();
+    if (seq_algo == SeqAlgo::Topo) {
+      eg->sequential_close_topo(equalities);
+    } else {
+      eg->sequential_close_nelson(equalities);
+    }
+    t_close = clk::now();
+    for (auto [a, b] : disequalities) {
+      if (eg->equiv(a, b)) { unsat = true; break; }
+    }
+    t_check = clk::now();
+    std::puts(unsat ? "unsat" : "sat");
+    std::fflush(stdout);
+    eg.reset();
+    t_dtor = clk::now();
+  } else {
+    std::unique_ptr<pe::ConcurrentEGraph> eg;
+    if (use_async) {
+      eg = std::make_unique<pe::ConcurrentEGraph>(std::move(nodes), pe::async);
+    } else if (use_topo) {
+      eg = std::make_unique<pe::ConcurrentEGraph>(std::move(nodes), pe::topo);
+    } else {
+      eg = std::make_unique<pe::ConcurrentEGraph>(std::move(nodes));
+    }
+    t_build = clk::now();
+
+    if (use_async) {
+      eg->parallel_close_async_rounds(std::move(equalities));
+    } else if (use_topo) {
+      eg->parallel_close_topo(std::move(equalities));
+    } else {
+      eg->parallel_close(std::move(equalities));
+    }
+    t_close = clk::now();
+
+    for (auto [a, b] : disequalities) {
+      if (eg->equiv(a, b)) { unsat = true; break; }
+    }
+    t_check = clk::now();
+
+    std::puts(unsat ? "unsat" : "sat");
+    std::fflush(stdout);
+
+    // The EGraph dtor runs at function exit; capture its cost too.
+    eg.reset();
+    t_dtor = clk::now();
   }
-  auto t_check = clk::now();
-
-  std::puts(unsat ? "unsat" : "sat");
-  std::fflush(stdout);
-
-  // The EGraph dtor runs at function exit; capture its cost too.
-  eg.reset();
-  auto t_dtor = clk::now();
 
   if (emit_timing) {
     std::fprintf(stderr,
