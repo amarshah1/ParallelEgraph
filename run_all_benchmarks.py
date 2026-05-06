@@ -325,7 +325,7 @@ def run_random_xl(out_dir: Path, thread_counts: list[int],
 
 
 def run_random(out_dir: Path, thread_counts: list[int],
-               also_async: bool = False):
+               also_async: bool = False, only_topo: bool = False):
     """closure_compare_bench with PE_BENCH_FORMAT=csv at each thread count.
 
     The binary runs all 6 baked-in workloads in one invocation. Header is
@@ -338,6 +338,11 @@ def run_random(out_dir: Path, thread_counts: list[int],
     PE_USE_ASYNC=1 and PE_BENCH_SKIP_NELSON=1 so the async closure is
     timed alongside BSP. The CSV's `algorithm` column distinguishes them
     (nelson_seq / par_close / par_close_async).
+
+    When `only_topo`, every invocation sets PE_BENCH_SKIP_NELSON=1, which
+    drops the `nelson_seq` (Nelson worklist) baseline rows and leaves
+    only `nelson_topo` (sequential topo sort) and `par_topo` (parallel
+    topo sort) in random.csv.
     """
     csv_path = out_dir / "random.csv"
     trace_csv_path = out_dir / "random_trace.csv"
@@ -352,8 +357,10 @@ def run_random(out_dir: Path, thread_counts: list[int],
             # nelson_seq is sequential — its time doesn't depend on
             # PARLAY_NUM_THREADS. Run it only on the first thread count
             # for each (workload) and skip on subsequent thread counts
-            # via PE_BENCH_SKIP_NELSON=1.
-            bsp_skip_nelson = i > 0
+            # via PE_BENCH_SKIP_NELSON=1. `only_topo` forces the skip on
+            # every invocation so random.csv ends up with only
+            # nelson_topo + par_topo rows.
+            bsp_skip_nelson = only_topo or (i > 0)
             passes: list[tuple[str, dict[str, str]]] = [
                 ("bsp", {"PE_BENCH_SKIP_NELSON": "1"} if bsp_skip_nelson
                         else {}),
@@ -791,6 +798,13 @@ def main():
                     help="comma-separated subset of XL ladder rungs to run "
                          "(e.g. '16XL,32XL'). Only meaningful with "
                          "--random-xl-only. Defaults to the full ladder.")
+    ap.add_argument("--topo-only", action="store_true",
+                    help="run only the random phase, and within it only "
+                         "the sequential topo sort (nelson_topo) plus the "
+                         "parallel topo sort (par_topo). Skips nelson_seq "
+                         "by setting PE_BENCH_SKIP_NELSON=1 on every "
+                         "invocation, and implies --skip synthetic --skip "
+                         "cube_decomp --skip egg.")
     ap.add_argument("--also-async", action="store_true",
                     help="run the async-rounds closure alongside BSP at "
                          "every (workload, threads) cell. Roughly doubles "
@@ -839,6 +853,12 @@ def main():
     skip = set(args.skip)
     if args.random_xl_only:
         skip.update({"synthetic", "cube_decomp", "egg"})
+    if args.topo_only:
+        skip.update({"synthetic", "cube_decomp", "egg"})
+        if args.random_xl_only:
+            sys.exit("--topo-only and --random-xl-only are mutually exclusive: "
+                     "the XL ladder runs the full nelson_seq/nelson_topo/"
+                     "par_topo trio, not topo-only.")
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(args.out_root) / ts
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -875,8 +895,10 @@ def main():
             print(f"=== (a) random (XL ladder{tag}) ===")
             run_random_xl(out_dir, thread_counts, labels=xl_labels)
         else:
-            print("=== (a) random ===")
-            run_random(out_dir, thread_counts, also_async=args.also_async)
+            tag = " (topo-only)" if args.topo_only else ""
+            print(f"=== (a) random{tag} ===")
+            run_random(out_dir, thread_counts, also_async=args.also_async,
+                       only_topo=args.topo_only)
         print()
 
     if "synthetic" not in skip:

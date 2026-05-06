@@ -627,6 +627,12 @@ def main():
                     help="N for top-N longest-close egg files (default 10)")
     ap.add_argument("--no-trace-bars", action="store_true",
                     help="skip (A) per-round stacked-bar charts")
+    ap.add_argument("--topo-only", action="store_true",
+                    help="companion to run_all_benchmarks.py --topo-only: "
+                         "only emit the random-phase speedup plot, with "
+                         "par_algo=par_topo and seq_algo=nelson_topo. "
+                         "Skips synthetic/cube_decomp/egg plots since "
+                         "those phases weren't run.")
     args = ap.parse_args()
 
     run_dir = Path(args.run_dir)
@@ -635,6 +641,23 @@ def main():
     figs = run_dir / "figs"
     figs.mkdir(exist_ok=True)
     print(f"writing figures under {figs}")
+
+    # --topo-only: only the random phase was run, and within it only
+    # nelson_topo + par_topo. Plot the random speedup with par_topo as
+    # the parallel curve, nelson_topo as the baseline, and stop.
+    if args.topo_only:
+        print("[topo-only] random speedup (par_topo vs nelson_topo)")
+        plot_speedup_random(run_dir / "random.csv", figs,
+                            par_algo="par_topo",
+                            seq_algo="nelson_topo",
+                            out_name="random_speedup_topo.png")
+        if not args.no_trace_bars:
+            print("[A] per-round stacked bars (random only)")
+            plot_trace_bars(run_dir / "random_trace.csv", figs, "random")
+        print("[C] per-round time lines (random only)")
+        plot_rounds_random(run_dir / "random_trace.csv", figs)
+        print("done.")
+        return
 
     # (A) per-round bar charts
     if args.no_trace_bars:
