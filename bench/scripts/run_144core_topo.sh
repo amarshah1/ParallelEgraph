@@ -26,6 +26,19 @@ OUT=bench/results/topo144
 mkdir -p "$OUT"
 
 # ------------------- Pre-flight -------------------
+# Multi-socket NUMA: interleave allocations across all nodes so atomic
+# UF operations and the parlay scheduler's per-thread allocator don't
+# pile traffic on one node's memory controller. Override with NUMACTL=
+# (empty) to disable, or set NUMACTL='numactl --cpunodebind=0' to pin.
+NUMACTL=${NUMACTL:-numactl -i all}
+if [ -n "$NUMACTL" ]; then
+  command -v numactl >/dev/null 2>&1 || {
+    echo "numactl not found. Install with: sudo apt-get install numactl" >&2
+    echo "(Or run with NUMACTL= to disable: NUMACTL= ./bench/scripts/run_144core_topo.sh)" >&2
+    exit 1
+  }
+fi
+
 for B in closure_compare_bench synthetic_bench smt_bench closure_test; do
   [ -x "build/$B" ] || {
     echo "Missing build/$B. Run:" >&2
@@ -56,10 +69,14 @@ fi
     sysctl -n machdep.cpu.brand_string hw.physicalcpu hw.logicalcpu 2>/dev/null
   fi
   echo
+  echo "numa:"; numactl --hardware 2>&1 | head -20 || true
+  echo
+  echo "numactl prefix: $NUMACTL"
+  echo
   echo "compiler:"; cmake --version | head -1
 } > "$OUT/build_info.txt" 2>&1
 
-# Sanity check
+# Sanity check (no NUMACTL — closure_test is sequential and tiny)
 echo "[1/6] correctness tests"
 ./build/closure_test > "$OUT/sanity.log" 2>&1
 grep -E "FAIL|tests passed" "$OUT/sanity.log"
@@ -71,12 +88,12 @@ echo "T_max=$T_MAX"
 echo "[2/6] closure_compare headline at T=$T_MAX"
 PARLAY_NUM_THREADS=$T_MAX \
   PE_BENCH_FORMAT=csv PE_BENCH_HEADER=1 \
-  ./build/closure_compare_bench > "$OUT/closure_compare_144T.csv"
+  $NUMACTL ./build/closure_compare_bench > "$OUT/closure_compare_144T.csv"
 
 echo "[3/6] synthetic_bench headline at T=$T_MAX"
 PARLAY_NUM_THREADS=$T_MAX \
   PE_BENCH_FORMAT=csv PE_BENCH_HEADER=1 \
-  ./build/synthetic_bench > "$OUT/synthetic_144T.csv"
+  $NUMACTL ./build/synthetic_bench > "$OUT/synthetic_144T.csv"
 
 # ------------------- Strong scaling: closure_compare across T -------------------
 echo "[4/6] closure_compare strong scaling across T"
@@ -87,7 +104,7 @@ for T in 1 2 4 8 16 32 64 96 144; do
   echo "  T=$T"
   PARLAY_NUM_THREADS=$T \
     PE_BENCH_FORMAT=csv PE_BENCH_HEADER=$HDR \
-    ./build/closure_compare_bench >> "$OUT/closure_scaling.csv"
+    $NUMACTL ./build/closure_compare_bench >> "$OUT/closure_scaling.csv"
   HDR=
 done
 
@@ -101,7 +118,7 @@ for T in 1 2 4 8 16 32 64 96 144; do
   PARLAY_NUM_THREADS=$T \
     PE_SYNTH_FAMILIES=quintic PE_SYNTH_NS=20 \
     PE_BENCH_FORMAT=csv PE_BENCH_HEADER=$HDR \
-    ./build/synthetic_bench >> "$OUT/quintic20_scaling.csv"
+    $NUMACTL ./build/synthetic_bench >> "$OUT/quintic20_scaling.csv"
   HDR=
 done
 
@@ -109,7 +126,7 @@ done
 echo "[6/6] full eggcc sweep at T=$T_MAX (507 files; ~10-20 min)"
 PARLAY_NUM_THREADS=$T_MAX \
   PE_SMT_TRIALS=1 PE_SMT_WARMUP=0 PE_BENCH_HEADER=1 \
-  ./build/smt_bench cc-benchmarks/smt-grounded > "$OUT/eggcc_144T.csv"
+  $NUMACTL ./build/smt_bench cc-benchmarks/smt-grounded > "$OUT/eggcc_144T.csv"
 
 # ------------------- Aggregate eggcc -------------------
 echo "[6/6] aggregating eggcc results"
