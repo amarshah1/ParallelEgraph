@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Topo-closure benchmark sweep for the 144-core machine.
 #
-# Captures everything we'd want to know about how `parallel_close_topo`
-# (depth-stratified semisort BSP) scales relative to `nelson_topo` (the
-# optimized one-pass sequential algo) and the older `parallel_close`
-# BSP. Re-running overwrites prior results.
+# Times only the two topo paths — `sequential_close_topo` (nelson_topo)
+# and `parallel_close_topo` (par_topo) — across the closure_compare,
+# synthetic, and eggcc workloads. The Nelson baseline is skipped via
+# PE_BENCH_SKIP_NELSON=1. Re-running overwrites prior results.
 #
 # Outputs (under bench/results/topo144/):
 #   build_info.txt              compiler/git state captured at run time
@@ -25,6 +25,10 @@ cd "$(dirname "$0")/../.."
 OUT=bench/results/topo144
 mkdir -p "$OUT"
 
+# Bench drivers honor PE_BENCH_SKIP_NELSON to drop the Nelson baseline
+# from the table — leaving only nelson_topo and par_topo timed.
+export PE_BENCH_SKIP_NELSON=1
+
 # ------------------- Pre-flight -------------------
 # Multi-socket NUMA: interleave allocations across all nodes so atomic
 # UF operations and the parlay scheduler's per-thread allocator don't
@@ -39,14 +43,19 @@ if [ -n "$NUMACTL" ]; then
   }
 fi
 
-for B in closure_compare_bench synthetic_bench smt_bench closure_test; do
-  [ -x "build/$B" ] || {
-    echo "Missing build/$B. Run:" >&2
-    echo "  mkdir -p build && cd build && cmake -DCMAKE_BUILD_TYPE=Release .. \\" >&2
-    echo "    && cmake --build . --target closure_compare_bench synthetic_bench smt_bench closure_test -j" >&2
-    exit 1
-  }
+# Build any missing binary. cmake + make are incremental, so re-running
+# after no source changes is essentially a no-op (one stat per file).
+TARGETS="closure_compare_bench synthetic_bench smt_bench closure_test"
+need_build=0
+for B in $TARGETS; do
+  [ -x "build/$B" ] || { need_build=1; break; }
 done
+if [ "$need_build" -eq 1 ]; then
+  echo "[build] one or more bench binaries missing — building..."
+  mkdir -p build
+  ( cd build && cmake -DCMAKE_BUILD_TYPE=Release .. )
+  cmake --build build --target $TARGETS -j
+fi
 
 if [ ! -d cc-benchmarks/smt-grounded ] || [ -z "$(ls cc-benchmarks/smt-grounded/*.smt2 2>/dev/null)" ]; then
   echo "cc-benchmarks submodule not populated. Run:" >&2
@@ -139,14 +148,11 @@ NR == 1 { next }
 }
 END {
   for (f in files) {
-    if (!((f, "nelson_seq") in ms && (f, "nelson_topo") in ms &&
-          (f, "par_topo") in ms)) continue
+    if (!((f, "nelson_topo") in ms && (f, "par_topo") in ms)) continue
     n_paired++
-    sum_nel += ms[f, "nelson_seq"]
     sum_top += ms[f, "nelson_topo"]
     sum_pt  += ms[f, "par_topo"]
     if (ms[f, "par_topo"] < ms[f, "nelson_topo"]) pt_wins_top++
-    if (ms[f, "par_topo"] < ms[f, "nelson_seq"]) pt_wins_nel++
     if (classes[f] < 1000)         { b = "<1K"     }
     else if (classes[f] < 10000)   { b = "1-10K"   }
     else if (classes[f] < 100000)  { b = "10-100K" }
@@ -157,16 +163,11 @@ END {
     if (ms[f, "par_topo"] < ms[f, "nelson_topo"]) bw_top[b]++
   }
   printf "Files paired: %d / 507\n\n", n_paired
-  printf "Σ nelson_seq:  %10.2f ms\n", sum_nel
   printf "Σ nelson_topo: %10.2f ms\n", sum_top
   printf "Σ par_topo:    %10.2f ms\n\n", sum_pt
-  printf "par_topo aggregate (sum):\n"
-  printf "  vs nelson_seq:  %.2fx\n", sum_nel/sum_pt
-  printf "  vs nelson_topo: %.2fx\n\n", sum_top/sum_pt
-  printf "win rates:\n"
-  printf "  par_topo < nelson_seq:  %d / %d (%.1f%%)\n", pt_wins_nel, n_paired, 100*pt_wins_nel/n_paired
-  printf "  par_topo < nelson_topo: %d / %d (%.1f%%)\n\n", pt_wins_top, n_paired, 100*pt_wins_top/n_paired
-  printf "by classes-per-file (vs nelson_topo):\n"
+  printf "par_topo vs nelson_topo: %.2fx (sum)\n", sum_top/sum_pt
+  printf "win rate:                %d / %d (%.1f%%)\n\n", pt_wins_top, n_paired, 100*pt_wins_top/n_paired
+  printf "by classes-per-file:\n"
   printf "%-10s %5s | %12s %12s %8s | %5s\n", "bucket", "files", "Σnel_topo", "Σpar_topo", "ratio", "wins"
   order = "<1K 1-10K 10-100K >=100K"
   split(order, bs, " ")
