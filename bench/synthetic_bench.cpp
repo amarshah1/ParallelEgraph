@@ -265,15 +265,14 @@ BuiltGraph<UF> build(Family f, std::size_t n, std::size_t g_arity) {
   return {std::move(eg), std::move(w.eqs), total, n_eqs};
 }
 
-// Topo-flavor build: same workload generation, EGraph constructed via
-// the topo-tagged ctor (precomputes depth_buckets_, skips parents_/
-// last_marked_). Used by bench_parallel_close_topo.
+// Async-flavor build: workload generation identical, EGraph via the
+// async-tagged ctor (populates last_marked_, skips parents_).
 template <typename UF>
-BuiltGraph<UF> build_topo(Family f, std::size_t n, std::size_t g_arity) {
+BuiltGraph<UF> build_async(Family f, std::size_t n, std::size_t g_arity) {
   auto w = gen_workload(f, n, g_arity);
   const std::size_t total = w.nodes.size();
   const std::size_t n_eqs = w.eqs.size();
-  auto eg = std::make_unique<EGraph<UF>>(std::move(w.nodes), pe::topo);
+  auto eg = std::make_unique<EGraph<UF>>(std::move(w.nodes), pe::async);
   return {std::move(eg), std::move(w.eqs), total, n_eqs};
 }
 
@@ -355,19 +354,73 @@ std::vector<double> bench_nelson_topo(Family f, std::size_t n,
   return times;
 }
 
-std::vector<double> bench_parallel_close_topo(Family f, std::size_t n,
-                                                std::size_t g_arity,
-                                                int warmup, int trials) {
+std::vector<double> bench_nelson_topo_iter(Family f, std::size_t n,
+                                             std::size_t g_arity,
+                                             int warmup, int trials) {
   for (int i = 0; i < warmup; ++i) {
-    auto g = build_topo<ConcurrentUnionFind>(f, n, g_arity);
-    g.eg->parallel_close_topo(std::move(g.eqs));
+    auto g = build<SequentialUnionFind>(f, n, g_arity);
+    g.eg->sequential_close_topo_iter(g.eqs);
   }
   std::vector<double> times;
   times.reserve(trials);
   for (int i = 0; i < trials; ++i) {
-    auto g = build_topo<ConcurrentUnionFind>(f, n, g_arity);
+    auto g = build<SequentialUnionFind>(f, n, g_arity);
     auto t0 = clk::now();
-    g.eg->parallel_close_topo(std::move(g.eqs));
+    g.eg->sequential_close_topo_iter(g.eqs);
+    times.push_back(elapsed_ms(t0));
+  }
+  return times;
+}
+
+std::vector<double> bench_nelson_dst(Family f, std::size_t n,
+                                      std::size_t g_arity,
+                                      int warmup, int trials) {
+  for (int i = 0; i < warmup; ++i) {
+    auto g = build<SequentialUnionFind>(f, n, g_arity);
+    g.eg->sequential_close_dst(g.eqs);
+  }
+  std::vector<double> times;
+  times.reserve(trials);
+  for (int i = 0; i < trials; ++i) {
+    auto g = build<SequentialUnionFind>(f, n, g_arity);
+    auto t0 = clk::now();
+    g.eg->sequential_close_dst(g.eqs);
+    times.push_back(elapsed_ms(t0));
+  }
+  return times;
+}
+
+std::vector<double> bench_parallel_close(Family f, std::size_t n,
+                                          std::size_t g_arity,
+                                          int warmup, int trials) {
+  for (int i = 0; i < warmup; ++i) {
+    auto g = build<ConcurrentUnionFind>(f, n, g_arity);
+    g.eg->parallel_close(std::move(g.eqs));
+  }
+  std::vector<double> times;
+  times.reserve(trials);
+  for (int i = 0; i < trials; ++i) {
+    auto g = build<ConcurrentUnionFind>(f, n, g_arity);
+    auto t0 = clk::now();
+    g.eg->parallel_close(std::move(g.eqs));
+    times.push_back(elapsed_ms(t0));
+  }
+  return times;
+}
+
+std::vector<double> bench_parallel_close_async(Family f, std::size_t n,
+                                                 std::size_t g_arity,
+                                                 int warmup, int trials) {
+  for (int i = 0; i < warmup; ++i) {
+    auto g = build_async<ConcurrentUnionFind>(f, n, g_arity);
+    g.eg->parallel_close_async_rounds(std::move(g.eqs));
+  }
+  std::vector<double> times;
+  times.reserve(trials);
+  for (int i = 0; i < trials; ++i) {
+    auto g = build_async<ConcurrentUnionFind>(f, n, g_arity);
+    auto t0 = clk::now();
+    g.eg->parallel_close_async_rounds(std::move(g.eqs));
     times.push_back(elapsed_ms(t0));
   }
   return times;
@@ -484,11 +537,11 @@ int main() {
   if (!csv) {
     std::printf("synthetic_bench  trials=%d  warmup=%d  par_threads=%zu\n",
                 trials, warmup, par_threads);
-    std::printf("(par_topo \"spd\" is vs nelson_topo)\n");
-    std::printf("%-8s %5s %10s %9s | %11s %11s %8s | %11s %8s\n",
+    std::printf("(* = unsound on cross-depth inits; par_spd = par_close vs topo_iter)\n");
+    std::printf("%-8s %5s %10s %9s | %11s %11s %11s %11s | %11s %11s %7s\n",
                 "family", "n", "classes", "merges",
-                "nelson_seq", "nelson_topo", "vs_nel",
-                "par_topo", "vs_top");
+                "nelson_seq", "nelson_topo*", "topo_iter", "nelson_dst",
+                "par_close", "par_async", "par_spd");
   } else if (csv_header) {
     std::printf("family,n,d,classes,merges,algorithm,trial,"
                 "parlay_threads,dnc_cutoff,wallclock_ms\n");
@@ -525,20 +578,29 @@ int main() {
       }
       auto top = bench_nelson_topo(f, n, g_arity, warmup, trials);
       double mt = median(top);
-      auto ptp = bench_parallel_close_topo(f, n, g_arity, warmup, trials);
-      double mpt = median(ptp);
+      auto iter = bench_nelson_topo_iter(f, n, g_arity, warmup, trials);
+      double mi = median(iter);
+      auto dst = bench_nelson_dst(f, n, g_arity, warmup, trials);
+      double md = median(dst);
+      auto par = bench_parallel_close(f, n, g_arity, warmup, trials);
+      double mp = median(par);
+      auto pa = bench_parallel_close_async(f, n, g_arity, warmup, trials);
+      double mpa = median(pa);
 
       if (csv) {
         if (!skip_nelson) emit_csv(f, n, classes, merges, "nelson_seq", nel);
         emit_csv(f, n, classes, merges, "nelson_topo", top);
-        emit_csv(f, n, classes, merges, "par_topo", ptp);
+        emit_csv(f, n, classes, merges, "nelson_topo_iter", iter);
+        emit_csv(f, n, classes, merges, "nelson_dst", dst);
+        emit_csv(f, n, classes, merges, "par_close", par);
+        emit_csv(f, n, classes, merges, "par_async", pa);
       } else if (skip_nelson) {
-        std::printf("%-8s %5zu %10zu %9zu |   skipped   %9.2fms          | %9.2fms %6.2fx\n",
-                    family_name(f), n, classes, merges, mt, mpt, mt / mpt);
+        std::printf("%-8s %5zu %10zu %9zu |   skipped   %9.2fms %9.2fms %9.2fms | %9.2fms %9.2fms %6.2fx\n",
+                    family_name(f), n, classes, merges, mt, mi, md, mp, mpa, mi / mp);
       } else {
-        std::printf("%-8s %5zu %10zu %9zu | %9.2fms %9.2fms %6.2fx | %9.2fms %6.2fx\n",
+        std::printf("%-8s %5zu %10zu %9zu | %9.2fms %9.2fms %9.2fms %9.2fms | %9.2fms %9.2fms %6.2fx\n",
                     family_name(f), n, classes, merges,
-                    mn, mt, mn / mt, mpt, mt / mpt);
+                    mn, mt, mi, md, mp, mpa, mi / mp);
       }
       std::fflush(stdout);
     }

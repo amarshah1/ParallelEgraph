@@ -157,16 +157,29 @@ void EGraph<ConcurrentUnionFind>::parallel_close(
 
 // ---- parallel_close_topo ------------------------------------------------
 //
-// Depth-stratified BSP. Round d processes every class at depth d in
-// parallel. Because children sit strictly below their parents in depth,
-// every signature read in round d sees a UF state that no other round-d
-// thread is mutating; intra-round matches are resolved by the semisort
-// (same primitive used by parallel_close). Total rounds = max depth.
+// Depth-stratified BSP. Round d is a two-phase parallel step:
+//   Phase 1 (parlay::map):   compute CanonEntry for every depth-d class.
+//                            Reads UF (find_root); the only writes are
+//                            path-compression CAS, which preserves
+//                            find_root return values.
+//   parlay::map JOINS — implicit barrier between phases.
+//   Phase 2 (apply_congruence_semisort): semisort canon by hash, dnc_union
+//                            each non-singleton run. The only UF writes
+//                            in this round happen here.
+// The barrier is the actual safety property: every sig read in phase 1
+// observes the same UF snapshot — the post-round-(d-1) state — so the
+// semisort catches every intra-round congruence reachable from that
+// snapshot. Note that this safety does NOT come from depth stratification
+// per se: a class's representative can be a node at any depth (cross-depth
+// initial unions like `assert(leaf_ta1_0 = f0(a))` make the leaf's class
+// have a depth-1 root), and round-d unions can mutate those representatives.
+// What guarantees correctness is that phase 1 doesn't observe phase-2
+// mutations because the barrier orders them.
 //
-// Unlike `sequential_close_topo`, this is correct on arbitrary DAGs: at
-// every level the UF snapshot used to compute sigs is fixed for the
-// whole batch, so no level-d node misses a congruence with another
-// level-d node — they end up in the same semisort bucket.
+// Total rounds = max depth. Correct on arbitrary DAGs (including
+// cross-depth initial unions); unlike `sequential_close_topo`, no
+// level-d node ever misses a congruence with another level-d node — the
+// semisort sees them all in one frozen-snapshot bucketing pass.
 
 template <>
 void EGraph<ConcurrentUnionFind>::parallel_close_topo(
@@ -318,6 +331,15 @@ struct SignatureHash {
   }
 };
 
+template <typename UF>
+Signature canonical_sig(const ENode& node, UF& uf) {
+  Signature sig;
+  sig.op = &node.op;
+  sig.children.reserve(node.children.size());
+  for (Id c : node.children) sig.children.push_back(uf.find_root(c));
+  return sig;
+}
+
 }  // namespace
 
 template <>
@@ -331,20 +353,134 @@ void EGraph<SequentialUnionFind>::sequential_close_topo(
 
   const std::size_t n = nodes_.size();
   for (std::uint32_t pidx = 0; pidx < n; ++pidx) {
-    const auto& node = nodes_[pidx];
-
-    Signature sig;
-    sig.op = &node.op;
-    sig.children.reserve(node.children.size());
-    for (Id c : node.children) {
-      sig.children.push_back(uf_.find_root(c));
-    }
-
-    auto [it, inserted] = bucket.try_emplace(std::move(sig), pidx);
+    auto [it, inserted] = bucket.try_emplace(
+        canonical_sig(nodes_[pidx], uf_), pidx);
     if (!inserted) {
       Id ra = uf_.find_root(pidx);
       Id rb = uf_.find_root(it->second);
       if (ra != rb) uf_.union_(ra, rb);
+    }
+  }
+}
+
+// ---- sequential_close_topo_iter -----------------------------------------
+//
+// Drive `sequential_close_topo` to a fixpoint. Each iteration is a fresh
+// forward walk through `nodes_` with a fresh hashcons; we stop when a
+// full pass produces zero new unions. Recovers correctness from the
+// known unsoundness of single-pass topo on cross-depth / adversarial
+// inputs (see test_seq_topo_adversarial_order). Number of iterations =
+// (longest cross-depth chain in the augmented DAG) + 1.
+
+template <>
+void EGraph<SequentialUnionFind>::sequential_close_topo_iter(
+    const parlay::sequence<std::pair<Id, Id>>& initial_unions) {
+  for (auto [a, b] : initial_unions) uf_.union_(a, b);
+
+  const std::size_t n = nodes_.size();
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    ankerl::unordered_dense::map<Signature, std::uint32_t, SignatureHash>
+        bucket;
+    bucket.reserve(n);
+    for (std::uint32_t pidx = 0; pidx < n; ++pidx) {
+      auto [it, inserted] = bucket.try_emplace(
+          canonical_sig(nodes_[pidx], uf_), pidx);
+      if (!inserted) {
+        Id ra = uf_.find_root(pidx);
+        Id rb = uf_.find_root(it->second);
+        if (ra != rb) {
+          uf_.union_(ra, rb);
+          changed = true;
+        }
+      }
+    }
+  }
+}
+
+// ---- sequential_close_dst -----------------------------------------------
+//
+// Worklist closure with smaller-into-larger merging and a structural
+// hashcons (Signature -> class id). Correct on arbitrary initial unions.
+//
+// Invariants:
+//   * `parents_[r]` (for any current UF root r) holds every node id that
+//     has a class member of r among its children. When a root dies, its
+//     parents migrate to the survivor's parents list.
+//   * The hashcons may contain *stale* entries (sig -> pidx where pidx's
+//     current canonical sig differs from the stored key). Stale entries
+//     are harmless: a later structurally-matching insertion either hits
+//     the stale entry — yielding a valid merge by congruence at the time
+//     the stale sig was canonical, which is monotonically still valid
+//     now — or misses and inserts a fresh entry.
+//
+// Two queues drive the loop:
+//   * pending_merges: pairs (a, b) of class ids that need to be unioned.
+//     Seeded from `initial_unions` and from duplicate sigs detected on
+//     the initial seed sweep; refilled by phase 1 when re-canonicalized
+//     parents collide with existing hashcons entries.
+//   * pending_nodes: node ids whose canonical sig may have changed
+//     (because one of their children's roots moved). Refilled by
+//     phase 2 from `parents_[ra]` whenever ra dies.
+
+template <>
+void EGraph<SequentialUnionFind>::sequential_close_dst(
+    const parlay::sequence<std::pair<Id, Id>>& initial_unions) {
+  ankerl::unordered_dense::map<Signature, Id, SignatureHash> hashcons;
+  hashcons.reserve(nodes_.size());
+
+  std::vector<std::pair<Id, Id>> pending_merges;
+  pending_merges.reserve(initial_unions.size() + nodes_.size() / 4);
+  for (auto [a, b] : initial_unions) pending_merges.emplace_back(a, b);
+
+  // Initial seed: every node's signature goes into the hashcons.
+  // Pre-existing congruences (two nodes with identical structure)
+  // surface as duplicates and become initial pending_merges.
+  for (std::uint32_t pidx = 0; pidx < nodes_.size(); ++pidx) {
+    auto [it, inserted] = hashcons.try_emplace(
+        canonical_sig(nodes_[pidx], uf_), pidx);
+    if (!inserted) pending_merges.emplace_back(pidx, it->second);
+  }
+
+  std::vector<std::uint32_t> pending_nodes;
+
+  while (!pending_merges.empty() || !pending_nodes.empty()) {
+    // Phase 1: re-canonicalize each pending node. A collision with an
+    // existing hashcons entry queues a fresh merge.
+    for (std::uint32_t pidx : pending_nodes) {
+      auto [it, inserted] = hashcons.try_emplace(
+          canonical_sig(nodes_[pidx], uf_), pidx);
+      if (!inserted && it->second != pidx) {
+        pending_merges.emplace_back(pidx, it->second);
+      }
+    }
+    pending_nodes.clear();
+
+    // Phase 2: drain the merge queue, possibly adding to pending_nodes.
+    auto merges = std::move(pending_merges);
+    pending_merges.clear();
+    for (auto [a, b] : merges) {
+      Id ra = uf_.find_root(a);
+      Id rb = uf_.find_root(b);
+      if (ra == rb) continue;
+
+      // Smaller-half: the class with fewer parents dies. O(N log N)
+      // total parent-list migration over the lifetime of the closure.
+      if (parents_[ra].size() > parents_[rb].size()) std::swap(ra, rb);
+
+      uf_.union_into(ra, rb);
+
+      // Migrate ra's parents into rb's list and queue them for
+      // re-canonicalization (their child-root just moved). One pass
+      // over src does both.
+      auto& src = parents_[ra];
+      auto& dst = parents_[rb];
+      for (Id pidx : src) {
+        pending_nodes.push_back(pidx);
+        dst.push_back(pidx);
+      }
+      src.clear();
     }
   }
 }

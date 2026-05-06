@@ -192,9 +192,20 @@ int main(int argc, char** argv) {
     run_one<pe::SequentialUnionFind>(script, stem, family, n, trials,
         warmup, par_threads, "nelson_topo", std::monostate{},
         [](auto& eg, auto& eqs) { eg.sequential_close_topo(eqs); });
+    run_one<pe::SequentialUnionFind>(script, stem, family, n, trials,
+        warmup, par_threads, "nelson_topo_iter", std::monostate{},
+        [](auto& eg, auto& eqs) { eg.sequential_close_topo_iter(eqs); });
+    run_one<pe::SequentialUnionFind>(script, stem, family, n, trials,
+        warmup, par_threads, "nelson_dst", std::monostate{},
+        [](auto& eg, auto& eqs) { eg.sequential_close_dst(eqs); });
     run_one<pe::ConcurrentUnionFind>(script, stem, family, n, trials,
-        warmup, par_threads, "par_topo", pe::topo,
-        [](auto& eg, auto& eqs) { eg.parallel_close_topo(std::move(eqs)); });
+        warmup, par_threads, "par_close", std::monostate{},
+        [](auto& eg, auto& eqs) { eg.parallel_close(std::move(eqs)); });
+    run_one<pe::ConcurrentUnionFind>(script, stem, family, n, trials,
+        warmup, par_threads, "par_async", pe::async,
+        [](auto& eg, auto& eqs) {
+          eg.parallel_close_async_rounds(std::move(eqs));
+        });
   }
   return 0;
 }

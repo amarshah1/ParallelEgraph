@@ -184,6 +184,63 @@ BuiltGraph<UF> build_topo(const Workload& w) {
   return {std::move(eg), std::move(eq_seq)};
 }
 
+// Async-flavor build: same workload generation, EGraph constructed via
+// the async-tagged ctor (populates last_marked_, skips parents_/
+// depth_buckets_). Used by bench_parallel_close_async.
+template <typename UF>
+BuiltGraph<UF> build_async(const Workload& w) {
+  const std::size_t depth = std::max<std::size_t>(w.depth, 1);
+  const std::size_t per_level = w.n_nodes / depth;
+  std::vector<std::size_t> level_starts;
+  level_starts.reserve(depth + 1);
+  level_starts.push_back(2 * w.n_leaves);
+  for (std::size_t lvl = 0; lvl < depth; ++lvl) {
+    const std::size_t count = (lvl + 1 == depth)
+                                ? (w.n_nodes - per_level * (depth - 1))
+                                : per_level;
+    level_starts.push_back(level_starts[lvl] + count);
+  }
+  const std::size_t total = level_starts.back();
+  parlay::random_generator gen(0xC0FFEEULL ^ static_cast<std::size_t>(w.n_nodes));
+
+  auto all_nodes = parlay::tabulate(total, [&](std::size_t i) -> ENode {
+    if (i < w.n_leaves) {
+      return ENode{std::string("x") + std::to_string(i), {}};
+    }
+    if (i < 2 * w.n_leaves) {
+      return ENode{std::string("y") + std::to_string(i - w.n_leaves), {}};
+    }
+    std::size_t lvl = static_cast<std::size_t>(
+        std::upper_bound(level_starts.begin(), level_starts.end(), i) -
+        level_starts.begin()) - 1;
+    const std::size_t prev_start = (lvl == 0) ? 0 : level_starts[lvl - 1];
+    const std::size_t prev_size = level_starts[lvl] - prev_start;
+    auto r = gen[i];
+    ENode n;
+    n.op = std::string("f") + std::to_string(lvl) + "_" +
+           std::to_string(r() % w.n_fns);
+    n.children = {static_cast<Id>(prev_start + r() % prev_size),
+                  static_cast<Id>(prev_start + r() % prev_size)};
+    return n;
+  });
+
+  auto eg = std::make_unique<EGraph<UF>>(std::move(all_nodes), pe::async);
+
+  const std::size_t n_x_merges = w.n_merges / 2;
+  auto eq_seq = parlay::tabulate(w.n_merges, [&](std::size_t i) {
+    auto r = gen[total + i];
+    if (i < n_x_merges) {
+      return std::pair<Id, Id>{static_cast<Id>(r() % w.n_leaves),
+                               static_cast<Id>(r() % w.n_leaves)};
+    }
+    return std::pair<Id, Id>{
+        static_cast<Id>(w.n_leaves + r() % w.n_leaves),
+        static_cast<Id>(w.n_leaves + r() % w.n_leaves)};
+  });
+
+  return {std::move(eg), std::move(eq_seq)};
+}
+
 double median(std::vector<double> xs) {
   std::sort(xs.begin(), xs.end());
   return xs[xs.size() / 2];
@@ -226,17 +283,65 @@ std::vector<double> bench_nelson_topo(const Workload& w) {
   return times;
 }
 
-std::vector<double> bench_parallel_close_topo(const Workload& w) {
+std::vector<double> bench_nelson_dst(const Workload& w) {
   for (int i = 0; i < WARMUP; ++i) {
-    auto g = build_topo<ConcurrentUnionFind>(w);
-    g.eg->parallel_close_topo(std::move(g.eqs));
+    auto g = build<SequentialUnionFind>(w);
+    g.eg->sequential_close_dst(g.eqs);
   }
   std::vector<double> times;
   times.reserve(TRIALS);
   for (int i = 0; i < TRIALS; ++i) {
-    auto g = build_topo<ConcurrentUnionFind>(w);
+    auto g = build<SequentialUnionFind>(w);
     auto t0 = clk::now();
-    g.eg->parallel_close_topo(std::move(g.eqs));
+    g.eg->sequential_close_dst(g.eqs);
+    times.push_back(elapsed_ms(t0));
+  }
+  return times;
+}
+
+std::vector<double> bench_nelson_topo_iter(const Workload& w) {
+  for (int i = 0; i < WARMUP; ++i) {
+    auto g = build<SequentialUnionFind>(w);
+    g.eg->sequential_close_topo_iter(g.eqs);
+  }
+  std::vector<double> times;
+  times.reserve(TRIALS);
+  for (int i = 0; i < TRIALS; ++i) {
+    auto g = build<SequentialUnionFind>(w);
+    auto t0 = clk::now();
+    g.eg->sequential_close_topo_iter(g.eqs);
+    times.push_back(elapsed_ms(t0));
+  }
+  return times;
+}
+
+std::vector<double> bench_parallel_close(const Workload& w) {
+  for (int i = 0; i < WARMUP; ++i) {
+    auto g = build<ConcurrentUnionFind>(w);
+    g.eg->parallel_close(std::move(g.eqs));
+  }
+  std::vector<double> times;
+  times.reserve(TRIALS);
+  for (int i = 0; i < TRIALS; ++i) {
+    auto g = build<ConcurrentUnionFind>(w);
+    auto t0 = clk::now();
+    g.eg->parallel_close(std::move(g.eqs));
+    times.push_back(elapsed_ms(t0));
+  }
+  return times;
+}
+
+std::vector<double> bench_parallel_close_async(const Workload& w) {
+  for (int i = 0; i < WARMUP; ++i) {
+    auto g = build_async<ConcurrentUnionFind>(w);
+    g.eg->parallel_close_async_rounds(std::move(g.eqs));
+  }
+  std::vector<double> times;
+  times.reserve(TRIALS);
+  for (int i = 0; i < TRIALS; ++i) {
+    auto g = build_async<ConcurrentUnionFind>(w);
+    auto t0 = clk::now();
+    g.eg->parallel_close_async_rounds(std::move(g.eqs));
     times.push_back(elapsed_ms(t0));
   }
   return times;
@@ -309,11 +414,13 @@ int main() {
   if (!csv) {
     std::printf("close_compare  trials=%d  warmup=%d  par_threads=%zu\n",
                 TRIALS, WARMUP, par_threads);
-    std::printf("(par_topo \"spd\" is vs nelson_topo)\n");
-    std::printf("%-8s %8s %10s %9s | %11s %11s %8s | %11s %8s\n",
+    std::printf("(* = unsound on cross-depth inits; topo_iter is the "
+                "iterated-to-fixpoint sound version. par_spd is "
+                "par_close vs topo_iter.)\n");
+    std::printf("%-8s %8s %10s %9s | %11s %11s %11s %11s | %11s %11s %7s\n",
                 "name", "leaves", "nodes", "merges",
-                "nelson_seq", "nelson_topo", "vs_nel",
-                "par_topo", "vs_top");
+                "nelson_seq", "nelson_topo*", "topo_iter", "nelson_dst",
+                "par_close", "par_async", "par_spd");
   } else if (csv_header) {
     std::printf("workload,leaves,fns,nodes,merges,depth,algorithm,trial,"
                 "parlay_threads,dnc_cutoff,wallclock_ms\n");
@@ -339,23 +446,29 @@ int main() {
     }
     auto top = bench_nelson_topo(w);
     double mt = median(top);
-    auto ptp = bench_parallel_close_topo(w);
-    double mpt = median(ptp);
+    auto iter = bench_nelson_topo_iter(w);
+    double mi = median(iter);
+    auto dst = bench_nelson_dst(w);
+    double md = median(dst);
+    auto par = bench_parallel_close(w);
+    double mp = median(par);
+    auto pa = bench_parallel_close_async(w);
+    double mpa = median(pa);
 
     if (csv) {
       if (!skip_nelson) emit_csv(w, "nelson_seq", nel);
       emit_csv(w, "nelson_topo", top);
-      emit_csv(w, "par_topo", ptp);
+      emit_csv(w, "nelson_topo_iter", iter);
+      emit_csv(w, "nelson_dst", dst);
+      emit_csv(w, "par_close", par);
+      emit_csv(w, "par_async", pa);
     } else if (skip_nelson) {
-      std::printf("%-8s %8zu %10zu %9zu |   skipped   %9.2fms          | %9.2fms %6.2fx\n",
-                  w.name, w.n_leaves, w.n_nodes, w.n_merges, mt, mpt, mt / mpt);
+      std::printf("%-8s %8zu %10zu %9zu |   skipped   %9.2fms %9.2fms %9.2fms | %9.2fms %9.2fms %6.2fx\n",
+                  w.name, w.n_leaves, w.n_nodes, w.n_merges, mt, mi, md, mp, mpa, mi / mp);
     } else {
-      // nelson_topo "spd" is vs nelson_seq (Nelson baseline gain from
-      // single-pass refactor); par_topo "spd" is vs nelson_topo, since
-      // that's the relevant parallel-vs-best-sequential comparison.
-      std::printf("%-8s %8zu %10zu %9zu | %9.2fms %9.2fms %6.2fx | %9.2fms %6.2fx\n",
+      std::printf("%-8s %8zu %10zu %9zu | %9.2fms %9.2fms %9.2fms %9.2fms | %9.2fms %9.2fms %6.2fx\n",
                   w.name, w.n_leaves, w.n_nodes, w.n_merges,
-                  mn, mt, mn / mt, mpt, mt / mpt);
+                  mn, mt, mi, md, mp, mpa, mi / mp);
     }
     std::fflush(stdout);
   }

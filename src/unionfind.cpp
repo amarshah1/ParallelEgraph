@@ -133,4 +133,12 @@ void SequentialUnionFind::union_(Id u, Id v) {
   }
 }
 
+void SequentialUnionFind::union_into(Id dying, Id survivor) {
+  // Caller's responsibility to ensure both are roots and distinct.
+  // We just splice: dying's slot points at survivor; survivor's rank
+  // bookkeeping is left alone (it's irrelevant for correctness — we
+  // never compete with by-rank union_ on the same call sequence).
+  data_[dying] = survivor;
+}
+
 }  // namespace pe

@@ -1,20 +1,28 @@
 #!/usr/bin/env bash
-# Topo-closure benchmark sweep for the 144-core machine.
+# Closure benchmark sweep for the 144-core machine. Times the full set of
+# closure algorithms across closure_compare, synthetic, and eggcc:
 #
-# Times only the two topo paths — `sequential_close_topo` (nelson_topo)
-# and `parallel_close_topo` (par_topo) — across the closure_compare,
-# synthetic, and eggcc workloads. The Nelson baseline is skipped via
+#   nelson_topo*       single-pass forward topo  (UNSOUND on cross-depth inits — kept for reference)
+#   nelson_topo_iter   topo iterated to fixpoint (sound; ~2 passes on synthetic)
+#   nelson_dst         worklist + smaller-into-larger hashcons (sound; correct on arbitrary inputs)
+#   par_close          parallel BSP with parents_ frontier (sound)
+#   par_async          parallel async-rounds with last_marked_ stamps (sound)
+#
+# The Nelson baseline (sequential_close_nelson) is skipped via
 # PE_BENCH_SKIP_NELSON=1. Re-running overwrites prior results.
 #
 # Outputs (under bench/results/topo144/):
 #   build_info.txt              compiler/git state captured at run time
 #   sanity.log                  closure_test pass/fail
-#   closure_compare_144T.csv    headline closure_compare at T=144
-#   synthetic_144T.csv          headline synthetic_bench at T=144
-#   closure_scaling.csv         closure_compare across T = 1..144
+#   closure_compare_144T.csv    headline closure_compare at T_max
+#   synthetic_144T.csv          headline synthetic_bench at T_max
+#   closure_scaling.csv         closure_compare across T = 1..T_max
 #   quintic20_scaling.csv       synthetic quintic-20 (12.8M classes) across T
-#   eggcc_144T.csv              full 507-file cc-benchmarks/smt-grounded sweep at T=144
-#   eggcc_summary_144T.txt      aggregate (par_topo vs nelson_topo, win rates, by class-bucket)
+#   eggcc_144T.csv              full 507-file cc-benchmarks/smt-grounded sweep at T_max
+#   eggcc_summary_144T.txt      aggregate ratios + win rates by class-bucket
+#
+# Override T_MAX (default 144) for other thread budgets; the scaling
+# sweeps clamp at T_MAX. e.g. T_MAX=192 ./bench/scripts/run_144core_topo.sh
 #
 # Total wall time ~30-60 min depending on memory bandwidth and disk speed.
 # The eggcc sweep dominates (~10-20 min); the scaling sweeps are ~5 min each.
@@ -104,7 +112,7 @@ PARLAY_NUM_THREADS=$T_MAX \
 echo "[4/6] closure_compare strong scaling across T"
 : > "$OUT/closure_scaling.csv"
 HDR=1
-for T in 1 2 4 8 16 32 64 96 144; do
+for T in 1 2 4 8 16 32 48 64 96 128 144 192; do
   [ $T -gt $T_MAX ] && continue
   echo "  T=$T"
   PARLAY_NUM_THREADS=$T \
@@ -117,7 +125,7 @@ done
 echo "[5/6] synthetic quintic-20 scaling across T (12.8M classes)"
 : > "$OUT/quintic20_scaling.csv"
 HDR=1
-for T in 1 2 4 8 16 32 64 96 144; do
+for T in 1 2 4 8 16 32 48 64 96 128 144 192; do
   [ $T -gt $T_MAX ] && continue
   echo "  T=$T"
   PARLAY_NUM_THREADS=$T \
@@ -143,35 +151,65 @@ NR == 1 { next }
   classes[$1] = $4 + 0
 }
 END {
+  # Algorithms we care about. nelson_topo is the unsound reference;
+  # nelson_topo_iter and nelson_dst are sound sequentials; par_close and
+  # par_async are sound parallels. nelson_seq is the original baseline
+  # (only present when PE_BENCH_SKIP_NELSON is unset — typically absent).
+  algos = "nelson_topo nelson_topo_iter nelson_dst par_close par_async"
+  n_algos = split(algos, a, " ")
+
   for (f in files) {
-    if (!((f, "nelson_topo") in ms && (f, "par_topo") in ms)) continue
+    have_all = 1
+    for (i = 1; i <= n_algos; i++) {
+      if (!((f, a[i]) in ms)) { have_all = 0; break }
+    }
+    if (!have_all) continue
     n_paired++
-    sum_top += ms[f, "nelson_topo"]
-    sum_pt  += ms[f, "par_topo"]
-    if (ms[f, "par_topo"] < ms[f, "nelson_topo"]) pt_wins_top++
-    if (classes[f] < 1000)         { b = "<1K"     }
-    else if (classes[f] < 10000)   { b = "1-10K"   }
-    else if (classes[f] < 100000)  { b = "10-100K" }
-    else                           { b = ">=100K"  }
+    for (i = 1; i <= n_algos; i++) {
+      sum[a[i]] += ms[f, a[i]]
+    }
+    # win rates: par_async vs each correct sequential
+    if (ms[f, "par_async"] < ms[f, "nelson_topo_iter"]) wins_async_iter++
+    if (ms[f, "par_async"] < ms[f, "nelson_dst"])       wins_async_dst++
+    if (ms[f, "par_close"] < ms[f, "nelson_topo_iter"]) wins_close_iter++
+
+    if (classes[f] < 1000)         b = "<1K"
+    else if (classes[f] < 10000)   b = "1-10K"
+    else if (classes[f] < 100000)  b = "10-100K"
+    else                           b = ">=100K"
     bn[b]++
-    bs_top[b] += ms[f, "nelson_topo"]
-    bs_pt[b]  += ms[f, "par_topo"]
-    if (ms[f, "par_topo"] < ms[f, "nelson_topo"]) bw_top[b]++
+    for (i = 1; i <= n_algos; i++) {
+      bsum[b, a[i]] += ms[f, a[i]]
+    }
+    if (ms[f, "par_async"] < ms[f, "nelson_topo_iter"]) bwins_async[b]++
   }
-  printf "Files paired: %d / 507\n\n", n_paired
-  printf "Σ nelson_topo: %10.2f ms\n", sum_top
-  printf "Σ par_topo:    %10.2f ms\n\n", sum_pt
-  printf "par_topo vs nelson_topo: %.2fx (sum)\n", sum_top/sum_pt
-  printf "win rate:                %d / %d (%.1f%%)\n\n", pt_wins_top, n_paired, 100*pt_wins_top/n_paired
-  printf "by classes-per-file:\n"
-  printf "%-10s %5s | %12s %12s %8s | %5s\n", "bucket", "files", "Σnel_topo", "Σpar_topo", "ratio", "wins"
+
+  printf "Files paired (all algos timed): %d / 507\n\n", n_paired
+  for (i = 1; i <= n_algos; i++) {
+    printf "  Σ %-18s %10.2f ms\n", a[i] ":", sum[a[i]]
+  }
+  printf "\nspeedups (sum-of-medians):\n"
+  printf "  par_async / nelson_topo_iter: %.2fx     (correct seq → correct par)\n", sum["nelson_topo_iter"] / sum["par_async"]
+  printf "  par_async / nelson_dst:       %.2fx\n", sum["nelson_dst"] / sum["par_async"]
+  printf "  par_close / nelson_topo_iter: %.2fx\n", sum["nelson_topo_iter"] / sum["par_close"]
+  printf "  par_async / par_close:        %.2fx     (async vs BSP-frontier)\n", sum["par_close"] / sum["par_async"]
+  printf "  nelson_topo / nelson_topo_iter: %.2fx   (cost of correctness — unsound vs sound seq)\n", sum["nelson_topo_iter"] / sum["nelson_topo"]
+
+  printf "\nwin rates over %d files:\n", n_paired
+  printf "  par_async  < nelson_topo_iter: %d (%.1f%%)\n", wins_async_iter, 100*wins_async_iter/n_paired
+  printf "  par_async  < nelson_dst:       %d (%.1f%%)\n", wins_async_dst, 100*wins_async_dst/n_paired
+  printf "  par_close  < nelson_topo_iter: %d (%.1f%%)\n", wins_close_iter, 100*wins_close_iter/n_paired
+
+  printf "\npar_async vs nelson_topo_iter, by classes-per-file:\n"
+  printf "%-10s %5s | %12s %12s %8s | %5s\n", "bucket", "files", "Σtopo_iter", "Σpar_async", "ratio", "wins"
   order = "<1K 1-10K 10-100K >=100K"
   split(order, bs, " ")
   for (i = 1; i <= 4; i++) {
     b = bs[i]
     if (bn[b] > 0)
       printf "%-10s %5d | %10.2fms %10.2fms %7.2fx | %d/%d\n",
-             b, bn[b], bs_top[b], bs_pt[b], bs_top[b]/bs_pt[b], bw_top[b], bn[b]
+             b, bn[b], bsum[b, "nelson_topo_iter"], bsum[b, "par_async"],
+             bsum[b, "nelson_topo_iter"] / bsum[b, "par_async"], bwins_async[b], bn[b]
   }
 }' "$OUT/eggcc_144T.csv" | tee "$OUT/eggcc_summary_144T.txt"
 

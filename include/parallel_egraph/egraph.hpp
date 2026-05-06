@@ -233,16 +233,22 @@ class EGraph {
       parlay::sequence<std::pair<Id, Id>> initial_unions);
 
   // Depth-stratified parallel closure. Round d processes every class at
-  // depth d in parallel: build CanonEntries against the current UF state,
-  // semisort by signature hash, and union per group via the same
-  // `merge_and_collect_semisort` primitive that drives parallel_close.
-  // Within a single round all sigs are computed against a frozen UF
-  // snapshot (children's depth < d, so their roots cannot change during
-  // the round); intra-round congruences are caught by the semisort, and
-  // unions are visible to round d+1 through find_root. Total rounds =
-  // max depth — strictly fewer than parallel_close's frontier-driven BSP
-  // cadence on workloads with bounded depth. Defined out-of-line as an
-  // explicit specialization on `ConcurrentUnionFind`.
+  // depth d as a two-phase BSP step: (1) parallel canon-build —
+  // `parlay::map` over the depth-d bucket reads `find_root` to compute
+  // each node's CanonEntry, no UF unions occur yet; (2) parallel
+  // semisort + dnc_union writes the new unions. The map join between (1)
+  // and (2) is a barrier, so all sig reads in (1) observe the same UF
+  // snapshot — the post-round-(d-1) state — and the semisort catches
+  // every intra-round congruence reachable from that snapshot. (Note:
+  // depth-stratification orders the *work* — children before parents,
+  // bucket d after bucket d-1 — but it does not by itself isolate UF
+  // state across threads. The actual safety property comes from the
+  // phase-1 / phase-2 separation: phase 1 writes only path-compression
+  // CAS, which is idempotent w.r.t. find_root return values.) Total
+  // rounds = max depth — strictly fewer than parallel_close's
+  // frontier-driven BSP cadence on workloads with bounded depth.
+  // Defined out-of-line as an explicit specialization on
+  // `ConcurrentUnionFind`.
   void parallel_close_topo(
       parlay::sequence<std::pair<Id, Id>> initial_unions);
 
@@ -257,7 +263,36 @@ class EGraph {
   // canonicalizes each node's signature once. Each repeated signature
   // unions the current node's class with the prior one. Defined
   // out-of-line as an explicit specialization on `SequentialUnionFind`.
+  //
+  // Order-dependent on cross-depth initial unions: see
+  // tests/closure_test.cpp::test_seq_topo_adversarial_order for a
+  // concrete failure case. Use `sequential_close_dst` for arbitrary
+  // initial-union shapes.
   void sequential_close_topo(
+      const parlay::sequence<std::pair<Id, Id>>& initial_unions);
+
+  // Fixpoint over `sequential_close_topo`: repeats the single-pass
+  // topological closure until a full pass yields no new unions. Recovers
+  // correctness on cross-depth and adversarial inputs at the cost of
+  // (cross-depth-chain-length + 1) passes. Each pass is the same forward
+  // walk through `nodes_` with a fresh hashcons; once the UF is stable
+  // across one full pass, the closure has converged. Defined out-of-line
+  // as an explicit specialization on `SequentialUnionFind`.
+  void sequential_close_topo_iter(
+      const parlay::sequence<std::pair<Id, Id>>& initial_unions);
+
+  // Worklist-driven sequential closure with smaller-into-larger merging.
+  // Maintains a structural hashcons (Signature -> class id) seeded with
+  // every node's initial signature; initial unions and seed-detected
+  // duplicates are queued as pending merges. Each merge re-pends the
+  // dying class's parents so their stale signatures get refreshed
+  // against the new UF state. Continues until the merge queue and the
+  // re-canonicalization queue are both empty. Correct on arbitrary
+  // initial unions (cross-depth, cycles in the augmented DAG, etc.).
+  // Requires `parents_` — populated by the default (BSP-flavor) ctor.
+  // Defined out-of-line as an explicit specialization on
+  // `SequentialUnionFind`.
+  void sequential_close_dst(
       const parlay::sequence<std::pair<Id, Id>>& initial_unions);
 
   bool equiv(Id a, Id b) { return uf_.find_root(a) == uf_.find_root(b); }

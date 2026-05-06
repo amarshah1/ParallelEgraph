@@ -76,6 +76,13 @@ class SequentialUnionFind {
   Id find_root(Id u);
   void union_(Id u, Id v);
 
+  // Merge `dying` into `survivor` unconditionally — `dying` becomes a
+  // child of `survivor`, no by-rank tie-breaking. Caller must guarantee
+  // `dying` and `survivor` are distinct roots. Used by
+  // sequential_close_dst's smaller-into-larger merge, which decides which
+  // root dies based on the size of `parents_[r]` rather than UF rank.
+  void union_into(Id dying, Id survivor);
+
  private:
   std::uint32_t rank_of(Id root) const { return rank_value(data_[root]); }
   std::vector<std::uint32_t> data_;

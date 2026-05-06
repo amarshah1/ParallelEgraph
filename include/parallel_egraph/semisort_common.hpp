@@ -17,6 +17,7 @@
 #include <parlay/primitives.h>
 #include <parlay/sequence.h>
 #include <parlay/internal/group_by.h>
+#include <parlay/internal/integer_sort.h>
 
 namespace pe::detail {
 
@@ -29,6 +30,15 @@ namespace pe::detail {
 // can't loop, and dnc_union is a UF no-op when all members already
 // share a root). Skipping the per-group `parlay::map(values, .root)`
 // and the outer `parlay::flatten` is the whole point.
+//
+// Two implementations:
+//   * `apply_unions_semisort`        — uses `parlay::group_by_key`. Builds a
+//                                     keyed-pair array + sequence-of-sequences.
+//   * `apply_unions_integer_sort`    — sorts in-place by primary hash, walks
+//                                     runs in parallel. Avoids the keyed-pair
+//                                     map and the per-group sequence build.
+//                                     Used by `parallel_close_topo`.
+
 template <typename EqualFn>
 void apply_unions_semisort(
     parlay::sequence<CanonEntry> canon, ConcurrentUnionFind& uf,
@@ -43,6 +53,48 @@ void apply_unions_semisort(
     auto& values = groups[g].second;
     if (values.size() < 2) return;
     dnc_union(values, 0, values.size(), uf);
+  });
+}
+
+// Optimization A: in-place integer-sort by primary hash + parallel
+// run-walk. One sort pass, one boundary-flag tabulate, one pack_index,
+// one per-run parallel_for. No keyed-pair allocation, no per-group
+// `parlay::sequence<value>` allocation.
+//
+// Within each primary-hash run we split by full equality (`equal_fn`).
+// The expected case is "every element in the run matches" — true
+// 96-bit collisions are ~10^-14 per 64M-element batch — so the inner
+// while-loop almost always iterates once and does a single dnc_union.
+template <typename EqualFn>
+void apply_unions_integer_sort(
+    parlay::sequence<CanonEntry> canon, ConcurrentUnionFind& uf,
+    EqualFn equal_fn) {
+  if (canon.empty()) return;
+
+  parlay::integer_sort_inplace(
+      parlay::make_slice(canon),
+      [](const CanonEntry& e) -> std::uint64_t { return e.hash; });
+
+  auto starts_flag = parlay::tabulate(canon.size(), [&](std::size_t i) {
+    return i == 0 || canon[i].hash != canon[i - 1].hash;
+  });
+  auto run_starts = parlay::pack_index<std::uint32_t>(starts_flag);
+
+  parlay::parallel_for(0, run_starts.size(), [&](std::size_t r) {
+    const std::size_t lo = run_starts[r];
+    const std::size_t hi = (r + 1 < run_starts.size())
+                               ? static_cast<std::size_t>(run_starts[r + 1])
+                               : canon.size();
+    if (hi - lo < 2) return;
+    // Same-primary-hash run: split by full equality. Expected fast
+    // path: single subgroup spanning [lo, hi).
+    std::size_t i = lo;
+    while (i < hi) {
+      std::size_t j = i + 1;
+      while (j < hi && equal_fn(canon[i], canon[j])) ++j;
+      if (j - i >= 2) dnc_union(canon, i, j, uf);
+      i = j;
+    }
   });
 }
 
