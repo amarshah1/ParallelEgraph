@@ -24,4 +24,13 @@ parlay::sequence<Id> merge_and_collect_semisort(
       });
 }
 
+void apply_congruence_semisort(
+    parlay::sequence<CanonEntry> canon, ConcurrentUnionFind& uf,
+    [[maybe_unused]] const parlay::sequence<ENode>& nodes) {
+  apply_unions_semisort(std::move(canon), uf,
+      [](const CanonEntry& a, const CanonEntry& b) {
+        return a.hash == b.hash && a.secondary_hash == b.secondary_hash;
+      });
+}
+
 }  // namespace pe::detail

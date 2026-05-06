@@ -155,6 +155,58 @@ void EGraph<ConcurrentUnionFind>::parallel_close(
   }
 }
 
+// ---- parallel_close_topo ------------------------------------------------
+//
+// Depth-stratified BSP. Round d processes every class at depth d in
+// parallel. Because children sit strictly below their parents in depth,
+// every signature read in round d sees a UF state that no other round-d
+// thread is mutating; intra-round matches are resolved by the semisort
+// (same primitive used by parallel_close). Total rounds = max depth.
+//
+// Unlike `sequential_close_topo`, this is correct on arbitrary DAGs: at
+// every level the UF snapshot used to compute sigs is fixed for the
+// whole batch, so no level-d node misses a congruence with another
+// level-d node — they end up in the same semisort bucket.
+
+template <>
+void EGraph<ConcurrentUnionFind>::parallel_close_topo(
+    parlay::sequence<std::pair<Id, Id>> initial_unions) {
+  const bool trace = std::getenv("PE_TRACE") != nullptr;
+  using clk = std::chrono::steady_clock;
+  auto ms_since = [](clk::time_point t0) {
+    return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+  };
+
+  parlay::parallel_for(0, initial_unions.size(), [&](std::size_t i) {
+    uf_.union_(initial_unions[i].first, initial_unions[i].second);
+  });
+
+  // Depth 0 = leaves; no signatures to canonicalize. Walk d = 1..max.
+  for (std::size_t d = 1; d < depth_buckets_.size(); ++d) {
+    const auto& bucket = depth_buckets_[d];
+    if (bucket.empty()) continue;
+
+    auto t_round = clk::now();
+    auto canon = parlay::map(bucket, [&](Id idx) {
+      const auto& node = nodes_[idx];
+#ifdef PE_SEMISORT_SOUND
+      return detail::CanonEntry{sig_hash(node, uf_), uf_.find_root(idx), idx};
+#else
+      auto [hash, secondary] = sig_hashes(node, uf_);
+      return detail::CanonEntry{hash, uf_.find_root(idx), secondary};
+#endif
+    });
+
+    detail::apply_congruence_semisort(std::move(canon), uf_, nodes_);
+
+    if (trace) {
+      std::fprintf(stderr,
+                   "[pe-topo] depth=%3zu bucket=%9zu round=%7.3fms\n",
+                   d, bucket.size(), ms_since(t_round));
+    }
+  }
+}
+
 // ---- sequential_close_nelson --------------------------------------------
 
 template <>

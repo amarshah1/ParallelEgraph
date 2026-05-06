@@ -186,6 +186,56 @@ bool test_topo_agrees_with_nelson() {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// parallel_close_topo (depth-stratified BSP) agrees with Nelson on the
+// same hand-built input as par_vs_seq_agree.
+// ---------------------------------------------------------------------------
+bool test_par_topo_agrees_with_nelson() {
+  auto build_nodes = []() {
+    return make_nodes({
+        ENode{"a", {}},        // 0
+        ENode{"b", {}},        // 1
+        ENode{"c", {}},        // 2
+        ENode{"d", {}},        // 3
+        ENode{"e", {}},        // 4
+        ENode{"g", {}},        // 5
+        ENode{"f", {0, 1}},    // 6
+        ENode{"f", {2, 3}},    // 7
+        ENode{"h", {0, 1, 4}}, // 8
+        ENode{"h", {2, 3, 5}}, // 9
+        ENode{"k", {6}},       // 10
+        ENode{"k", {7}},       // 11
+    });
+  };
+  auto unions = []() {
+    parlay::sequence<std::pair<Id, Id>> eqs;
+    eqs.push_back({0, 2});
+    eqs.push_back({1, 3});
+    eqs.push_back({4, 5});
+    return eqs;
+  };
+
+  auto eg_nel = std::make_unique<SequentialEGraph>(build_nodes());
+  eg_nel->sequential_close_nelson(unions());
+
+  auto eg_pt = std::make_unique<ConcurrentEGraph>(build_nodes(), pe::topo);
+  eg_pt->parallel_close_topo(unions());
+
+  for (Id i = 0; i < 12; ++i) {
+    for (Id j = i + 1; j < 12; ++j) {
+      bool n = eg_nel->equiv(i, j);
+      bool p = eg_pt->equiv(i, j);
+      if (n != p) {
+        std::fprintf(stderr,
+                     "FAIL nelson/par_topo disagree on (%u, %u): nel=%d pt=%d\n",
+                     i, j, int(n), int(p));
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 bool test_par_vs_seq_agree() {
   // 6 leaves, plus binary + ternary fn nodes to exercise variable arity
   auto build_nodes = []() {
@@ -278,6 +328,7 @@ int main() {
       {"mixed_arity",        test_mixed_arity},
       {"par_vs_seq_agree",   test_par_vs_seq_agree},
       {"topo_agrees",        test_topo_agrees_with_nelson},
+      {"par_topo_agrees",    test_par_topo_agrees_with_nelson},
       {"self_merge_no_loop", test_self_merge_no_loop},
   };
 

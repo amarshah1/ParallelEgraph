@@ -102,6 +102,15 @@ bool sigs_equal(std::uint32_t ia, std::uint32_t ib, UF& uf,
 struct async_t { explicit async_t() = default; };
 inline constexpr async_t async{};
 
+// Tag selecting the depth-stratified parallel closure layout. The ctor
+// computes each class's depth (longest path from any leaf) and groups
+// class ids by depth into `depth_buckets_`. Used by
+// `parallel_close_topo`. Skips parents_ and last_marked_; calling
+// either of the other parallel closure variants on an instance built
+// this way is undefined.
+struct topo_t { explicit topo_t() = default; };
+inline constexpr topo_t topo{};
+
 template <typename UF>
 class EGraph {
  public:
@@ -159,6 +168,37 @@ class EGraph {
     });
   }
 
+  // Topo-flavor ctor: compute each class's depth (longest path from any
+  // leaf — leaves are 0, parents are 1 + max(child depth)) via a single
+  // sequential bottom-up sweep (cheap because nodes_ is already in DAG
+  // order, so children are at indices < i). Then group class ids by depth
+  // into `depth_buckets_`, used as the per-round frontier in
+  // `parallel_close_topo`. Skips parents_/last_marked_ entirely.
+  EGraph(parlay::sequence<ENode> nodes, topo_t) : uf_(nodes.size()) {
+    const std::size_t n = nodes.size();
+    uf_.bulk_init(n);
+    nodes_ = std::move(nodes);
+
+    std::vector<std::uint32_t> depth(n, 0);
+    std::uint32_t max_depth = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+      std::uint32_t d = 0;
+      for (Id c : nodes_[i].children) {
+        const std::uint32_t cd = depth[c] + 1;
+        if (cd > d) d = cd;
+      }
+      depth[i] = d;
+      if (d > max_depth) max_depth = d;
+    }
+
+    auto pairs = parlay::tabulate(n, [&](std::size_t i) {
+      return std::pair<Id, Id>{static_cast<Id>(depth[i]),
+                               static_cast<Id>(i)};
+    });
+    depth_buckets_ = parlay::group_by_index(
+        std::move(pairs), static_cast<Id>(max_depth + 1));
+  }
+
   // Lock-free for ConcurrentUnionFind; safe to call concurrently. Path
   // compression CAS is a write, so this is non-const.
   Id find(Id id) { return uf_.find_root(id); }
@@ -190,6 +230,20 @@ class EGraph {
   // Defined out-of-line as an explicit specialization on
   // `ConcurrentUnionFind`.
   void parallel_close_async_rounds(
+      parlay::sequence<std::pair<Id, Id>> initial_unions);
+
+  // Depth-stratified parallel closure. Round d processes every class at
+  // depth d in parallel: build CanonEntries against the current UF state,
+  // semisort by signature hash, and union per group via the same
+  // `merge_and_collect_semisort` primitive that drives parallel_close.
+  // Within a single round all sigs are computed against a frozen UF
+  // snapshot (children's depth < d, so their roots cannot change during
+  // the round); intra-round congruences are caught by the semisort, and
+  // unions are visible to round d+1 through find_root. Total rounds =
+  // max depth — strictly fewer than parallel_close's frontier-driven BSP
+  // cadence on workloads with bounded depth. Defined out-of-line as an
+  // explicit specialization on `ConcurrentUnionFind`.
+  void parallel_close_topo(
       parlay::sequence<std::pair<Id, Id>> initial_unions);
 
   // Sequential Nelson-style closure baseline. Defined out-of-line only as
@@ -229,6 +283,11 @@ class EGraph {
   // worker holding a stale R can never overwrite a fresher mark.
   // Indexed by class id.
   parlay::sequence<std::atomic<std::uint64_t>> last_marked_;
+  // Topo-only state. Populated by the `topo_t`-tagged ctor; left empty
+  // by the default and async ctors. depth_buckets_[d] is the (parallel)
+  // sequence of class ids whose nodes lie at depth d in the DAG; depth
+  // 0 = leaves, no congruence work. Indexed by depth; size = max_depth+1.
+  parlay::sequence<parlay::sequence<Id>> depth_buckets_;
 };
 
 using ConcurrentEGraph = EGraph<ConcurrentUnionFind>;

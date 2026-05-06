@@ -20,6 +20,32 @@
 
 namespace pe::detail {
 
+// Stripped-down variant of `semisort_with_equality` for
+// `parallel_close_topo`: semisort by signature, dnc_union each
+// non-singleton bucket, done. No next-round frontier, no
+// all_same_root short-circuit (that check existed only to keep BSP's
+// `parents_[root]`-self-reference from re-entering next_work; since
+// the topo path drives rounds from precomputed depth buckets, it
+// can't loop, and dnc_union is a UF no-op when all members already
+// share a root). Skipping the per-group `parlay::map(values, .root)`
+// and the outer `parlay::flatten` is the whole point.
+template <typename EqualFn>
+void apply_unions_semisort(
+    parlay::sequence<CanonEntry> canon, ConcurrentUnionFind& uf,
+    EqualFn equal_fn) {
+  if (canon.empty()) return;
+  auto keyed = parlay::map(canon, [](const CanonEntry& e) {
+    return std::pair<CanonEntry, CanonEntry>{e, e};
+  });
+  auto hash_fn = [](const CanonEntry& e) -> std::size_t { return e.hash; };
+  auto groups = parlay::group_by_key(keyed, hash_fn, equal_fn);
+  parlay::parallel_for(0, groups.size(), [&](std::size_t g) {
+    auto& values = groups[g].second;
+    if (values.size() < 2) return;
+    dnc_union(values, 0, values.size(), uf);
+  });
+}
+
 template <typename EqualFn>
 parlay::sequence<Id> semisort_with_equality(
     parlay::sequence<CanonEntry> canon, ConcurrentUnionFind& uf,

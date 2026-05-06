@@ -24,7 +24,9 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <parlay/parallel.h>
@@ -60,8 +62,13 @@ struct Built {
   std::size_t classes;
 };
 
-template <typename UF>
-Built<UF> build_from_script(const pe::Script& script) {
+// `Tag` selects the EGraph ctor flavor. The default-constructed value
+// of pe::Script::Tag isn't a thing — Tag is meant to be one of:
+//   * std::monostate-like sentinel (default ctor: parents_)
+//   * pe::async_t (last_marked_)
+//   * pe::topo_t  (depth_buckets_)
+template <typename UF, typename Tag = std::monostate>
+Built<UF> build_from_script(const pe::Script& script, Tag tag = {}) {
   pe::SmtToEGraphBuilder builder;
   parlay::sequence<std::pair<pe::Id, pe::Id>> eqs;
   for (const auto& cmd : script.commands) {
@@ -75,7 +82,12 @@ Built<UF> build_from_script(const pe::Script& script) {
     // disequalities ignored for benchmarking
   }
   std::size_t classes = builder.size();
-  auto eg = std::make_unique<pe::EGraph<UF>>(std::move(builder).take_nodes());
+  std::unique_ptr<pe::EGraph<UF>> eg;
+  if constexpr (std::is_same_v<Tag, std::monostate>) {
+    eg = std::make_unique<pe::EGraph<UF>>(std::move(builder).take_nodes());
+  } else {
+    eg = std::make_unique<pe::EGraph<UF>>(std::move(builder).take_nodes(), tag);
+  }
   return {std::move(eg), std::move(eqs), classes};
 }
 
@@ -93,17 +105,17 @@ std::pair<std::string, std::size_t> parse_filename(const std::string& stem) {
   return {m[1].str(), static_cast<std::size_t>(std::stoull(m[2].str()))};
 }
 
-template <typename UF, typename Close>
+template <typename UF, typename Tag, typename Close>
 void run_one(const pe::Script& script, const std::string& stem,
              const std::string& family, std::size_t n,
              int trials, int warmup, std::size_t par_threads,
-             const char* algorithm, Close close) {
+             const char* algorithm, Tag tag, Close close) {
   for (int i = 0; i < warmup; ++i) {
-    auto b = build_from_script<UF>(script);
+    auto b = build_from_script<UF>(script, tag);
     close(*b.eg, b.eqs);
   }
   for (int i = 0; i < trials; ++i) {
-    auto b = build_from_script<UF>(script);
+    auto b = build_from_script<UF>(script, tag);
     const std::size_t neq = b.eqs.size();
     auto t0 = clk::now();
     close(*b.eg, b.eqs);
@@ -174,15 +186,18 @@ int main(int argc, char** argv) {
 
     if (!skip_nelson) {
       run_one<pe::SequentialUnionFind>(script, stem, family, n, trials,
-          warmup, par_threads, "nelson_seq",
+          warmup, par_threads, "nelson_seq", std::monostate{},
           [](auto& eg, auto& eqs) { eg.sequential_close_nelson(eqs); });
     }
     run_one<pe::SequentialUnionFind>(script, stem, family, n, trials,
-        warmup, par_threads, "nelson_topo",
+        warmup, par_threads, "nelson_topo", std::monostate{},
         [](auto& eg, auto& eqs) { eg.sequential_close_topo(eqs); });
     run_one<pe::ConcurrentUnionFind>(script, stem, family, n, trials,
-        warmup, par_threads, "par_close",
+        warmup, par_threads, "par_close", std::monostate{},
         [](auto& eg, auto& eqs) { eg.parallel_close(std::move(eqs)); });
+    run_one<pe::ConcurrentUnionFind>(script, stem, family, n, trials,
+        warmup, par_threads, "par_topo", pe::topo,
+        [](auto& eg, auto& eqs) { eg.parallel_close_topo(std::move(eqs)); });
   }
   return 0;
 }
