@@ -43,19 +43,15 @@ if [ -n "$NUMACTL" ]; then
   }
 fi
 
-# Build any missing binary. cmake + make are incremental, so re-running
-# after no source changes is essentially a no-op (one stat per file).
+# Always run an incremental build. `cmake --build` is a no-op if every
+# target is up-to-date, but catches the case where the user just pulled
+# and the on-disk binaries are stale relative to the source — that's
+# the easy way to end up running last week's algorithm by accident.
+# Configure (the slower step) is skipped when build/ already exists.
 TARGETS="closure_compare_bench synthetic_bench smt_bench closure_test"
-need_build=0
-for B in $TARGETS; do
-  [ -x "build/$B" ] || { need_build=1; break; }
-done
-if [ "$need_build" -eq 1 ]; then
-  echo "[build] one or more bench binaries missing — building..."
-  mkdir -p build
-  ( cd build && cmake -DCMAKE_BUILD_TYPE=Release .. )
-  cmake --build build --target $TARGETS -j
-fi
+echo "[build] ensuring bench binaries are up to date..."
+[ -d build/CMakeFiles ] || ( mkdir -p build && cd build && cmake -DCMAKE_BUILD_TYPE=Release .. )
+cmake --build build --target $TARGETS -j
 
 if [ ! -d cc-benchmarks/smt-grounded ] || [ -z "$(ls cc-benchmarks/smt-grounded/*.smt2 2>/dev/null)" ]; then
   echo "cc-benchmarks submodule not populated. Run:" >&2
