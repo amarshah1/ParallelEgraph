@@ -3,10 +3,11 @@
 # closure algorithms across closure_compare, synthetic, and eggcc:
 #
 #   nelson_topo*       single-pass forward topo  (UNSOUND on cross-depth inits — kept for reference)
-#   nelson_topo_iter   topo iterated to fixpoint (sound; ~2 passes on synthetic)
+#   nelson_topo_iter   topo iterated to fixpoint (sound; MIN_ID union — usually 2 passes)
 #   nelson_dst         worklist + smaller-into-larger hashcons (sound; correct on arbitrary inputs)
 #   par_close          parallel BSP with parents_ frontier (sound)
-#   par_async          parallel async-rounds with last_marked_ stamps (sound)
+#   par_async          parallel async-rounds with last_marked_ stamps + by-rank union (sound)
+#   par_async_min_id   par_async variant using MIN_ID union (sound; preserves canonical-id invariant)
 #
 # The Nelson baseline (sequential_close_nelson) is skipped via
 # PE_BENCH_SKIP_NELSON=1. Re-running overwrites prior results.
@@ -168,10 +169,11 @@ NR == 1 { next }
 }
 END {
   # Algorithms we care about. nelson_topo is the unsound reference;
-  # nelson_topo_iter and nelson_dst are sound sequentials; par_close and
-  # par_async are sound parallels. nelson_seq is the original baseline
-  # (only present when PE_BENCH_SKIP_NELSON is unset — typically absent).
-  algos = "nelson_topo nelson_topo_iter nelson_dst par_close par_async"
+  # nelson_topo_iter and nelson_dst are sound sequentials; par_close,
+  # par_async, and par_async_min_id are sound parallels. nelson_seq is
+  # the original baseline (only present when PE_BENCH_SKIP_NELSON is
+  # unset — typically absent).
+  algos = "nelson_topo nelson_topo_iter nelson_dst par_close par_async par_async_min_id"
   n_algos = split(algos, a, " ")
 
   for (f in files) {
@@ -184,10 +186,11 @@ END {
     for (i = 1; i <= n_algos; i++) {
       sum[a[i]] += ms[f, a[i]]
     }
-    # win rates: par_async vs each correct sequential
-    if (ms[f, "par_async"] < ms[f, "nelson_topo_iter"]) wins_async_iter++
-    if (ms[f, "par_async"] < ms[f, "nelson_dst"])       wins_async_dst++
-    if (ms[f, "par_close"] < ms[f, "nelson_topo_iter"]) wins_close_iter++
+    # win rates: parallel variants vs the best correct sequential.
+    if (ms[f, "par_async"]        < ms[f, "nelson_topo_iter"]) wins_async_iter++
+    if (ms[f, "par_async"]        < ms[f, "nelson_dst"])       wins_async_dst++
+    if (ms[f, "par_close"]        < ms[f, "nelson_topo_iter"]) wins_close_iter++
+    if (ms[f, "par_async_min_id"] < ms[f, "par_async"])        wins_min_over_async++
 
     if (classes[f] < 1000)         b = "<1K"
     else if (classes[f] < 10000)   b = "1-10K"
@@ -197,35 +200,48 @@ END {
     for (i = 1; i <= n_algos; i++) {
       bsum[b, a[i]] += ms[f, a[i]]
     }
-    if (ms[f, "par_async"] < ms[f, "nelson_topo_iter"]) bwins_async[b]++
+    # Per-bucket win rate of the best parallel (par_async_min_id) vs the
+    # best correct sequential (whichever is smaller per file).
+    best_seq_f = (ms[f, "nelson_topo_iter"] < ms[f, "nelson_dst"]) \
+                 ? ms[f, "nelson_topo_iter"] : ms[f, "nelson_dst"]
+    if (ms[f, "par_async_min_id"] < best_seq_f) bwins_min[b]++
   }
 
   printf "Files paired (all algos timed): %d / 507\n\n", n_paired
   for (i = 1; i <= n_algos; i++) {
-    printf "  Σ %-18s %10.2f ms\n", a[i] ":", sum[a[i]]
+    printf "  Σ %-22s %10.2f ms\n", a[i] ":", sum[a[i]]
   }
   printf "\nspeedups (sum-of-medians):\n"
-  printf "  par_async / nelson_topo_iter: %.2fx     (correct seq → correct par)\n", sum["nelson_topo_iter"] / sum["par_async"]
-  printf "  par_async / nelson_dst:       %.2fx\n", sum["nelson_dst"] / sum["par_async"]
-  printf "  par_close / nelson_topo_iter: %.2fx\n", sum["nelson_topo_iter"] / sum["par_close"]
-  printf "  par_async / par_close:        %.2fx     (async vs BSP-frontier)\n", sum["par_close"] / sum["par_async"]
-  printf "  nelson_topo / nelson_topo_iter: %.2fx   (cost of correctness — unsound vs sound seq)\n", sum["nelson_topo_iter"] / sum["nelson_topo"]
+  printf "  par_async        / nelson_topo_iter:      %.2fx     (sound seq → sound par)\n", sum["nelson_topo_iter"] / sum["par_async"]
+  printf "  par_async_min_id / nelson_topo_iter:      %.2fx     (MIN_ID variant)\n", sum["nelson_topo_iter"] / sum["par_async_min_id"]
+  printf "  par_async        / nelson_dst:            %.2fx\n", sum["nelson_dst"] / sum["par_async"]
+  printf "  par_async_min_id / nelson_dst:            %.2fx\n", sum["nelson_dst"] / sum["par_async_min_id"]
+  printf "  par_close        / nelson_topo_iter:      %.2fx\n", sum["nelson_topo_iter"] / sum["par_close"]
+  printf "  par_async        / par_close:             %.2fx     (async vs BSP-frontier)\n", sum["par_close"] / sum["par_async"]
+  printf "  par_async_min_id / par_async:             %.2fx     (MIN_ID gain over by-rank)\n", sum["par_async"] / sum["par_async_min_id"]
+  printf "  nelson_topo      / nelson_topo_iter:      %.2fx     (cost of correctness — unsound vs sound seq)\n", sum["nelson_topo_iter"] / sum["nelson_topo"]
 
   printf "\nwin rates over %d files:\n", n_paired
-  printf "  par_async  < nelson_topo_iter: %d (%.1f%%)\n", wins_async_iter, 100*wins_async_iter/n_paired
-  printf "  par_async  < nelson_dst:       %d (%.1f%%)\n", wins_async_dst, 100*wins_async_dst/n_paired
-  printf "  par_close  < nelson_topo_iter: %d (%.1f%%)\n", wins_close_iter, 100*wins_close_iter/n_paired
+  printf "  par_async         < nelson_topo_iter: %d (%.1f%%)\n", wins_async_iter, 100*wins_async_iter/n_paired
+  printf "  par_async         < nelson_dst:       %d (%.1f%%)\n", wins_async_dst, 100*wins_async_dst/n_paired
+  printf "  par_close         < nelson_topo_iter: %d (%.1f%%)\n", wins_close_iter, 100*wins_close_iter/n_paired
+  printf "  par_async_min_id  < par_async:        %d (%.1f%%)\n", wins_min_over_async, 100*wins_min_over_async/n_paired
 
-  printf "\npar_async vs nelson_topo_iter, by classes-per-file:\n"
-  printf "%-10s %5s | %12s %12s %8s | %5s\n", "bucket", "files", "Σtopo_iter", "Σpar_async", "ratio", "wins"
+  printf "\npar_async_min_id vs best correct sequential, by classes-per-file:\n"
+  printf "%-10s %5s | %12s %12s %12s %8s | %5s\n",
+         "bucket", "files", "Σnel_iter", "Σnel_dst", "Σpar_async_m", "ratio", "wins"
   order = "<1K 1-10K 10-100K >=100K"
   split(order, bs, " ")
   for (i = 1; i <= 4; i++) {
     b = bs[i]
-    if (bn[b] > 0)
-      printf "%-10s %5d | %10.2fms %10.2fms %7.2fx | %d/%d\n",
-             b, bn[b], bsum[b, "nelson_topo_iter"], bsum[b, "par_async"],
-             bsum[b, "nelson_topo_iter"] / bsum[b, "par_async"], bwins_async[b], bn[b]
+    if (bn[b] > 0) {
+      best_seq = (bsum[b, "nelson_topo_iter"] < bsum[b, "nelson_dst"]) \
+                 ? bsum[b, "nelson_topo_iter"] : bsum[b, "nelson_dst"]
+      printf "%-10s %5d | %10.2fms %10.2fms %10.2fms %7.2fx | %d/%d\n",
+             b, bn[b], bsum[b, "nelson_topo_iter"], bsum[b, "nelson_dst"],
+             bsum[b, "par_async_min_id"],
+             best_seq / bsum[b, "par_async_min_id"], bwins_min[b], bn[b]
+    }
   }
 }' "$OUT/eggcc_144T.csv" | tee "$OUT/eggcc_summary_144T.txt"
 
