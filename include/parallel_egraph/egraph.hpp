@@ -265,6 +265,18 @@ class EGraph {
   void parallel_close_topo(
       parlay::sequence<std::pair<Id, Id>> initial_unions);
 
+  // Sound iterated variant of `parallel_close_topo`. Same depth-stratified
+  // structure (parallel canon-build per depth, semisort + dnc_union per
+  // bucket), but every union uses MIN_ID linking AND the entire
+  // depth-walk is wrapped in a fixpoint loop that repeats until a full
+  // pass produces no new unions. Recovers correctness on cross-depth
+  // initial unions; on regular cascades (Family C) MIN_ID makes a single
+  // depth-walk usually suffice, so the verification pass is the only
+  // overhead. Defined out-of-line as an explicit specialization on
+  // `ConcurrentUnionFind`.
+  void parallel_close_topo_iter(
+      parlay::sequence<std::pair<Id, Id>> initial_unions);
+
   // Sequential Nelson-style closure baseline. Defined out-of-line only as
   // an explicit specialization on `SequentialUnionFind`.
   void sequential_close_nelson(

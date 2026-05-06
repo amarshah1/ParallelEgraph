@@ -1,5 +1,6 @@
 #include "parallel_egraph/egraph.hpp"
 #include "parallel_egraph/detail.hpp"
+#include "parallel_egraph/dnc_union.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -217,6 +218,111 @@ void EGraph<ConcurrentUnionFind>::parallel_close_topo(
                    "[pe-topo] depth=%3zu bucket=%9zu round=%7.3fms\n",
                    d, bucket.size(), ms_since(t_round));
     }
+  }
+}
+
+// ---- parallel_close_topo_iter -------------------------------------------
+//
+// Sound parallel topo: depth-stratified BSP wrapped in a fixpoint loop,
+// with MIN_ID linking. The single-pass `parallel_close_topo` is unsound
+// on cross-depth initial unions because in-round unions can change
+// find_root values for sibling sigs that were already computed; iterating
+// catches the missed congruences across passes, and MIN_ID makes the
+// fixpoint converge in 1-2 passes on regular cascades.
+
+template <>
+void EGraph<ConcurrentUnionFind>::parallel_close_topo_iter(
+    parlay::sequence<std::pair<Id, Id>> initial_unions) {
+  const bool trace = std::getenv("PE_TRACE_ITER") != nullptr;
+  using clk = std::chrono::steady_clock;
+
+  // ---- step 1: apply initial unions in parallel (MIN_ID) -----------------
+  parlay::parallel_for(0, initial_unions.size(), [&](std::size_t i) {
+    uf_.union_min_id(initial_unions[i].first, initial_unions[i].second);
+  });
+
+  // Lambda dispatched into dnc_union_with — also sets `*changed` when
+  // an actual merge commits.
+  std::atomic<bool> changed{false};
+  auto union_track = [&changed](ConcurrentUnionFind& u, Id a, Id b) {
+    if (u.union_min_id(a, b)) {
+      changed.store(true, std::memory_order_relaxed);
+    }
+  };
+
+  std::size_t round = 0;
+  do {
+    changed.store(false, std::memory_order_relaxed);
+    auto t_round = trace ? clk::now() : clk::time_point{};
+
+    // Walk d = 1..max_depth. depth 0 = leaves; nothing to canonicalize.
+    for (std::size_t d = 1; d < depth_buckets_.size(); ++d) {
+      const auto& bucket = depth_buckets_[d];
+      if (bucket.empty()) continue;
+
+      // Build CanonEntry for every class in the bucket.
+      auto canon = parlay::map(bucket, [&](Id idx) {
+        const auto& node = nodes_[idx];
+#ifdef PE_SEMISORT_SOUND
+        return detail::CanonEntry{sig_hash(node, uf_), uf_.find_root(idx), idx};
+#else
+        auto [hash, secondary] = sig_hashes(node, uf_);
+        return detail::CanonEntry{hash, uf_.find_root(idx), secondary};
+#endif
+      });
+
+      if (canon.empty()) continue;
+
+      // Sort by primary hash (in-place) and walk runs.
+      parlay::integer_sort_inplace(
+          parlay::make_slice(canon),
+          [](const detail::CanonEntry& e) -> std::uint64_t { return e.hash; });
+
+      auto starts_flag = parlay::tabulate(canon.size(), [&](std::size_t i) {
+        return i == 0 || canon[i].hash != canon[i - 1].hash;
+      });
+      auto run_starts = parlay::pack_index<std::uint32_t>(starts_flag);
+
+      parlay::parallel_for(0, run_starts.size(), [&](std::size_t r) {
+        const std::size_t lo = run_starts[r];
+        const std::size_t hi = (r + 1 < run_starts.size())
+                                   ? static_cast<std::size_t>(run_starts[r + 1])
+                                   : canon.size();
+        if (hi - lo < 2) return;
+        // Same primary-hash run; split by full equality (secondary or sound).
+        std::size_t i = lo;
+        while (i < hi) {
+          std::size_t j = i + 1;
+          while (j < hi) {
+#ifdef PE_SEMISORT_SOUND
+            if (!sigs_equal(canon[i].class_id, canon[j].class_id, uf_, nodes_))
+              break;
+#else
+            if (canon[i].secondary_hash != canon[j].secondary_hash) break;
+#endif
+            ++j;
+          }
+          if (j - i >= 2) {
+            detail::dnc_union_with(canon, i, j, uf_, union_track);
+          }
+          i = j;
+        }
+      });
+    }
+
+    ++round;
+    if (trace) {
+      double ms = std::chrono::duration<double, std::milli>(
+                      clk::now() - t_round).count();
+      std::fprintf(stderr,
+                   "[par_topo_iter] round=%2zu changed=%d  %7.2fms\n",
+                   round, int(changed.load()), ms);
+    }
+  } while (changed.load(std::memory_order_relaxed));
+
+  if (trace) {
+    std::fprintf(stderr,
+                 "[par_topo_iter] converged after %zu round(s)\n", round);
   }
 }
 

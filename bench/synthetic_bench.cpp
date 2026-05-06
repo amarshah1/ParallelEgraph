@@ -276,6 +276,17 @@ BuiltGraph<UF> build_async(Family f, std::size_t n, std::size_t g_arity) {
   return {std::move(eg), std::move(w.eqs), total, n_eqs};
 }
 
+// Topo-flavor build: workload generation identical, EGraph via the
+// topo-tagged ctor (populates depth_buckets_, skips parents_/last_marked_).
+template <typename UF>
+BuiltGraph<UF> build_topo(Family f, std::size_t n, std::size_t g_arity) {
+  auto w = gen_workload(f, n, g_arity);
+  const std::size_t total = w.nodes.size();
+  const std::size_t n_eqs = w.eqs.size();
+  auto eg = std::make_unique<EGraph<UF>>(std::move(w.nodes), pe::topo);
+  return {std::move(eg), std::move(w.eqs), total, n_eqs};
+}
+
 // Prints every node + initial union to stderr in a human-readable form.
 // One line per node:  "id: op(child_id, child_id, ...)" or "id: op  // leaf"
 // One line per union: "  union: a_id = b_id"
@@ -444,6 +455,24 @@ std::vector<double> bench_parallel_close_async_min(Family f, std::size_t n,
   return times;
 }
 
+std::vector<double> bench_parallel_close_topo_iter(Family f, std::size_t n,
+                                                     std::size_t g_arity,
+                                                     int warmup, int trials) {
+  for (int i = 0; i < warmup; ++i) {
+    auto g = build_topo<ConcurrentUnionFind>(f, n, g_arity);
+    g.eg->parallel_close_topo_iter(std::move(g.eqs));
+  }
+  std::vector<double> times;
+  times.reserve(trials);
+  for (int i = 0; i < trials; ++i) {
+    auto g = build_topo<ConcurrentUnionFind>(f, n, g_arity);
+    auto t0 = clk::now();
+    g.eg->parallel_close_topo_iter(std::move(g.eqs));
+    times.push_back(elapsed_ms(t0));
+  }
+  return times;
+}
+
 // ---- Env parsing ----------------------------------------------------------
 
 std::vector<std::string> split_csv(const std::string& s) {
@@ -556,10 +585,10 @@ int main() {
     std::printf("synthetic_bench  trials=%d  warmup=%d  par_threads=%zu\n",
                 trials, warmup, par_threads);
     std::printf("(* = unsound on cross-depth inits; par_spd = par_close vs topo_iter)\n");
-    std::printf("%-8s %5s %10s %9s | %11s %11s %11s %11s | %11s %11s %11s %7s\n",
+    std::printf("%-8s %5s %10s %9s | %11s %11s %11s %11s | %11s %11s %11s %11s %7s\n",
                 "family", "n", "classes", "merges",
                 "nelson_seq", "nelson_topo*", "topo_iter", "nelson_dst",
-                "par_close", "par_async", "par_async_m", "par_spd");
+                "par_close", "par_topo_it", "par_async", "par_async_m", "par_spd");
   } else if (csv_header) {
     std::printf("family,n,d,classes,merges,algorithm,trial,"
                 "parlay_threads,dnc_cutoff,wallclock_ms\n");
@@ -602,6 +631,8 @@ int main() {
       double md = median(dst);
       auto par = bench_parallel_close(f, n, g_arity, warmup, trials);
       double mp = median(par);
+      auto pti = bench_parallel_close_topo_iter(f, n, g_arity, warmup, trials);
+      double mpti = median(pti);
       auto pa = bench_parallel_close_async(f, n, g_arity, warmup, trials);
       double mpa = median(pa);
       auto pam = bench_parallel_close_async_min(f, n, g_arity, warmup, trials);
@@ -613,15 +644,16 @@ int main() {
         emit_csv(f, n, classes, merges, "nelson_topo_iter", iter);
         emit_csv(f, n, classes, merges, "nelson_dst", dst);
         emit_csv(f, n, classes, merges, "par_close", par);
+        emit_csv(f, n, classes, merges, "par_topo_iter", pti);
         emit_csv(f, n, classes, merges, "par_async", pa);
         emit_csv(f, n, classes, merges, "par_async_min_id", pam);
       } else if (skip_nelson) {
-        std::printf("%-8s %5zu %10zu %9zu |   skipped   %9.2fms %9.2fms %9.2fms | %9.2fms %9.2fms %9.2fms %6.2fx\n",
-                    family_name(f), n, classes, merges, mt, mi, md, mp, mpa, mpam, mi / mp);
+        std::printf("%-8s %5zu %10zu %9zu |   skipped   %9.2fms %9.2fms %9.2fms | %9.2fms %9.2fms %9.2fms %9.2fms %6.2fx\n",
+                    family_name(f), n, classes, merges, mt, mi, md, mp, mpti, mpa, mpam, mi / mp);
       } else {
-        std::printf("%-8s %5zu %10zu %9zu | %9.2fms %9.2fms %9.2fms %9.2fms | %9.2fms %9.2fms %9.2fms %6.2fx\n",
+        std::printf("%-8s %5zu %10zu %9zu | %9.2fms %9.2fms %9.2fms %9.2fms | %9.2fms %9.2fms %9.2fms %9.2fms %6.2fx\n",
                     family_name(f), n, classes, merges,
-                    mn, mt, mi, md, mp, mpa, mpam, mi / mp);
+                    mn, mt, mi, md, mp, mpti, mpa, mpam, mi / mp);
       }
       std::fflush(stdout);
     }

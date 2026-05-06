@@ -55,7 +55,12 @@ class ConcurrentUnionFind {
   // Used by the `parallel_close_async_rounds_min_id` variant; preserves
   // the canonical-id-stable invariant that lets DAG-ordered cascades
   // collapse in one BSP round on regular workloads (Family C).
-  void union_min_id(Id u, Id v);
+  //
+  // Returns true if the call actually merged two distinct classes,
+  // false if the operands were already in the same class. Callers that
+  // need fixpoint detection (e.g., `parallel_close_topo_iter`) capture
+  // this bool to know when to stop iterating.
+  bool union_min_id(Id u, Id v);
 
   bool same_set(Id u, Id v);
 

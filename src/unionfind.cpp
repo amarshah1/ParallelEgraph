@@ -93,7 +93,7 @@ void ConcurrentUnionFind::union_(Id u, Id v) {
   }
 }
 
-void ConcurrentUnionFind::union_min_id(Id u, Id v) {
+bool ConcurrentUnionFind::union_min_id(Id u, Id v) {
   // MIN_ID merge: the lower-id root always survives. Repeatedly resolve
   // both sides to roots, then attempt to swing the higher-id root's slot
   // to point at the lower-id one. CAS races: if some other thread merges
@@ -102,10 +102,13 @@ void ConcurrentUnionFind::union_min_id(Id u, Id v) {
   // and we only succeed if the slot is still its own rank-encoded root
   // value; if it was already merged into something else, retry. The
   // lower-id root's slot is never written by this routine.
+  //
+  // Returns true if a real merge committed; false if u and v were
+  // already in the same class on entry.
   for (;;) {
     auto [u_root, ru] = find(u);
     auto [v_root, rv] = find(v);
-    if (u_root == v_root) return;
+    if (u_root == v_root) return false;
 
     Id loser, winner;
     std::uint32_t loser_rank;
@@ -123,7 +126,7 @@ void ConcurrentUnionFind::union_min_id(Id u, Id v) {
     if (data_[loser].compare_exchange_strong(expected, winner,
                                               std::memory_order_release,
                                               std::memory_order_relaxed)) {
-      return;
+      return true;
     }
     // CAS failed: someone else either bumped loser's rank or merged
     // loser into a different root. Retry — find() will follow the new

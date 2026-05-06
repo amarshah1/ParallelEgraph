@@ -6,6 +6,7 @@
 #   nelson_topo_iter   topo iterated to fixpoint (sound; MIN_ID union — usually 2 passes)
 #   nelson_dst         worklist + smaller-into-larger hashcons (sound; correct on arbitrary inputs)
 #   par_close          parallel BSP with parents_ frontier (sound)
+#   par_topo_iter      depth-stratified BSP iterated to fixpoint with MIN_ID union (sound)
 #   par_async          parallel async-rounds with last_marked_ stamps + by-rank union (sound)
 #   par_async_min_id   par_async variant using MIN_ID union (sound; preserves canonical-id invariant)
 #
@@ -173,7 +174,7 @@ END {
   # par_async, and par_async_min_id are sound parallels. nelson_seq is
   # the original baseline (only present when PE_BENCH_SKIP_NELSON is
   # unset — typically absent).
-  algos = "nelson_topo nelson_topo_iter nelson_dst par_close par_async par_async_min_id"
+  algos = "nelson_topo nelson_topo_iter nelson_dst par_close par_topo_iter par_async par_async_min_id"
   n_algos = split(algos, a, " ")
 
   for (f in files) {
