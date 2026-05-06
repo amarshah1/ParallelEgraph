@@ -49,4 +49,25 @@ void dnc_union(Bucket& bucket, std::size_t lo, std::size_t hi,
   uf.union_(as_root(bucket[lo]), as_root(bucket[mid]));
 }
 
+// Variant taking a caller-supplied union method. Used by the MIN_ID
+// async closure to substitute `union_min_id` for the default `union_`
+// without duplicating dnc_union's dnc structure.
+template <typename Bucket, typename UnionFn>
+void dnc_union_with(Bucket& bucket, std::size_t lo, std::size_t hi,
+                    ConcurrentUnionFind& uf, UnionFn union_fn) {
+  if (hi - lo <= 1) return;
+  const std::size_t DNC_SEQ_CUTOFF = dnc_cutoff();
+  if (hi - lo <= DNC_SEQ_CUTOFF) {
+    for (std::size_t i = lo + 1; i < hi; ++i) {
+      union_fn(uf, as_root(bucket[lo]), as_root(bucket[i]));
+    }
+    return;
+  }
+  std::size_t mid = lo + (hi - lo) / 2;
+  parlay::par_do(
+      [&] { dnc_union_with(bucket, lo, mid, uf, union_fn); },
+      [&] { dnc_union_with(bucket, mid, hi, uf, union_fn); });
+  union_fn(uf, as_root(bucket[lo]), as_root(bucket[mid]));
+}
+
 }  // namespace pe::detail

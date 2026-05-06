@@ -49,6 +49,14 @@ class ConcurrentUnionFind {
   std::pair<Id, std::uint32_t> find(Id u);
   Id find_root(Id u) { return find(u).first; }
   void union_(Id u, Id v);
+
+  // MIN_ID variant: lower class id always wins (becomes root). Drops
+  // by-rank balancing — path compression keeps chains short in practice.
+  // Used by the `parallel_close_async_rounds_min_id` variant; preserves
+  // the canonical-id-stable invariant that lets DAG-ordered cascades
+  // collapse in one BSP round on regular workloads (Family C).
+  void union_min_id(Id u, Id v);
+
   bool same_set(Id u, Id v);
 
  private:

@@ -358,7 +358,16 @@ void EGraph<SequentialUnionFind>::sequential_close_topo(
     if (!inserted) {
       Id ra = uf_.find_root(pidx);
       Id rb = uf_.find_root(it->second);
-      if (ra != rb) uf_.union_(ra, rb);
+      if (ra != rb) {
+        // MIN_ID union: lower class id wins. Preserves the invariant
+        // that on a DAG-ordered input, the canonical (earliest-emitted)
+        // representative of any equivalence class is its current root —
+        // which lets a forward-pass collapse the entire cascade in a
+        // single sweep, since downstream sigs reference roots that were
+        // valid at insertion time AND remain valid after subsequent
+        // intra-pass merges.
+        uf_.union_into(std::max(ra, rb), std::min(ra, rb));
+      }
     }
   }
 }
@@ -377,10 +386,18 @@ void EGraph<SequentialUnionFind>::sequential_close_topo_iter(
     const parlay::sequence<std::pair<Id, Id>>& initial_unions) {
   for (auto [a, b] : initial_unions) uf_.union_(a, b);
 
+  const bool trace = std::getenv("PE_TRACE_ITER") != nullptr;
+  using clk = std::chrono::steady_clock;
+
   const std::size_t n = nodes_.size();
+  std::size_t round = 0;
+  std::size_t total_unions = 0;
   bool changed = true;
   while (changed) {
     changed = false;
+    auto t0 = trace ? clk::now() : clk::time_point{};
+    std::size_t round_unions = 0;
+
     ankerl::unordered_dense::map<Signature, std::uint32_t, SignatureHash>
         bucket;
     bucket.reserve(n);
@@ -391,11 +408,32 @@ void EGraph<SequentialUnionFind>::sequential_close_topo_iter(
         Id ra = uf_.find_root(pidx);
         Id rb = uf_.find_root(it->second);
         if (ra != rb) {
-          uf_.union_(ra, rb);
+          // MIN_ID union: see comment in sequential_close_topo.
+          // For DAG-ordered emission with canonical members at lower
+          // ids, this collapses the entire cascade in 2 rounds (1 work
+          // pass + 1 verification pass). Without it, each round
+          // advances exactly one g-tree level and total cost is
+          // O(N × depth) instead of O(N).
+          uf_.union_into(std::max(ra, rb), std::min(ra, rb));
           changed = true;
+          ++round_unions;
         }
       }
     }
+    ++round;
+    total_unions += round_unions;
+    if (trace) {
+      double ms = std::chrono::duration<double, std::milli>(
+                      clk::now() - t0).count();
+      std::fprintf(stderr,
+                   "[topo_iter] round=%3zu unions=%9zu cumulative=%9zu  %7.2fms\n",
+                   round, round_unions, total_unions, ms);
+    }
+  }
+  if (trace) {
+    std::fprintf(stderr,
+                 "[topo_iter] converged after %zu rounds, %zu total unions\n",
+                 round, total_unions);
   }
 }
 
