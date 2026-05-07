@@ -119,9 +119,34 @@ int main(int argc, char** argv) {
         pe::Id a = builder.add_term(t.args[0].args[0]);
         pe::Id b = builder.add_term(t.args[0].args[1]);
         disequalities.emplace_back(a, b);
+      } else if (t.kind == pe::Term::Kind::Distinct) {
+        // (distinct t1 ... tn): assert all n*(n-1)/2 pairwise
+        // disequalities. Intern each operand once and then enumerate
+        // the upper-triangle pairs.
+        std::vector<pe::Id> ids;
+        ids.reserve(t.args.size());
+        for (const auto& arg : t.args) {
+          ids.push_back(builder.add_term(arg));
+        }
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+          for (std::size_t j = i + 1; j < ids.size(); ++j) {
+            disequalities.emplace_back(ids[i], ids[j]);
+          }
+        }
+      } else if (t.kind == pe::Term::Kind::Not && t.args.size() == 1 &&
+                 t.args[0].kind == pe::Term::Kind::Distinct) {
+        // (not (distinct ...)) means "at least two operands are
+        // equal" — that's a disjunction, not expressible as a
+        // conjunction of unit equalities. Refuse rather than
+        // silently mis-handle.
+        std::fprintf(stderr,
+            "(not (distinct ...)) is not expressible as unit equalities; "
+            "skipping is unsound, so we refuse this input\n");
+        return 1;
       } else {
         std::fprintf(stderr,
-            "unsupported assertion shape (only (= a b) and (not (= a b)))\n");
+            "unsupported assertion shape (only (= a b), (not (= a b)), "
+            "and (distinct t1 ... tn))\n");
         return 1;
       }
     }

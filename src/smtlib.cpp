@@ -183,6 +183,18 @@ class Parser {
     } else if (head == "not") {
       t.kind = Term::Kind::Not;
       t.args.push_back(parse_term());
+    } else if (head == "distinct") {
+      // (distinct t1 ... tn). Variadic n >= 2. The consumer expands it
+      // into n*(n-1)/2 pairwise disequalities; we just collect the
+      // operands here.
+      t.kind = Term::Kind::Distinct;
+      while (cur_.kind != Token::Kind::RParen) {
+        if (cur_.kind == Token::Kind::End) error("unterminated (distinct ...)");
+        t.args.push_back(parse_term());
+      }
+      if (t.args.size() < 2) {
+        error("(distinct ...) requires at least 2 operands");
+      }
     } else {
       t.kind = Term::Kind::App;
       t.op = head;
