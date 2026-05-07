@@ -546,6 +546,92 @@ bool test_par_async_cross_depth() {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// `parallel_close_async_rounds_min_id` should match `parallel_close` on
+// the cross-depth init scenario — confirms the MIN_ID variant doesn't
+// regress correctness when classes get merged across depth boundaries.
+// ---------------------------------------------------------------------------
+bool test_par_async_min_cross_depth() {
+  auto build_nodes = []() {
+    return make_nodes({
+        ENode{"a",  {}}, ENode{"b",  {}},
+        ENode{"ta1", {}}, ENode{"ta2", {}}, ENode{"t",  {}},
+        ENode{"f", {0}}, ENode{"f", {1}},
+        ENode{"g", {2, 4}}, ENode{"g", {3, 4}},
+    });
+  };
+  auto unions = []() {
+    parlay::sequence<std::pair<Id, Id>> eqs;
+    eqs.push_back({0, 1});
+    eqs.push_back({2, 5});
+    eqs.push_back({3, 6});
+    return eqs;
+  };
+
+  auto eg_par = std::make_unique<ConcurrentEGraph>(build_nodes());
+  eg_par->parallel_close(unions());
+
+  auto eg_min = std::make_unique<ConcurrentEGraph>(build_nodes(), pe::async);
+  eg_min->parallel_close_async_rounds_min_id(unions());
+
+  for (Id i = 0; i < 9; ++i) {
+    for (Id j = i + 1; j < 9; ++j) {
+      if (eg_par->equiv(i, j) != eg_min->equiv(i, j)) {
+        std::fprintf(stderr,
+                     "FAIL par_async_min vs parallel_close on (%u, %u): "
+                     "oracle=%d min=%d\n",
+                     i, j, int(eg_par->equiv(i, j)),
+                     int(eg_min->equiv(i, j)));
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// `parallel_close_topo_iter` is the iterated MIN_ID variant of the
+// previously-unsound `parallel_close_topo`. Should match `parallel_close`
+// on the cross-depth scenario thanks to the fixpoint loop.
+// ---------------------------------------------------------------------------
+bool test_par_topo_iter_cross_depth() {
+  auto build_nodes = []() {
+    return make_nodes({
+        ENode{"a",  {}}, ENode{"b",  {}},
+        ENode{"ta1", {}}, ENode{"ta2", {}}, ENode{"t",  {}},
+        ENode{"f", {0}}, ENode{"f", {1}},
+        ENode{"g", {2, 4}}, ENode{"g", {3, 4}},
+    });
+  };
+  auto unions = []() {
+    parlay::sequence<std::pair<Id, Id>> eqs;
+    eqs.push_back({0, 1});
+    eqs.push_back({2, 5});
+    eqs.push_back({3, 6});
+    return eqs;
+  };
+
+  auto eg_par = std::make_unique<ConcurrentEGraph>(build_nodes());
+  eg_par->parallel_close(unions());
+
+  auto eg_pti = std::make_unique<ConcurrentEGraph>(build_nodes(), pe::topo);
+  eg_pti->parallel_close_topo_iter(unions());
+
+  for (Id i = 0; i < 9; ++i) {
+    for (Id j = i + 1; j < 9; ++j) {
+      if (eg_par->equiv(i, j) != eg_pti->equiv(i, j)) {
+        std::fprintf(stderr,
+                     "FAIL par_topo_iter vs parallel_close on (%u, %u): "
+                     "oracle=%d pti=%d\n",
+                     i, j, int(eg_par->equiv(i, j)),
+                     int(eg_pti->equiv(i, j)));
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 bool test_par_vs_seq_agree() {
   // 6 leaves, plus binary + ternary fn nodes to exercise variable arity
   auto build_nodes = []() {
@@ -645,6 +731,8 @@ int main() {
       {"seq_dst_adversarial", test_seq_dst_adversarial_order},
       {"seq_topo_iter_adversarial", test_seq_topo_iter_adversarial_order},
       {"par_async_cross_depth", test_par_async_cross_depth},
+      {"par_async_min_cross_depth", test_par_async_min_cross_depth},
+      {"par_topo_iter_cross_depth", test_par_topo_iter_cross_depth},
       {"self_merge_no_loop", test_self_merge_no_loop},
   };
 

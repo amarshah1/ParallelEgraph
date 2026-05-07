@@ -211,4 +211,125 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds(
   }
 }
 
+// ---- MIN_ID variant -----------------------------------------------------
+//
+// Same algorithm as `parallel_close_async_rounds`; every union (initial
+// unions and dnc_union) goes through `ConcurrentUnionFind::union_min_id`
+// so the lower-id root always survives. This preserves the
+// canonical-id-stable invariant on DAG-ordered inputs: lookups and
+// insertions across in-pass merges agree on which class id is the root,
+// so a regular cascade (Family C) collapses in a single BSP round
+// instead of one round per level.
+
+template <>
+void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds_min_id(
+    parlay::sequence<std::pair<Id, Id>> initial_unions) {
+  const bool trace = std::getenv("PE_TRACE") != nullptr;
+  using clk = std::chrono::steady_clock;
+  auto ms_since = [](clk::time_point t0) {
+    return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+  };
+
+  const std::size_t n = nodes_.size();
+  std::uint64_t R = 1;
+
+  // ---- step 1: apply initial unions in parallel; mark new roots --------
+  parlay::parallel_for(0, initial_unions.size(), [&](std::size_t i) {
+    auto [a, b] = initial_unions[i];
+    uf_.union_min_id(a, b);
+    mark_round(last_marked_[uf_.find_root(a)], R);
+  });
+
+  auto all_idx = parlay::iota<std::uint32_t>(static_cast<std::uint32_t>(n));
+  auto non_leaf = parlay::filter(all_idx, [&](std::uint32_t i) {
+    return !nodes_[i].children.empty();
+  });
+
+  // Lambda dispatching dnc_union_with onto the MIN_ID merge.
+  auto union_min_fn = [](ConcurrentUnionFind& uf, Id a, Id b) {
+    uf.union_min_id(a, b);
+  };
+
+  std::size_t round = 0;
+  while (true) {
+    ++R;
+
+    auto t_filter = clk::now();
+    auto dirty = parlay::filter(non_leaf, [&](std::uint32_t i) {
+      const auto& cs = nodes_[i].children;
+      for (Id c : cs) {
+        const std::uint64_t m =
+            last_marked_[uf_.find_root(c)].load(std::memory_order_relaxed);
+        if (m == R - 1 || m == R) return true;
+      }
+      return false;
+    });
+    double filter_ms = trace ? ms_since(t_filter) : 0.0;
+
+    if (dirty.empty()) {
+      if (trace) {
+        std::fprintf(stderr,
+                     "[pe-async-min] round=%3zu R=%llu dirty=        0 "
+                     "filter=%7.3fms (clean break)\n",
+                     round, (unsigned long long)R, filter_ms);
+      }
+      break;
+    }
+
+    auto t_semisort = clk::now();
+    auto canon_entries = parlay::map(dirty, [&](std::uint32_t i) {
+#ifdef PE_SEMISORT_SOUND
+      return detail::CanonEntry{sig_hash(nodes_[i], uf_), uf_.find_root(i),
+                                static_cast<Id>(i)};
+#else
+      auto [h1, h2] = sig_hashes(nodes_[i], uf_);
+      return detail::CanonEntry{h1, uf_.find_root(i), h2};
+#endif
+    });
+
+    auto keyed = parlay::map(canon_entries, [](const detail::CanonEntry& e) {
+      return std::pair<detail::CanonEntry, detail::CanonEntry>{e, e};
+    });
+    auto hash_fn = [](const detail::CanonEntry& e) -> std::size_t {
+      return e.hash;
+    };
+#ifdef PE_SEMISORT_SOUND
+    auto equal_fn = [&](const detail::CanonEntry& a,
+                        const detail::CanonEntry& b) {
+      return a.hash == b.hash &&
+             sigs_equal(a.class_id, b.class_id, uf_, nodes_);
+    };
+#else
+    auto equal_fn = [](const detail::CanonEntry& a,
+                       const detail::CanonEntry& b) {
+      return a.hash == b.hash && a.secondary_hash == b.secondary_hash;
+    };
+#endif
+    auto groups = parlay::group_by_key(keyed, hash_fn, equal_fn);
+
+    parlay::parallel_for(0, groups.size(), [&](std::size_t g) {
+      auto& bucket = groups[g].second;
+      if (bucket.size() < 2) return;
+      const Id ref = bucket[0].root;
+      bool all_same = parlay::all_of(
+          bucket, [ref](const detail::CanonEntry& e) { return e.root == ref; });
+      if (all_same) return;
+      detail::dnc_union_with(bucket, 0, bucket.size(), uf_, union_min_fn);
+      // After MIN_ID dnc_union, the surviving root is the lowest-id
+      // member of the bucket's pre-merge roots. Stamp it.
+      mark_round(last_marked_[uf_.find_root(bucket[0].root)], R);
+    });
+    double semisort_ms = trace ? ms_since(t_semisort) : 0.0;
+
+    if (trace) {
+      std::fprintf(stderr,
+                   "[pe-async-min] round=%3zu R=%llu dirty=%9zu groups=%9zu "
+                   "filter=%7.3fms semisort=%7.3fms\n",
+                   round, (unsigned long long)R, dirty.size(),
+                   groups.size(), filter_ms, semisort_ms);
+    }
+    ++round;
+  }
+}
+
 }  // namespace pe

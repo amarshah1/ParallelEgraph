@@ -1,5 +1,6 @@
 #include "parallel_egraph/egraph.hpp"
 #include "parallel_egraph/detail.hpp"
+#include "parallel_egraph/dnc_union.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -220,6 +221,111 @@ void EGraph<ConcurrentUnionFind>::parallel_close_topo(
   }
 }
 
+// ---- parallel_close_topo_iter -------------------------------------------
+//
+// Sound parallel topo: depth-stratified BSP wrapped in a fixpoint loop,
+// with MIN_ID linking. The single-pass `parallel_close_topo` is unsound
+// on cross-depth initial unions because in-round unions can change
+// find_root values for sibling sigs that were already computed; iterating
+// catches the missed congruences across passes, and MIN_ID makes the
+// fixpoint converge in 1-2 passes on regular cascades.
+
+template <>
+void EGraph<ConcurrentUnionFind>::parallel_close_topo_iter(
+    parlay::sequence<std::pair<Id, Id>> initial_unions) {
+  const bool trace = std::getenv("PE_TRACE_ITER") != nullptr;
+  using clk = std::chrono::steady_clock;
+
+  // ---- step 1: apply initial unions in parallel (MIN_ID) -----------------
+  parlay::parallel_for(0, initial_unions.size(), [&](std::size_t i) {
+    uf_.union_min_id(initial_unions[i].first, initial_unions[i].second);
+  });
+
+  // Lambda dispatched into dnc_union_with — also sets `*changed` when
+  // an actual merge commits.
+  std::atomic<bool> changed{false};
+  auto union_track = [&changed](ConcurrentUnionFind& u, Id a, Id b) {
+    if (u.union_min_id(a, b)) {
+      changed.store(true, std::memory_order_relaxed);
+    }
+  };
+
+  std::size_t round = 0;
+  do {
+    changed.store(false, std::memory_order_relaxed);
+    auto t_round = trace ? clk::now() : clk::time_point{};
+
+    // Walk d = 1..max_depth. depth 0 = leaves; nothing to canonicalize.
+    for (std::size_t d = 1; d < depth_buckets_.size(); ++d) {
+      const auto& bucket = depth_buckets_[d];
+      if (bucket.empty()) continue;
+
+      // Build CanonEntry for every class in the bucket.
+      auto canon = parlay::map(bucket, [&](Id idx) {
+        const auto& node = nodes_[idx];
+#ifdef PE_SEMISORT_SOUND
+        return detail::CanonEntry{sig_hash(node, uf_), uf_.find_root(idx), idx};
+#else
+        auto [hash, secondary] = sig_hashes(node, uf_);
+        return detail::CanonEntry{hash, uf_.find_root(idx), secondary};
+#endif
+      });
+
+      if (canon.empty()) continue;
+
+      // Sort by primary hash (in-place) and walk runs.
+      parlay::integer_sort_inplace(
+          parlay::make_slice(canon),
+          [](const detail::CanonEntry& e) -> std::uint64_t { return e.hash; });
+
+      auto starts_flag = parlay::tabulate(canon.size(), [&](std::size_t i) {
+        return i == 0 || canon[i].hash != canon[i - 1].hash;
+      });
+      auto run_starts = parlay::pack_index<std::uint32_t>(starts_flag);
+
+      parlay::parallel_for(0, run_starts.size(), [&](std::size_t r) {
+        const std::size_t lo = run_starts[r];
+        const std::size_t hi = (r + 1 < run_starts.size())
+                                   ? static_cast<std::size_t>(run_starts[r + 1])
+                                   : canon.size();
+        if (hi - lo < 2) return;
+        // Same primary-hash run; split by full equality (secondary or sound).
+        std::size_t i = lo;
+        while (i < hi) {
+          std::size_t j = i + 1;
+          while (j < hi) {
+#ifdef PE_SEMISORT_SOUND
+            if (!sigs_equal(canon[i].class_id, canon[j].class_id, uf_, nodes_))
+              break;
+#else
+            if (canon[i].secondary_hash != canon[j].secondary_hash) break;
+#endif
+            ++j;
+          }
+          if (j - i >= 2) {
+            detail::dnc_union_with(canon, i, j, uf_, union_track);
+          }
+          i = j;
+        }
+      });
+    }
+
+    ++round;
+    if (trace) {
+      double ms = std::chrono::duration<double, std::milli>(
+                      clk::now() - t_round).count();
+      std::fprintf(stderr,
+                   "[par_topo_iter] round=%2zu changed=%d  %7.2fms\n",
+                   round, int(changed.load()), ms);
+    }
+  } while (changed.load(std::memory_order_relaxed));
+
+  if (trace) {
+    std::fprintf(stderr,
+                 "[par_topo_iter] converged after %zu round(s)\n", round);
+  }
+}
+
 // ---- sequential_close_nelson --------------------------------------------
 
 template <>
@@ -358,7 +464,16 @@ void EGraph<SequentialUnionFind>::sequential_close_topo(
     if (!inserted) {
       Id ra = uf_.find_root(pidx);
       Id rb = uf_.find_root(it->second);
-      if (ra != rb) uf_.union_(ra, rb);
+      if (ra != rb) {
+        // MIN_ID union: lower class id wins. Preserves the invariant
+        // that on a DAG-ordered input, the canonical (earliest-emitted)
+        // representative of any equivalence class is its current root —
+        // which lets a forward-pass collapse the entire cascade in a
+        // single sweep, since downstream sigs reference roots that were
+        // valid at insertion time AND remain valid after subsequent
+        // intra-pass merges.
+        uf_.union_into(std::max(ra, rb), std::min(ra, rb));
+      }
     }
   }
 }
@@ -377,10 +492,18 @@ void EGraph<SequentialUnionFind>::sequential_close_topo_iter(
     const parlay::sequence<std::pair<Id, Id>>& initial_unions) {
   for (auto [a, b] : initial_unions) uf_.union_(a, b);
 
+  const bool trace = std::getenv("PE_TRACE_ITER") != nullptr;
+  using clk = std::chrono::steady_clock;
+
   const std::size_t n = nodes_.size();
+  std::size_t round = 0;
+  std::size_t total_unions = 0;
   bool changed = true;
   while (changed) {
     changed = false;
+    auto t0 = trace ? clk::now() : clk::time_point{};
+    std::size_t round_unions = 0;
+
     ankerl::unordered_dense::map<Signature, std::uint32_t, SignatureHash>
         bucket;
     bucket.reserve(n);
@@ -391,11 +514,32 @@ void EGraph<SequentialUnionFind>::sequential_close_topo_iter(
         Id ra = uf_.find_root(pidx);
         Id rb = uf_.find_root(it->second);
         if (ra != rb) {
-          uf_.union_(ra, rb);
+          // MIN_ID union: see comment in sequential_close_topo.
+          // For DAG-ordered emission with canonical members at lower
+          // ids, this collapses the entire cascade in 2 rounds (1 work
+          // pass + 1 verification pass). Without it, each round
+          // advances exactly one g-tree level and total cost is
+          // O(N × depth) instead of O(N).
+          uf_.union_into(std::max(ra, rb), std::min(ra, rb));
           changed = true;
+          ++round_unions;
         }
       }
     }
+    ++round;
+    total_unions += round_unions;
+    if (trace) {
+      double ms = std::chrono::duration<double, std::milli>(
+                      clk::now() - t0).count();
+      std::fprintf(stderr,
+                   "[topo_iter] round=%3zu unions=%9zu cumulative=%9zu  %7.2fms\n",
+                   round, round_unions, total_unions, ms);
+    }
+  }
+  if (trace) {
+    std::fprintf(stderr,
+                 "[topo_iter] converged after %zu rounds, %zu total unions\n",
+                 round, total_unions);
   }
 }
 

@@ -232,6 +232,19 @@ class EGraph {
   void parallel_close_async_rounds(
       parlay::sequence<std::pair<Id, Id>> initial_unions);
 
+  // MIN_ID variant of `parallel_close_async_rounds`. Same algorithm —
+  // dirty filter via `last_marked_`, semisort by canonical sig, dnc_union
+  // per multi-member bucket — but every union (initial unions and
+  // dnc_union both) uses `union_min_id` instead of by-rank. On
+  // DAG-ordered inputs where the lowest-id member of each equivalence
+  // class is its structurally-canonical representative, this preserves
+  // the canonical-id-stable invariant across BSP rounds: a single sweep
+  // collapses the entire cascade for regular workloads, instead of one
+  // round per cascade level. Defined out-of-line as an explicit
+  // specialization on `ConcurrentUnionFind`.
+  void parallel_close_async_rounds_min_id(
+      parlay::sequence<std::pair<Id, Id>> initial_unions);
+
   // Depth-stratified parallel closure. Round d processes every class at
   // depth d as a two-phase BSP step: (1) parallel canon-build —
   // `parlay::map` over the depth-d bucket reads `find_root` to compute
@@ -250,6 +263,18 @@ class EGraph {
   // Defined out-of-line as an explicit specialization on
   // `ConcurrentUnionFind`.
   void parallel_close_topo(
+      parlay::sequence<std::pair<Id, Id>> initial_unions);
+
+  // Sound iterated variant of `parallel_close_topo`. Same depth-stratified
+  // structure (parallel canon-build per depth, semisort + dnc_union per
+  // bucket), but every union uses MIN_ID linking AND the entire
+  // depth-walk is wrapped in a fixpoint loop that repeats until a full
+  // pass produces no new unions. Recovers correctness on cross-depth
+  // initial unions; on regular cascades (Family C) MIN_ID makes a single
+  // depth-walk usually suffice, so the verification pass is the only
+  // overhead. Defined out-of-line as an explicit specialization on
+  // `ConcurrentUnionFind`.
+  void parallel_close_topo_iter(
       parlay::sequence<std::pair<Id, Id>> initial_unions);
 
   // Sequential Nelson-style closure baseline. Defined out-of-line only as

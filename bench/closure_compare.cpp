@@ -347,6 +347,38 @@ std::vector<double> bench_parallel_close_async(const Workload& w) {
   return times;
 }
 
+std::vector<double> bench_parallel_close_async_min(const Workload& w) {
+  for (int i = 0; i < WARMUP; ++i) {
+    auto g = build_async<ConcurrentUnionFind>(w);
+    g.eg->parallel_close_async_rounds_min_id(std::move(g.eqs));
+  }
+  std::vector<double> times;
+  times.reserve(TRIALS);
+  for (int i = 0; i < TRIALS; ++i) {
+    auto g = build_async<ConcurrentUnionFind>(w);
+    auto t0 = clk::now();
+    g.eg->parallel_close_async_rounds_min_id(std::move(g.eqs));
+    times.push_back(elapsed_ms(t0));
+  }
+  return times;
+}
+
+std::vector<double> bench_parallel_close_topo_iter(const Workload& w) {
+  for (int i = 0; i < WARMUP; ++i) {
+    auto g = build_topo<ConcurrentUnionFind>(w);
+    g.eg->parallel_close_topo_iter(std::move(g.eqs));
+  }
+  std::vector<double> times;
+  times.reserve(TRIALS);
+  for (int i = 0; i < TRIALS; ++i) {
+    auto g = build_topo<ConcurrentUnionFind>(w);
+    auto t0 = clk::now();
+    g.eg->parallel_close_topo_iter(std::move(g.eqs));
+    times.push_back(elapsed_ms(t0));
+  }
+  return times;
+}
+
 }  // namespace
 
 // Parse "leaves,fns,nodes,merges,depth" → Workload. Returns false on
@@ -417,10 +449,10 @@ int main() {
     std::printf("(* = unsound on cross-depth inits; topo_iter is the "
                 "iterated-to-fixpoint sound version. par_spd is "
                 "par_close vs topo_iter.)\n");
-    std::printf("%-8s %8s %10s %9s | %11s %11s %11s %11s | %11s %11s %7s\n",
+    std::printf("%-8s %8s %10s %9s | %11s %11s %11s %11s | %11s %11s %11s %11s %7s\n",
                 "name", "leaves", "nodes", "merges",
                 "nelson_seq", "nelson_topo*", "topo_iter", "nelson_dst",
-                "par_close", "par_async", "par_spd");
+                "par_close", "par_topo_it", "par_async", "par_async_m", "par_spd");
   } else if (csv_header) {
     std::printf("workload,leaves,fns,nodes,merges,depth,algorithm,trial,"
                 "parlay_threads,dnc_cutoff,wallclock_ms\n");
@@ -452,8 +484,12 @@ int main() {
     double md = median(dst);
     auto par = bench_parallel_close(w);
     double mp = median(par);
+    auto pti = bench_parallel_close_topo_iter(w);
+    double mpti = median(pti);
     auto pa = bench_parallel_close_async(w);
     double mpa = median(pa);
+    auto pam = bench_parallel_close_async_min(w);
+    double mpam = median(pam);
 
     if (csv) {
       if (!skip_nelson) emit_csv(w, "nelson_seq", nel);
@@ -461,14 +497,16 @@ int main() {
       emit_csv(w, "nelson_topo_iter", iter);
       emit_csv(w, "nelson_dst", dst);
       emit_csv(w, "par_close", par);
+      emit_csv(w, "par_topo_iter", pti);
       emit_csv(w, "par_async", pa);
+      emit_csv(w, "par_async_min_id", pam);
     } else if (skip_nelson) {
-      std::printf("%-8s %8zu %10zu %9zu |   skipped   %9.2fms %9.2fms %9.2fms | %9.2fms %9.2fms %6.2fx\n",
-                  w.name, w.n_leaves, w.n_nodes, w.n_merges, mt, mi, md, mp, mpa, mi / mp);
+      std::printf("%-8s %8zu %10zu %9zu |   skipped   %9.2fms %9.2fms %9.2fms | %9.2fms %9.2fms %9.2fms %9.2fms %6.2fx\n",
+                  w.name, w.n_leaves, w.n_nodes, w.n_merges, mt, mi, md, mp, mpti, mpa, mpam, mi / mp);
     } else {
-      std::printf("%-8s %8zu %10zu %9zu | %9.2fms %9.2fms %9.2fms %9.2fms | %9.2fms %9.2fms %6.2fx\n",
+      std::printf("%-8s %8zu %10zu %9zu | %9.2fms %9.2fms %9.2fms %9.2fms | %9.2fms %9.2fms %9.2fms %9.2fms %6.2fx\n",
                   w.name, w.n_leaves, w.n_nodes, w.n_merges,
-                  mn, mt, mi, md, mp, mpa, mi / mp);
+                  mn, mt, mi, md, mp, mpti, mpa, mpam, mi / mp);
     }
     std::fflush(stdout);
   }
