@@ -111,6 +111,29 @@ inline constexpr async_t async{};
 struct topo_t { explicit topo_t() = default; };
 inline constexpr topo_t topo{};
 
+// Round-stamp slot used by the async closure path. Padded to 64 bytes
+// (one cache line) so that concurrent CAS-max updates on adjacent
+// class ids don't false-share. Without padding, eight slots fit in
+// one cache line: at high core counts the MESI traffic from
+// updating slot[3] invalidates slot[0..7] on every other core,
+// turning an O(unions) atomic workload into an O(unions × cores)
+// cache-coherence storm. With padding, distinct slots are on
+// distinct cache lines, so threads can update unrelated classes in
+// parallel without trashing each other's caches. Cost is 8× memory
+// (64B per slot vs 8B), which is fine on the supercomputer at
+// quintic-n=18 scale (~240MB).
+struct alignas(64) PaddedMark {
+  std::atomic<std::uint64_t> v;
+  // Trailing padding fills the rest of the cache line; sized to keep
+  // the struct exactly 64 bytes regardless of std::atomic<uint64_t>'s
+  // alignment requirements on this target.
+  char _pad[64 - sizeof(std::atomic<std::uint64_t>)];
+};
+static_assert(sizeof(PaddedMark) == 64,
+              "PaddedMark must be exactly one cache line");
+static_assert(alignof(PaddedMark) == 64,
+              "PaddedMark must be cache-line aligned");
+
 template <typename UF>
 class EGraph {
  public:
@@ -157,14 +180,15 @@ class EGraph {
     const std::size_t n = nodes.size();
     uf_.bulk_init(n);
     nodes_ = std::move(nodes);
-    // parlay::sequence<std::atomic<...>> supports in-place
-    // construction via uninitialized + parallel placement; we then
-    // zero-init each slot. std::atomic's default ctor leaves the
-    // value unspecified, so the explicit store is required.
-    last_marked_ =
-        parlay::sequence<std::atomic<std::uint64_t>>::uninitialized(n);
+    // parlay::sequence<PaddedMark> supports in-place construction via
+    // uninitialized + parallel placement; we then zero-init each
+    // slot's atomic. PaddedMark's default ctor would leave .v
+    // unspecified, so the explicit store is required. PaddedMark is
+    // 64B so distinct slots live on distinct cache lines — eliminates
+    // false sharing on `last_marked_` at high core counts.
+    last_marked_ = parlay::sequence<PaddedMark>::uninitialized(n);
     parlay::parallel_for(0, n, [&](std::size_t i) {
-      new (&last_marked_[i]) std::atomic<std::uint64_t>(0);
+      new (&last_marked_[i]) PaddedMark{std::atomic<std::uint64_t>(0), {}};
     });
   }
 
@@ -326,7 +350,7 @@ class EGraph {
   UF& uf() { return uf_; }
   const parlay::sequence<ENode>& nodes() const { return nodes_; }
   parlay::sequence<parlay::sequence<Id>>& parents() { return parents_; }
-  parlay::sequence<std::atomic<std::uint64_t>>& last_marked() {
+  parlay::sequence<PaddedMark>& last_marked() {
     return last_marked_;
   }
 
@@ -337,12 +361,14 @@ class EGraph {
   // async ctor.
   parlay::sequence<parlay::sequence<Id>> parents_;
   // Async-only state. Populated by the `async_t`-tagged ctor; left
-  // empty by the default ctor. last_marked_[r] = highest round
+  // empty by the default ctor. last_marked_[r].v = highest round
   // number for which class r was unioned-into-as-the-new-root.
   // Updated via parlay::write_max (monotone CAS-max), so a tail
   // worker holding a stale R can never overwrite a fresher mark.
-  // Indexed by class id.
-  parlay::sequence<std::atomic<std::uint64_t>> last_marked_;
+  // Each entry is cache-line padded (PaddedMark = 64B) to prevent
+  // false sharing between adjacent class ids' marks. Indexed by
+  // class id.
+  parlay::sequence<PaddedMark> last_marked_;
   // Topo-only state. Populated by the `topo_t`-tagged ctor; left empty
   // by the default and async ctors. depth_buckets_[d] is the (parallel)
   // sequence of class ids whose nodes lie at depth d in the DAG; depth

@@ -79,7 +79,7 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds(
     auto [a, b] = initial_unions[i];
     uf_.union_(a, b);
     // Whichever side became the new root, find_root(a) returns it.
-    mark_round(last_marked_[uf_.find_root(a)], R);
+    mark_round(last_marked_[uf_.find_root(a)].v, R);
   });
 
   // Build the list of non-leaf indices once. Leaves never need to be
@@ -102,7 +102,7 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds(
       const auto& cs = nodes_[i].children;
       for (Id c : cs) {
         const std::uint64_t m =
-            last_marked_[uf_.find_root(c)].load(std::memory_order_relaxed);
+            last_marked_[uf_.find_root(c)].v.load(std::memory_order_relaxed);
         if (m == R - 1 || m == R) return true;
       }
       return false;
@@ -166,7 +166,7 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds(
           const Id child = nodes_[i].children[cc];
           const Id child_root = uf_.find_root(child);
           std::fprintf(stderr, "%u(root=%u,marked=%llu)", child, child_root,
-                       (unsigned long long)last_marked_[child_root].load());
+                       (unsigned long long)last_marked_[child_root].v.load());
         }
         std::fprintf(stderr, "] self_root=%u\n", uf_.find_root(i));
       }
@@ -196,7 +196,7 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds(
       detail::dnc_union(bucket, 0, bucket.size(), uf_);
       // Bucket merged; whichever root survived is now the canonical
       // root for every member. Stamp it.
-      mark_round(last_marked_[uf_.find_root(bucket[0].root)], R);
+      mark_round(last_marked_[uf_.find_root(bucket[0].root)].v, R);
     });
     double semisort_ms = trace ? ms_since(t_semisort) : 0.0;
 
@@ -237,7 +237,7 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds_min_id(
   parlay::parallel_for(0, initial_unions.size(), [&](std::size_t i) {
     auto [a, b] = initial_unions[i];
     uf_.union_min_id(a, b);
-    mark_round(last_marked_[uf_.find_root(a)], R);
+    mark_round(last_marked_[uf_.find_root(a)].v, R);
   });
 
   auto all_idx = parlay::iota<std::uint32_t>(static_cast<std::uint32_t>(n));
@@ -259,7 +259,7 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds_min_id(
       const auto& cs = nodes_[i].children;
       for (Id c : cs) {
         const std::uint64_t m =
-            last_marked_[uf_.find_root(c)].load(std::memory_order_relaxed);
+            last_marked_[uf_.find_root(c)].v.load(std::memory_order_relaxed);
         if (m == R - 1 || m == R) return true;
       }
       return false;
@@ -317,7 +317,7 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds_min_id(
       detail::dnc_union_with(bucket, 0, bucket.size(), uf_, union_min_fn);
       // After MIN_ID dnc_union, the surviving root is the lowest-id
       // member of the bucket's pre-merge roots. Stamp it.
-      mark_round(last_marked_[uf_.find_root(bucket[0].root)], R);
+      mark_round(last_marked_[uf_.find_root(bucket[0].root)].v, R);
     });
     double semisort_ms = trace ? ms_since(t_semisort) : 0.0;
 
