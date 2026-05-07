@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -432,8 +433,37 @@ int main() {
   // PE_BENCH_ONLY=large (etc.) restricts to a single workload — handy for
   // quick parameter sweeps without paying for the other five.
   const char* only = std::getenv("PE_BENCH_ONLY");
-  // PE_BENCH_SKIP_NELSON=1 skips the sequential baseline (sweep-only).
-  const bool skip_nelson = std::getenv("PE_BENCH_SKIP_NELSON") != nullptr;
+  // PE_BENCH_SKIP_NELSON=1 skips the sequential nelson_seq baseline.
+  // PE_BENCH_PAR_ONLY=1 additionally skips nelson_topo, nelson_topo_iter,
+  // nelson_dst — i.e. every sequential algorithm. Useful for T>1 sweeps
+  // where the thread-independent baselines have already been measured
+  // at T=1. Implies PE_BENCH_SKIP_NELSON=1.
+  const bool par_only    = std::getenv("PE_BENCH_PAR_ONLY") != nullptr;
+  const bool skip_nelson = par_only ||
+                           std::getenv("PE_BENCH_SKIP_NELSON") != nullptr;
+
+  // PE_BENCH_ALGOS=algo1,algo2,... restricts which algorithms run+emit.
+  // Names must match CSV `algorithm` tags: nelson_seq, nelson_topo,
+  // nelson_topo_iter, nelson_dst, par_close, par_topo_iter, par_async,
+  // par_async_min_id. Empty/unset = run all (subject to par_only and
+  // skip_nelson). Combining narrows further.
+  std::set<std::string> algo_filter;
+  if (const char* algos_env = std::getenv("PE_BENCH_ALGOS")) {
+    std::string s(algos_env);
+    std::size_t start = 0;
+    while (start <= s.size()) {
+      std::size_t end = s.find(',', start);
+      std::string tok = (end == std::string::npos)
+                          ? s.substr(start)
+                          : s.substr(start, end - start);
+      if (!tok.empty()) algo_filter.insert(std::move(tok));
+      if (end == std::string::npos) break;
+      start = end + 1;
+    }
+  }
+  auto algo_enabled = [&](const char* name) {
+    return algo_filter.empty() || algo_filter.count(name) > 0;
+  };
   // PE_BENCH_FORMAT=csv emits one row per (workload, algorithm, trial)
   // instead of the aligned summary table. Header gated by PE_BENCH_HEADER=1
   // so multiple driver invocations can append.
@@ -491,34 +521,57 @@ int main() {
     std::fprintf(stderr, "[bench] running %s ...\n", w.name);
     std::vector<double> nel;
     double mn = 0.0;
-    if (!skip_nelson) {
+    if (!skip_nelson && algo_enabled("nelson_seq")) {
       nel = bench_nelson(w);
       mn = median(nel);
     }
-    auto top = bench_nelson_topo(w);
-    double mt = median(top);
-    auto iter = bench_nelson_topo_iter(w);
-    double mi = median(iter);
-    auto dst = bench_nelson_dst(w);
-    double md = median(dst);
-    auto par = bench_parallel_close(w);
-    double mp = median(par);
-    auto pti = bench_parallel_close_topo_iter(w);
-    double mpti = median(pti);
-    auto pa = bench_parallel_close_async(w);
-    double mpa = median(pa);
-    auto pam = bench_parallel_close_async_min(w);
-    double mpam = median(pam);
+    std::vector<double> top, iter, dst;
+    double mt = 0.0, mi = 0.0, md = 0.0;
+    if (!par_only) {
+      if (algo_enabled("nelson_topo")) {
+        top  = bench_nelson_topo(w);
+        mt   = median(top);
+      }
+      if (algo_enabled("nelson_topo_iter")) {
+        iter = bench_nelson_topo_iter(w);
+        mi   = median(iter);
+      }
+      if (algo_enabled("nelson_dst")) {
+        dst  = bench_nelson_dst(w);
+        md   = median(dst);
+      }
+    }
+    std::vector<double> par, pti, pa, pam;
+    double mp = 0.0, mpti = 0.0, mpa = 0.0, mpam = 0.0;
+    if (algo_enabled("par_close")) {
+      par = bench_parallel_close(w);
+      mp  = median(par);
+    }
+    if (algo_enabled("par_topo_iter")) {
+      pti  = bench_parallel_close_topo_iter(w);
+      mpti = median(pti);
+    }
+    if (algo_enabled("par_async")) {
+      pa  = bench_parallel_close_async(w);
+      mpa = median(pa);
+    }
+    if (algo_enabled("par_async_min_id")) {
+      pam  = bench_parallel_close_async_min(w);
+      mpam = median(pam);
+    }
 
     if (csv) {
-      if (!skip_nelson) emit_csv(w, "nelson_seq", nel);
-      emit_csv(w, "nelson_topo", top);
-      emit_csv(w, "nelson_topo_iter", iter);
-      emit_csv(w, "nelson_dst", dst);
-      emit_csv(w, "par_close", par);
-      emit_csv(w, "par_topo_iter", pti);
-      emit_csv(w, "par_async", pa);
-      emit_csv(w, "par_async_min_id", pam);
+      if (!skip_nelson && algo_enabled("nelson_seq"))
+        emit_csv(w, "nelson_seq", nel);
+      if (!par_only) {
+        if (algo_enabled("nelson_topo"))      emit_csv(w, "nelson_topo", top);
+        if (algo_enabled("nelson_topo_iter")) emit_csv(w, "nelson_topo_iter", iter);
+        if (algo_enabled("nelson_dst"))       emit_csv(w, "nelson_dst", dst);
+      }
+      if (algo_enabled("par_close"))        emit_csv(w, "par_close", par);
+      if (algo_enabled("par_topo_iter"))    emit_csv(w, "par_topo_iter", pti);
+      if (algo_enabled("par_async"))        emit_csv(w, "par_async", pa);
+      if (algo_enabled("par_async_min_id")) emit_csv(w, "par_async_min_id", pam);
     } else if (skip_nelson) {
       std::printf("%-8s %8zu %10zu %9zu |   skipped   %9.2fms %9.2fms %9.2fms | %9.2fms %9.2fms %9.2fms %9.2fms %6.2fx\n",
                   w.name, w.n_leaves, w.n_nodes, w.n_merges, mt, mi, md, mp, mpti, mpa, mpam, mi / mp);

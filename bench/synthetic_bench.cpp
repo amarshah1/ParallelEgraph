@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -555,7 +556,26 @@ int main() {
 
   const char* fams_env = std::getenv("PE_SYNTH_FAMILIES");
   const char* ns_env   = std::getenv("PE_SYNTH_NS");
-  const bool skip_nelson = std::getenv("PE_BENCH_SKIP_NELSON") != nullptr;
+  // PE_BENCH_PAR_ONLY=1 skips every sequential algorithm (nelson_seq,
+  // nelson_topo, nelson_topo_iter, nelson_dst). Useful for T>1 sweeps
+  // where re-running thread-independent baselines is wasted work.
+  // Implies PE_BENCH_SKIP_NELSON=1.
+  const bool par_only   = std::getenv("PE_BENCH_PAR_ONLY") != nullptr;
+  const bool skip_nelson = par_only ||
+                           std::getenv("PE_BENCH_SKIP_NELSON") != nullptr;
+
+  // PE_BENCH_ALGOS=algo1,algo2,... restricts which algorithms run+emit
+  // (saves wall time for narrow sweeps). Names must match the CSV
+  // `algorithm` column tags exactly. Empty/unset = run all (subject to
+  // par_only / skip_nelson). Combining with par_only is fine: the union
+  // of both restrictions applies (PE_BENCH_ALGOS narrows further).
+  std::set<std::string> algo_filter;
+  if (const char* algos_env = std::getenv("PE_BENCH_ALGOS")) {
+    for (auto& tok : split_csv(algos_env)) algo_filter.insert(std::move(tok));
+  }
+  auto algo_enabled = [&](const char* name) {
+    return algo_filter.empty() || algo_filter.count(name) > 0;
+  };
   const char* fmt = std::getenv("PE_BENCH_FORMAT");
   const bool csv = fmt && std::strcmp(fmt, "csv") == 0;
   const bool csv_header = std::getenv("PE_BENCH_HEADER") != nullptr;
@@ -678,34 +698,64 @@ int main() {
 
       std::vector<double> nel;
       double mn = 0.0;
-      if (!skip_nelson) {
+      if (!skip_nelson && algo_enabled("nelson_seq")) {
         nel = bench_nelson(f, n, g_arity, warmup, trials);
         mn = median(nel);
       }
-      auto top = bench_nelson_topo(f, n, g_arity, warmup, trials);
-      double mt = median(top);
-      auto iter = bench_nelson_topo_iter(f, n, g_arity, warmup, trials);
-      double mi = median(iter);
-      auto dst = bench_nelson_dst(f, n, g_arity, warmup, trials);
-      double md = median(dst);
-      auto par = bench_parallel_close(f, n, g_arity, warmup, trials);
-      double mp = median(par);
-      auto pti = bench_parallel_close_topo_iter(f, n, g_arity, warmup, trials);
-      double mpti = median(pti);
-      auto pa = bench_parallel_close_async(f, n, g_arity, warmup, trials);
-      double mpa = median(pa);
-      auto pam = bench_parallel_close_async_min(f, n, g_arity, warmup, trials);
-      double mpam = median(pam);
+      std::vector<double> top, iter, dst;
+      double mt = 0.0, mi = 0.0, md = 0.0;
+      if (!par_only) {
+        if (algo_enabled("nelson_topo")) {
+          top  = bench_nelson_topo(f, n, g_arity, warmup, trials);
+          mt   = median(top);
+        }
+        if (algo_enabled("nelson_topo_iter")) {
+          iter = bench_nelson_topo_iter(f, n, g_arity, warmup, trials);
+          mi   = median(iter);
+        }
+        if (algo_enabled("nelson_dst")) {
+          dst  = bench_nelson_dst(f, n, g_arity, warmup, trials);
+          md   = median(dst);
+        }
+      }
+      std::vector<double> par, pti, pa, pam;
+      double mp = 0.0, mpti = 0.0, mpa = 0.0, mpam = 0.0;
+      if (algo_enabled("par_close")) {
+        par = bench_parallel_close(f, n, g_arity, warmup, trials);
+        mp  = median(par);
+      }
+      if (algo_enabled("par_topo_iter")) {
+        pti  = bench_parallel_close_topo_iter(f, n, g_arity, warmup, trials);
+        mpti = median(pti);
+      }
+      if (algo_enabled("par_async")) {
+        pa  = bench_parallel_close_async(f, n, g_arity, warmup, trials);
+        mpa = median(pa);
+      }
+      if (algo_enabled("par_async_min_id")) {
+        pam  = bench_parallel_close_async_min(f, n, g_arity, warmup, trials);
+        mpam = median(pam);
+      }
 
       if (csv) {
-        if (!skip_nelson) emit_csv(f, n, classes, merges, "nelson_seq", nel);
-        emit_csv(f, n, classes, merges, "nelson_topo", top);
-        emit_csv(f, n, classes, merges, "nelson_topo_iter", iter);
-        emit_csv(f, n, classes, merges, "nelson_dst", dst);
-        emit_csv(f, n, classes, merges, "par_close", par);
-        emit_csv(f, n, classes, merges, "par_topo_iter", pti);
-        emit_csv(f, n, classes, merges, "par_async", pa);
-        emit_csv(f, n, classes, merges, "par_async_min_id", pam);
+        if (!skip_nelson && algo_enabled("nelson_seq"))
+          emit_csv(f, n, classes, merges, "nelson_seq", nel);
+        if (!par_only) {
+          if (algo_enabled("nelson_topo"))
+            emit_csv(f, n, classes, merges, "nelson_topo", top);
+          if (algo_enabled("nelson_topo_iter"))
+            emit_csv(f, n, classes, merges, "nelson_topo_iter", iter);
+          if (algo_enabled("nelson_dst"))
+            emit_csv(f, n, classes, merges, "nelson_dst", dst);
+        }
+        if (algo_enabled("par_close"))
+          emit_csv(f, n, classes, merges, "par_close", par);
+        if (algo_enabled("par_topo_iter"))
+          emit_csv(f, n, classes, merges, "par_topo_iter", pti);
+        if (algo_enabled("par_async"))
+          emit_csv(f, n, classes, merges, "par_async", pa);
+        if (algo_enabled("par_async_min_id"))
+          emit_csv(f, n, classes, merges, "par_async_min_id", pam);
       } else if (skip_nelson) {
         std::printf("%-8s %5zu %10zu %9zu |   skipped   %9.2fms %9.2fms %9.2fms | %9.2fms %9.2fms %9.2fms %9.2fms %6.2fx\n",
                     family_name(f), n, classes, merges, mt, mi, md, mp, mpti, mpa, mpam, mi / mp);
