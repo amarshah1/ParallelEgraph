@@ -48,25 +48,27 @@ namespace {
 constexpr int DEFAULT_TRIALS = 5;
 constexpr int DEFAULT_WARMUP = 1;
 
-enum class Family { Chain, Grid, Cube, Quartic, Quintic };
+enum class Family { Chain, Grid, Cube, Quartic, Quintic, MixedDepth };
 
 const char* family_name(Family f) {
   switch (f) {
-    case Family::Chain:   return "chain";
-    case Family::Grid:    return "grid";
-    case Family::Cube:    return "cube";
-    case Family::Quartic: return "quartic";
-    case Family::Quintic: return "quintic";
+    case Family::Chain:      return "chain";
+    case Family::Grid:       return "grid";
+    case Family::Cube:       return "cube";
+    case Family::Quartic:    return "quartic";
+    case Family::Quintic:    return "quintic";
+    case Family::MixedDepth: return "mixed_depth";
   }
   return "?";
 }
 
 bool parse_family(const std::string& s, Family& out) {
-  if (s == "chain")   { out = Family::Chain;   return true; }
-  if (s == "grid")    { out = Family::Grid;    return true; }
-  if (s == "cube")    { out = Family::Cube;    return true; }
-  if (s == "quartic") { out = Family::Quartic; return true; }
-  if (s == "quintic") { out = Family::Quintic; return true; }
+  if (s == "chain")       { out = Family::Chain;      return true; }
+  if (s == "grid")        { out = Family::Grid;       return true; }
+  if (s == "cube")        { out = Family::Cube;       return true; }
+  if (s == "quartic")     { out = Family::Quartic;    return true; }
+  if (s == "quintic")     { out = Family::Quintic;    return true; }
+  if (s == "mixed_depth") { out = Family::MixedDepth; return true; }
   return false;
 }
 
@@ -242,16 +244,73 @@ Workload gen_poly(std::size_t n, std::size_t arity, std::size_t g_arity) {
   return {std::move(nodes), std::move(eqs)};
 }
 
+// mixed_depth: cube-shape DAG (arity-3 f-apps + balanced d-ary g-tree)
+// with extra cross-depth initial unions on top of the standard
+// a_i = b_i leaf-leaf pairs. Designed to stress closure algorithms
+// whose convergence relies on a topological order of inputs:
+// par_topo_iter's outer fixpoint loop has to redo all depths on a
+// pass when a cross-depth merge happened, while async/BSP don't care.
+//
+// Layout is identical to gen_poly(n, 3, g_arity); on top of the
+// returned eqs (n leaf-leaf pairs), we append `n` cross-depth pairs.
+// Each cross-depth pair = (random leaf, random g-tree class). Both
+// endpoints are valid class ids in nodes_; the leaf is at depth 0
+// and the g-tree class is at some depth >= 2, so they're guaranteed
+// non-same-depth.
+//
+// Determinism: the seed is fixed (seeded from n + a magic constant)
+// so successive runs with the same n produce the same workload.
+Workload gen_mixed_depth(std::size_t n, std::size_t g_arity) {
+  // Build the cube base.
+  Workload w = gen_poly(n, 3, g_arity);
+
+  // Class-id ranges in the gen_poly layout:
+  //   [0, 2n)         : leaves (depth 0)
+  //   [2n, 2n + 2n^3) : f-apps (depth 1)
+  //   [2n + 2n^3, total) : g-tree internal nodes (depth >= 2)
+  const std::size_t per_side = n * n * n;          // n^3 f-apps per side
+  const std::size_t leaves_end = 2 * n;
+  const std::size_t f_total = leaves_end + 2 * per_side;
+  const std::size_t total = w.nodes.size();
+  const std::size_t g_count = total - f_total;     // g-tree classes
+
+  if (g_count == 0) {
+    // Degenerate (n is too small for g-tree to exist) — return base
+    // workload unchanged. mixed_depth at n=1 has nothing extra to do.
+    return w;
+  }
+
+  // Append n cross-depth unions: one leaf + one g-tree class each.
+  // 64-bit splitmix RNG seeded from n; deterministic per workload.
+  std::uint64_t seed = 0xC0FFEE'BADC0DEull ^ (static_cast<std::uint64_t>(n) << 16);
+  auto next_rand = [&]() {
+    seed += 0x9E37'79B9'7F4A'7C15ull;
+    std::uint64_t z = seed;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    z = z ^ (z >> 31);
+    return z;
+  };
+
+  for (std::size_t i = 0; i < n; ++i) {
+    Id leaf = static_cast<Id>(next_rand() % leaves_end);
+    Id g_cls = static_cast<Id>(f_total + (next_rand() % g_count));
+    w.eqs.push_back({leaf, g_cls});
+  }
+  return w;
+}
+
 // `g_arity` (a.k.a. d, the decomposition rate): fan-in of each internal
 // g-node in the polynomial families' wrapper. Ignored for chain (no
 // g-tree). d=2 is the historical default (balanced binary tree).
 Workload gen_workload(Family f, std::size_t n, std::size_t g_arity) {
   switch (f) {
-    case Family::Chain:   return gen_chain(n);
-    case Family::Grid:    return gen_poly(n, 2, g_arity);
-    case Family::Cube:    return gen_poly(n, 3, g_arity);
-    case Family::Quartic: return gen_poly(n, 4, g_arity);
-    case Family::Quintic: return gen_poly(n, 5, g_arity);
+    case Family::Chain:      return gen_chain(n);
+    case Family::Grid:       return gen_poly(n, 2, g_arity);
+    case Family::Cube:       return gen_poly(n, 3, g_arity);
+    case Family::Quartic:    return gen_poly(n, 4, g_arity);
+    case Family::Quintic:    return gen_poly(n, 5, g_arity);
+    case Family::MixedDepth: return gen_mixed_depth(n, g_arity);
   }
   std::abort();
 }

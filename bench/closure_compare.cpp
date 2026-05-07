@@ -25,8 +25,27 @@ using namespace pe;
 
 namespace {
 
-constexpr int TRIALS = 5;
-constexpr int WARMUP = 1;
+// Default trial counts; overridable at runtime via PE_BENCH_TRIALS /
+// PE_BENCH_WARMUP env vars. Lazy lookup the first time they're used so
+// the cost is paid once and every subsequent call sees a fast int load.
+inline int trials() {
+  static const int v = [] {
+    const char* s = std::getenv("PE_BENCH_TRIALS");
+    return s ? std::max(1, std::atoi(s)) : 5;
+  }();
+  return v;
+}
+inline int warmup() {
+  static const int v = [] {
+    const char* s = std::getenv("PE_BENCH_WARMUP");
+    return s ? std::max(0, std::atoi(s)) : 1;
+  }();
+  return v;
+}
+// Kept as identifiers for the existing call sites; macro-substitute via
+// using-declarations so we don't have to touch every loop bound.
+#define TRIALS (trials())
+#define WARMUP (warmup())
 
 struct Workload {
   const char* name;
