@@ -22,6 +22,11 @@
 //   PE_BENCH_ALGOS=...       comma-separated EXACT names from
 //                            {nelson_topo_iter, par_topo_iter,
 //                             par_async}. Default = run all three.
+//   PE_BENCH_PAR_ONLY=1      skip every sequential algo (nelson_*).
+//                            Set on T>1 invocations so we don't
+//                            re-measure the thread-independent
+//                            sequential baseline at every thread
+//                            count. Applies after PE_BENCH_ALGOS.
 //   PE_TRACE=1               propagate to the closure routines for
 //                            per-round detail
 //
@@ -146,6 +151,15 @@ int main(int argc, char** argv) {
           "nelson_topo_iter, par_topo_iter, par_async\n", a);
       return 2;
     }
+  }
+  // PE_BENCH_PAR_ONLY=1: skip every sequential algorithm. Mirrors the
+  // synthetic_bench / closure_compare convention. The intent is "we
+  // already measured the sequential at T=1, don't re-run it at T>1
+  // where it produces the same number 4 times more slowly." Applies
+  // AFTER the PE_BENCH_ALGOS filter, so PE_BENCH_ALGOS=nelson_topo_iter
+  // + PE_BENCH_PAR_ONLY=1 = no algorithms run.
+  if (std::getenv("PE_BENCH_PAR_ONLY")) {
+    run_nelson_topo_iter = false;
   }
 
   if (csv_header) {
