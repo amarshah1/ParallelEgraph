@@ -67,6 +67,7 @@ struct Built {
 //   * std::monostate-like sentinel (default ctor: parents_)
 //   * pe::async_t (last_marked_)
 //   * pe::topo_t  (depth_buckets_)
+//   * pe::naive_t (UF only)
 template <typename UF, typename Tag = std::monostate>
 Built<UF> build_from_script(const pe::Script& script, Tag tag = {}) {
   pe::SmtToEGraphBuilder builder;
@@ -215,6 +216,21 @@ int main(int argc, char** argv) {
         warmup, par_threads, "par_async_min_id", pe::async,
         [](auto& eg, auto& eqs) {
           eg.parallel_close_async_rounds_min_id(std::move(eqs));
+        });
+    run_one<pe::ConcurrentUnionFind>(script, stem, family, n, trials,
+        warmup, par_threads, "par_naive", pe::naive,
+        [](auto& eg, auto& eqs) {
+          eg.parallel_close_naive_rounds(std::move(eqs));
+        });
+    run_one<pe::ConcurrentUnionFind>(script, stem, family, n, trials,
+        warmup, par_threads, "par_async_cont", pe::async,
+        [](auto& eg, auto& eqs) {
+          eg.parallel_close_async_continuous(std::move(eqs));
+        });
+    run_one<pe::ConcurrentUnionFind>(script, stem, family, n, trials,
+        warmup, par_threads, "par_async_gbk", pe::async,
+        [](auto& eg, auto& eqs) {
+          eg.parallel_close_async_rounds_groupby(std::move(eqs));
         });
   }
   return 0;

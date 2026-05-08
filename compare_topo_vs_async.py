@@ -76,7 +76,18 @@ GATES_DEFAULT_SUITES = ["iwls22", "hwmcc12"]
 #   nelson_topo_iter  — sequential topo_iter (sound, rounds-based)
 #   par_close         — BSP parallel CC (parents_-frontier)
 #   par_topo_iter     — parallel topo_iter (rounds-based, sound)
-#   par_async         — async-rounds CC (mark-based dirty filter)
+#   par_async         — async-rounds CC, integer-sort + run-walk
+#                        semisort (production)
+#   par_async_gbk     — same as par_async but using parlay::group_by_key
+#                        (hash table + per-bucket sequence allocation);
+#                        kept as A/B baseline for the integer-sort swap
+#   par_async_cont    — truly-async CC (semisorter + unioner via
+#                        parlay::par_do, deque mailbox, drain-gated
+#                        BSP-with-overlap; same dirty-filter as
+#                        par_async but pipelined within each round)
+#   par_naive         — naive rounds CC (semisort all non-leaves every
+#                        round; no dirty filter; the "ablation" against
+#                        par_async that quantifies what filtering buys)
 ALGOS_OF_INTEREST = [
     "nelson_seq",
     "nelson_topo",
@@ -84,6 +95,9 @@ ALGOS_OF_INTEREST = [
     "par_close",
     "par_topo_iter",
     "par_async",
+    "par_async_gbk",
+    "par_async_cont",
+    "par_naive",
 ]
 ALGO_HEADERS = {
     "nelson_seq":       "nelson",
@@ -92,6 +106,9 @@ ALGO_HEADERS = {
     "par_close":        "par_close",
     "par_topo_iter":    "par_topo_it",
     "par_async":        "par_async",
+    "par_async_gbk":    "par_a_gbk",
+    "par_async_cont":   "par_a_cont",
+    "par_naive":        "par_naive",
 }
 
 # Sequential = every algo not starting with "par_". Run only at T=1.
@@ -133,15 +150,101 @@ def _run_binary(binary: str, *, env: dict, numactl_prefix: list[str],
 # Phase: random / closure_compare_bench
 # ---------------------------------------------------------------------------
 
+# XL ladder: doubles n_nodes / n_merges each step. Driven via
+# PE_BENCH_CUSTOM (leaves, fns, nodes, merges, depth) so closure_compare
+# runs one large workload per invocation. Mirrors run_all_benchmarks.py's
+# RANDOM_XL_LADDER; kept in sync manually.
+RANDOM_XL_LADDER: dict[str, tuple[int, int, int, int, int]] = {
+    "XL":   (50_000, 16,  2_000_000,   200_000, 3),
+    "2XL":  (50_000, 16,  4_000_000,   400_000, 3),
+    "4XL":  (50_000, 16,  8_000_000,   800_000, 3),
+    "8XL":  (50_000, 16, 16_000_000, 1_600_000, 3),
+    "16XL": (50_000, 16, 32_000_000, 3_200_000, 3),
+    "32XL": (50_000, 16, 64_000_000, 6_400_000, 3),
+}
+
+
+def _retag_random_xl_rows(stdout: str, label: str, emit_header: bool) -> str:
+    """closure_compare prints `custom,leaves,fns,...` rows when driven
+    via PE_BENCH_CUSTOM. Rewrite the leading workload column from
+    `custom` to the ladder label so the merged CSV is self-describing.
+    Drops the header line unless emit_header is True."""
+    out: list[str] = []
+    for line in stdout.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if stripped.startswith("workload,"):
+            if emit_header:
+                out.append(line)
+            continue
+        if stripped.startswith("custom,"):
+            comma = line.find(",")
+            out.append(f"{label}{line[comma:]}")
+            continue
+        out.append(line)
+    return "".join(out)
+
+
+def run_random_xl(out_dir: Path, thread_counts: list[int],
+                  *, warmup: int, trials: int,
+                  labels: list[str] | None,
+                  algos: list[str] | None,
+                  numactl_prefix: list[str],
+                  append: bool = False):
+    csv_path = out_dir / "random.csv"
+    binary = "./build/closure_compare_bench"
+    if labels is None:
+        ladder = list(RANDOM_XL_LADDER.items())
+    else:
+        unknown = [l for l in labels if l not in RANDOM_XL_LADDER]
+        if unknown:
+            sys.exit(f"unknown XL ladder labels: {unknown}. "
+                     f"valid: {list(RANDOM_XL_LADDER)}")
+        ladder = [(l, RANDOM_XL_LADDER[l]) for l in labels]
+    mode = "a" if append else "w"
+    print(f"=== random (XL ladder, {[l for l, _ in ladder]}) "
+          f"-> {csv_path}{' (append)' if append else ''}", flush=True)
+    first = not append
+    with open(csv_path, mode) as out:
+        for label, params in ladder:
+            spec = ",".join(str(x) for x in params)
+            for t in thread_counts:
+                par_only = t > 1
+                tag = "par_only" if par_only else "+seq"
+                print(f"  [random-xl] {label} T={t} ({tag})", flush=True)
+                env = os.environ.copy()
+                env["PE_BENCH_FORMAT"] = "csv"
+                env["PE_BENCH_TRIALS"] = str(trials)
+                env["PE_BENCH_WARMUP"] = str(warmup)
+                env["PARLAY_NUM_THREADS"] = str(t)
+                env["PE_BENCH_CUSTOM"] = spec
+                if first:
+                    env["PE_BENCH_HEADER"] = "1"
+                if par_only:
+                    env["PE_BENCH_PAR_ONLY"] = "1"
+                if algos:
+                    env["PE_BENCH_ALGOS"] = ",".join(algos)
+                stdout = _run_binary(binary, env=env,
+                                     numactl_prefix=numactl_prefix,
+                                     phase_label=f"random-xl {label} T={t}")
+                out.write(_retag_random_xl_rows(
+                    stdout, label, emit_header=first))
+                out.flush()
+                first = False
+    return csv_path
+
+
 def run_random(out_dir: Path, thread_counts: list[int],
                *, warmup: int, trials: int,
                algos: list[str] | None,
-               numactl_prefix: list[str]):
+               numactl_prefix: list[str],
+               append: bool = False):
     csv_path = out_dir / "random.csv"
     binary = "./build/closure_compare_bench"
-    print(f"=== random (closure_compare_bench) → {csv_path}", flush=True)
-    first = True
-    with open(csv_path, "w") as out:
+    mode = "a" if append else "w"
+    print(f"=== random (closure_compare_bench) → {csv_path}"
+          f"{' (append)' if append else ''}", flush=True)
+    first = not append  # skip CSV header on append so we don't duplicate it
+    with open(csv_path, mode) as out:
         for t in thread_counts:
             par_only = t > 1
             tag = "par_only" if par_only else "+seq"
@@ -273,7 +376,10 @@ EGG_ALGOS: list[tuple[str, str | None, str | None]] = [
     ("par_close",        None,         None),
     ("par_topo_iter",    None,         "PE_USE_TOPO"),
     ("par_async",        None,         "PE_USE_ASYNC"),
+    ("par_async_gbk",    None,         "PE_USE_ASYNC_GBK"),
+    ("par_async_cont",   None,         "PE_USE_ASYNC_CONT"),
     ("par_async_min_id", None,         "PE_USE_ASYNC_MIN_ID"),
+    ("par_naive",        None,         "PE_USE_NAIVE"),
 ]
 
 EGG_TIMING_RE = re.compile(
@@ -624,9 +730,10 @@ def summarize(csv_path: Path, group_keys: list[str]):
     print(f"--- {csv_path.name} ---")
     print(fixed + " ".join(header_cells)
           + " | "
-          + f"{'topo/async':>10} {'topo_it_spd':>12}")
+          + f"{'topo/async':>10} {'naive/async':>12} "
+          + f"{'cont/async':>11} {'gbk/async':>10} {'topo_it_spd':>12}")
     total_w = (len(fixed) + sum(col_w.values()) + len(ALGOS_OF_INTEREST) - 1
-               + len(" | ") + 10 + 1 + 12)
+               + len(" | ") + 10 + 1 + 12 + 1 + 11 + 1 + 10 + 1 + 12)
     print("-" * total_w)
 
     # Sequential algos only run at T=1; cache that median per workload.
@@ -650,15 +757,28 @@ def summarize(csv_path: Path, group_keys: list[str]):
                              else f"{'-':>{col_w[a]}}")
             pt = vals.get("par_topo_iter")
             pa = vals.get("par_async")
+            pc = vals.get("par_async_cont")
+            pg = vals.get("par_async_gbk")
+            pn = vals.get("par_naive")
             ni = vals.get("nelson_topo_iter")
             ratio_topo_async = (f"{pt/pa:>9.2f}x"
                                 if (pt and pa and pa > 0) else f"{'-':>10}")
+            ratio_naive_async = (f"{pn/pa:>11.2f}x"
+                                 if (pn and pa and pa > 0)
+                                 else f"{'-':>12}")
+            ratio_cont_async = (f"{pc/pa:>10.2f}x"
+                                if (pc and pa and pa > 0)
+                                else f"{'-':>11}")
+            ratio_gbk_async = (f"{pg/pa:>9.2f}x"
+                               if (pg and pa and pa > 0)
+                               else f"{'-':>10}")
             topo_it_spd = (f"{ni/pt:>11.2f}x"
                            if (ni and pt and pt > 0) else f"{'-':>12}")
             wl_str = "/".join(str(x) for x in wl)
             print(f"{wl_str:<20} {t:>4} | "
                   + " ".join(cells)
-                  + f" | {ratio_topo_async} {topo_it_spd}")
+                  + f" | {ratio_topo_async} {ratio_naive_async} "
+                  + f"{ratio_cont_async} {ratio_gbk_async} {topo_it_spd}")
         print()
 
 
@@ -689,10 +809,21 @@ def main():
                     help="comma-separated algorithm whitelist. Default: "
                          "all. Names: nelson_seq, nelson_topo, "
                          "nelson_topo_iter, nelson_dst, par_close, "
-                         "par_topo_iter, par_async, par_async_min_id. "
+                         "par_topo_iter, par_async, par_async_gbk, "
+                         "par_async_cont, par_async_min_id, par_naive. "
                          "Sets PE_BENCH_ALGOS for the C++ binaries and "
                          "filters the egg dispatch loop, so unwanted "
                          "algos are never run.")
+    ap.add_argument("--random-modes", default="default",
+                    help="comma-separated random-phase modes. Valid: "
+                         "'default' (6 baked-in workloads) and 'xl' "
+                         "(XL/2XL/.../32XL ladder via PE_BENCH_CUSTOM). "
+                         "Pass both ('default,xl') to merge their rows "
+                         "into one random.csv.")
+    ap.add_argument("--xl-labels", default=None,
+                    help="comma-separated subset of XL ladder rungs to run "
+                         f"(valid: {','.join(RANDOM_XL_LADDER)}). Only used "
+                         "when 'xl' is in --random-modes. Default: all rungs.")
     ap.add_argument("--egg-dir", default=DEFAULT_EGG_DIR,
                     help=f"directory of .smt2 files for the egg phase "
                          f"(default: {DEFAULT_EGG_DIR})")
@@ -754,6 +885,30 @@ def main():
             sys.exit(f"unknown algos: {','.join(unknown)}. "
                      f"valid: {sorted(valid_algos)}")
 
+    valid_random_modes = {"default", "xl"}
+    random_modes = [m.strip() for m in args.random_modes.split(",")
+                    if m.strip()]
+    unknown = [m for m in random_modes if m not in valid_random_modes]
+    if unknown:
+        sys.exit(f"unknown random modes: {','.join(unknown)}. "
+                 f"valid: {sorted(valid_random_modes)}")
+    if not random_modes:
+        sys.exit("--random-modes is empty")
+    # Preserve user-given order in case it matters (it doesn't downstream;
+    # plotting groups by workload). Dedup while preserving first occurrence.
+    seen: set[str] = set()
+    random_modes = [m for m in random_modes
+                    if not (m in seen or seen.add(m))]
+
+    xl_labels = None
+    if args.xl_labels:
+        xl_labels = [s.strip() for s in args.xl_labels.split(",")
+                     if s.strip()]
+        if "xl" not in random_modes:
+            print("WARN: --xl-labels given but 'xl' not in --random-modes; "
+                  "ignoring.", file=sys.stderr)
+            xl_labels = None
+
     skip = set(args.skip)
     targets: list[str] = []
     if "random" not in skip:
@@ -776,7 +931,12 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Output:        {out_dir}")
-    print(f"Phases:        {[p for p in ('random','synthetic','cube_decomp','egg','gates') if p not in skip]}")
+    print(f"Phases:        {[p for p in ('random','synthetic','cube_decomp','egg') if p not in skip]}")
+    if "random" not in skip:
+        rm_label = ",".join(random_modes)
+        if "xl" in random_modes:
+            rm_label += f" (xl={xl_labels or list(RANDOM_XL_LADDER)})"
+        print(f"Random modes:  {rm_label}")
     print(f"Threads:       {thread_counts}")
     print(f"Families:      {families}")
     if override_ns:
@@ -793,11 +953,27 @@ def main():
 
     csv_paths: list[tuple[Path, list[str]]] = []
     if "random" not in skip:
-        p = run_random(out_dir, thread_counts,
-                       warmup=args.warmup, trials=args.trials,
-                       algos=algos,
-                       numactl_prefix=numactl_prefix)
-        csv_paths.append((p, ["workload"]))
+        # Run each requested mode; second/third call appends so they all
+        # land in one random.csv that downstream plotters can consume.
+        first = True
+        last_p = None
+        for m in random_modes:
+            if m == "default":
+                last_p = run_random(out_dir, thread_counts,
+                                    warmup=args.warmup, trials=args.trials,
+                                    algos=algos,
+                                    numactl_prefix=numactl_prefix,
+                                    append=not first)
+            else:  # "xl"
+                last_p = run_random_xl(out_dir, thread_counts,
+                                       warmup=args.warmup,
+                                       trials=args.trials,
+                                       labels=xl_labels, algos=algos,
+                                       numactl_prefix=numactl_prefix,
+                                       append=not first)
+            first = False
+        if last_p is not None:
+            csv_paths.append((last_p, ["workload"]))
     if "synthetic" not in skip:
         p = run_synthetic(out_dir, families, DEFAULT_FAMILY_NS, override_ns,
                           thread_counts,

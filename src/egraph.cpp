@@ -56,14 +56,14 @@ void parallel_consolidate(
     Id rep = groups[g].first;
     const auto& members = groups[g].second;
 
-    // Replace parents[r] with the concatenation of parents[r] (its own
-    // pre-existing parents) and parents[c] for every non-root c grouped
-    // under r. Each source is moved out; parlay::flatten allocates the
-    // destination buffer once and does the parallel scatter internally.
-    parlay::sequence<Id> sources(members);
-    sources.push_back(rep);
-    auto inputs = parlay::map(sources, [&](Id c) {
-      return std::move(parents[c]);
+    // Build the inputs sequence directly via tabulate: slot 0 = parents[rep],
+    // slots 1..k = parents[m_i]. Each inner is moved (O(1) pointer transfer);
+    // parlay::flatten then uninitialized-relocates them into one freshly-
+    // allocated destination buffer (the sequence<sequence<T>>&& overload).
+    // The previous implementation built a `sources` index list and a
+    // `parlay::map(sources, …)` — both are gratuitous; tabulate fuses them.
+    auto inputs = parlay::tabulate(members.size() + 1, [&](std::size_t i) {
+      return std::move(i == 0 ? parents[rep] : parents[members[i - 1]]);
     });
     parents[rep] = parlay::flatten(std::move(inputs));
   });
@@ -106,9 +106,13 @@ void EGraph<ConcurrentUnionFind>::parallel_close(
 
     auto t_frontier = clk::now();
     auto unique_roots = parlay::remove_duplicates(roots);
+    // Map each root to a non-owning slice of its parents list. Flatten then
+    // copies straight from parents_[r] into one freshly-allocated destination
+    // buffer (the generic flatten overload, since slices yield element refs)
+    // — saves one per-root sequence allocation + memcpy compared to the
+    // older "construct a fresh sequence(begin, end) per r" pattern.
     auto frontier = parlay::flatten(parlay::map(unique_roots, [&](Id r) {
-      return parlay::sequence<std::uint32_t>(std::begin(parents_[r]),
-                                             std::end(parents_[r]));
+      return parlay::make_slice(parents_[r]);
     }));
     double frontier_ms = trace ? ms_since(t_frontier) : 0.0;
 
