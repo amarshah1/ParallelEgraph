@@ -276,6 +276,15 @@ class EGraph {
   void parallel_close_async_rounds(
       parlay::sequence<std::pair<Id, Id>> initial_unions);
 
+  // Same algorithm as `parallel_close_async_rounds` but using
+  // `parlay::group_by_key` (hash table + per-bucket `sequence<
+  // CanonEntry>` materialization) instead of in-place integer-sort.
+  // Kept as an A/B baseline; the integer-sort variant is the
+  // production path. Defined out-of-line as an explicit specialization
+  // on `ConcurrentUnionFind`.
+  void parallel_close_async_rounds_groupby(
+      parlay::sequence<std::pair<Id, Id>> initial_unions);
+
   // Naive rounds-based closure: same skeleton as
   // `parallel_close_async_rounds` but without dirty tracking or the
   // `last_marked_` filter. Every round semisorts *all* non-leaf terms

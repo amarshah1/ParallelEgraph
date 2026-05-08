@@ -89,6 +89,121 @@ inline void mark_round_cas_max(std::atomic<std::uint64_t>& slot,
 
 }  // namespace
 
+// ---- group_by_key baseline ---------------------------------------------
+//
+// `parallel_close_async_rounds_groupby` is the original implementation
+// kept for A/B comparison against the integer-sort variant. It uses
+// `parlay::group_by_key`, which builds a hash table over the canon
+// entries' primary hashes and materializes a `sequence<sequence<
+// CanonEntry>>` (one inner buffer per bucket). The integer-sort path
+// in `parallel_close_async_rounds` replaces this with one in-place
+// 64-bit radix sort + tabulate + pack_index, eliminating the per-
+// bucket allocation. Use this method only when you want to measure
+// the cost of that swap.
+
+template <>
+void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds_groupby(
+    parlay::sequence<std::pair<Id, Id>> initial_unions) {
+  const bool trace = std::getenv("PE_TRACE") != nullptr;
+  using clk = std::chrono::steady_clock;
+  auto ms_since = [](clk::time_point t0) {
+    return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+  };
+
+  const std::size_t n = nodes_.size();
+  std::uint64_t R = 1;
+
+  parlay::parallel_for(0, initial_unions.size(), [&](std::size_t i) {
+    auto [a, b] = initial_unions[i];
+    uf_.union_(a, b);
+    mark_round(last_marked_[uf_.find_root(a)].v, R);
+  });
+
+  auto all_idx = parlay::iota<std::uint32_t>(static_cast<std::uint32_t>(n));
+  auto non_leaf = parlay::filter(all_idx, [&](std::uint32_t i) {
+    return !nodes_[i].children.empty();
+  });
+
+  std::size_t round = 0;
+  while (true) {
+    ++R;
+
+    auto t_filter = clk::now();
+    auto dirty = parlay::filter(non_leaf, [&](std::uint32_t i) {
+      const auto& cs = nodes_[i].children;
+      for (Id c : cs) {
+        const std::uint64_t m =
+            last_marked_[uf_.find_root(c)].v.load(std::memory_order_relaxed);
+        if (m == R - 1) return true;
+      }
+      return false;
+    });
+    double filter_ms = trace ? ms_since(t_filter) : 0.0;
+
+    if (dirty.empty()) {
+      if (trace) {
+        std::fprintf(stderr,
+                     "[pe-async-gbk] round=%3zu R=%llu dirty=        0 "
+                     "filter=%7.3fms (clean break)\n",
+                     round, (unsigned long long)R, filter_ms);
+      }
+      break;
+    }
+
+    auto t_semisort = clk::now();
+    auto canon_entries = parlay::map(dirty, [&](std::uint32_t i) {
+#ifdef PE_SEMISORT_SOUND
+      return detail::CanonEntry{sig_hash(nodes_[i], uf_), uf_.find_root(i),
+                                static_cast<Id>(i)};
+#else
+      auto [h1, h2] = sig_hashes(nodes_[i], uf_);
+      return detail::CanonEntry{h1, uf_.find_root(i), h2};
+#endif
+    });
+
+    auto keyed = parlay::map(canon_entries, [](const detail::CanonEntry& e) {
+      return std::pair<detail::CanonEntry, detail::CanonEntry>{e, e};
+    });
+    auto hash_fn = [](const detail::CanonEntry& e) -> std::size_t {
+      return e.hash;
+    };
+#ifdef PE_SEMISORT_SOUND
+    auto equal_fn = [&](const detail::CanonEntry& a,
+                        const detail::CanonEntry& b) {
+      return a.hash == b.hash &&
+             sigs_equal(a.class_id, b.class_id, uf_, nodes_);
+    };
+#else
+    auto equal_fn = [](const detail::CanonEntry& a,
+                       const detail::CanonEntry& b) {
+      return a.hash == b.hash && a.secondary_hash == b.secondary_hash;
+    };
+#endif
+    auto groups = parlay::group_by_key(keyed, hash_fn, equal_fn);
+
+    parlay::parallel_for(0, groups.size(), [&](std::size_t g) {
+      auto& bucket = groups[g].second;
+      if (bucket.size() < 2) return;
+      const Id ref = bucket[0].root;
+      bool all_same = parlay::all_of(
+          bucket, [ref](const detail::CanonEntry& e) { return e.root == ref; });
+      if (all_same) return;
+      detail::dnc_union(bucket, 0, bucket.size(), uf_);
+      mark_round(last_marked_[uf_.find_root(bucket[0].root)].v, R);
+    });
+    double semisort_ms = trace ? ms_since(t_semisort) : 0.0;
+
+    if (trace) {
+      std::fprintf(stderr,
+                   "[pe-async-gbk] round=%3zu R=%llu dirty=%9zu groups=%9zu "
+                   "filter=%7.3fms semisort=%7.3fms\n",
+                   round, (unsigned long long)R, dirty.size(),
+                   groups.size(), filter_ms, semisort_ms);
+    }
+    ++round;
+  }
+}
+
 template <>
 void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds(
     parlay::sequence<std::pair<Id, Id>> initial_unions) {
