@@ -67,6 +67,20 @@ namespace {
 // from different rounds could race with different R values. In that
 // case use `mark_round_cas_max` (CAS-loop) below instead — a
 // stale-R writer must not overwrite a fresh-R one.
+//
+// Two invariants travel together for the rounds-based algorithm; both
+// must be revisited when lifting to barrier-free async:
+//   (a) the cheap `mark_round` here (load-then-conditional-store):
+//       relies on "all writers within a parallel_for capture the same
+//       R," so no thread is concurrently writing R-1 vs R to the same
+//       slot.
+//   (b) the dirty filter's single-clause check `m == R - 1` (see step
+//       2 of parallel_close_async_rounds): relies on "no fresh writes
+//       to last_marked_ can happen after R was bumped and before the
+//       filter runs," so observing a value of `R` is impossible. In
+//       barrier-free async, both clauses (`m == R - 1 || m == R`) are
+//       needed because writes can land late or early relative to the
+//       filter's view of R.
 inline void mark_round(std::atomic<std::uint64_t>& slot, std::uint64_t r) {
   if (slot.load(std::memory_order_relaxed) < r) {
     slot.store(r, std::memory_order_relaxed);
@@ -76,7 +90,10 @@ inline void mark_round(std::atomic<std::uint64_t>& slot, std::uint64_t r) {
 // Monotone CAS-max version, kept available for the eventual
 // barrier-free async path where writers from different rounds may
 // race. Unused by the current rounds-based code; left here as a
-// reference for the algorithm-level invariant document above.
+// reference for the algorithm-level invariant document above. When
+// migrating to barrier-free, this helper plus the two-clause filter
+// (m == R-1 || m == R) together restore safety against the races
+// that the rounds-based version statically excludes.
 [[maybe_unused]]
 inline void mark_round_cas_max(std::atomic<std::uint64_t>& slot,
                                 std::uint64_t r) {

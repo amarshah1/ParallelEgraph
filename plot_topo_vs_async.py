@@ -7,6 +7,7 @@ For each present input CSV under `<run_dir>/`:
   random.csv       → random_async_speedup_vs_nelson.png       (color=workload)
   cube_decomp.csv  → cube_decomp_async_speedup_vs_nelson.png  (color=(fam,n), style=d)
   egg.csv          → egg_async_speedup_vs_nelson.png          (color=top-N files by close_s)
+  gates.csv        → gates_async_speedup.png                  (color=top-N files by close_ms)
 
   speedup(T) = nelson_topo_iter / par_async(T)
 
@@ -17,7 +18,11 @@ to the cross-T median.
 
 random/synthetic/cube_decomp use the C++ binaries' shared schema and
 report wallclock_ms. egg uses egraph-cc's per-invocation schema and
-reports close_s (closure phase only).
+reports close_s (closure phase only). gates uses gates_bench's schema
+which reports close_ms; gates_bench has NO sequential baseline (it
+only runs the two par algorithms), so the gates plot uses
+par_topo_iter(T=1) as the surrogate baseline — the closest available
+"best-rounds-based-CC at one core" measurement.
 
 All values are medians across trials. Axes are log-2.
 
@@ -78,6 +83,27 @@ def _collect_random(rows: list[dict[str, str]]):
         except (KeyError, ValueError):
             continue
         buckets[(wl, t, algo)].append(ms)
+    return {k: median(v) for k, v in buckets.items() if v}
+
+
+def _collect_gates(rows: list[dict[str, str]]):
+    """{(file, t, algo): median_close_ms}.
+
+    gates_bench schema: file, suite, n_gates, n_literals, n_not_terms,
+    total_classes, algorithm, trial, parlay_threads, read_s, parse_s,
+    build_s, close_ms. Closure-only ms is what we want — read/parse/
+    build are file-loading overhead, separately reported.
+    """
+    buckets: dict[tuple, list[float]] = defaultdict(list)
+    for r in rows:
+        try:
+            f = r["file"]
+            t = int(r["parlay_threads"])
+            ms = float(r["close_ms"])
+            algo = r["algorithm"]
+        except (KeyError, ValueError):
+            continue
+        buckets[(f, t, algo)].append(ms)
     return {k: median(v) for k, v in buckets.items() if v}
 
 
@@ -325,16 +351,114 @@ def plot_random(med, out_path: Path):
     _save(fig, out_path)
 
 
+def plot_gates(med, out_path: Path, top_n: int):
+    """Gates has no sequential baseline (gates_bench only runs the two
+    parallel algorithms). Use par_topo_iter at T=1 as the surrogate
+    baseline — it's the closest "best-rounds-based-CC at one core"
+    measurement available, sits roughly where nelson_topo_iter would
+    on these workloads (within ~2x), and keeps the y-axis directly
+    interpretable as "speedup over a strong single-core baseline."
+
+    Two lines per file: par_topo_iter(T) and par_async(T) both
+    normalized to par_topo_iter(T=1). par_topo_iter's line is the
+    self-scaling reference; par_async's line is what we're evaluating.
+    Pick top-N files by par_async closure cost at T_max so we focus
+    on workloads with enough work for parallelism to matter.
+    """
+    threads = sorted({t for (_, t, _) in med})
+    if not threads:
+        print(f"  skip {out_path.name}: no rows")
+        return
+
+    SURROGATE_BASELINE = "par_topo_iter"
+    if 1 not in threads:
+        print(f"  skip {out_path.name}: no T=1 measurement to use as baseline")
+        return
+    t_max = threads[-1]
+
+    # Rank files by par_async closure cost at T_max — the more work
+    # par_async did, the more interesting the scaling.
+    cost_at_max: dict[str, float] = {}
+    for (f, t, algo), v in med.items():
+        if algo == PAR_ALGO and t == t_max:
+            cost_at_max[f] = v
+    if not cost_at_max:
+        print(f"  skip {out_path.name}: no {PAR_ALGO} rows at T={t_max}")
+        return
+    top_files = [f for f, _ in
+                 sorted(cost_at_max.items(), key=lambda x: -x[1])[:top_n]]
+
+    # Surrogate sequential baseline: par_topo_iter(T=1) per file.
+    base_by_file: dict[str, float] = {}
+    for f in top_files:
+        v = med.get((f, 1, SURROGATE_BASELINE))
+        if v is not None and v > 0:
+            base_by_file[f] = v
+    if not base_by_file:
+        print(f"  skip {out_path.name}: no {SURROGATE_BASELINE}(T=1) rows "
+              f"for top files")
+        return
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+    ax.plot(threads, threads, color="grey", linestyle=":", linewidth=1,
+            label="linear (ideal)", zorder=0)
+    cmap = plt.get_cmap("tab10")
+
+    plotted = 0
+    for i, f in enumerate(top_files):
+        base = base_by_file.get(f)
+        if base is None:
+            continue
+        short = f.replace(".gates", "")
+        # par_async (solid).
+        xs, ys = [], []
+        for t in threads:
+            par = med.get((f, t, PAR_ALGO))
+            if par and par > 0:
+                xs.append(t); ys.append(base / par)
+        if xs:
+            ax.plot(xs, ys, marker="o", color=cmap(i % 10),
+                    linewidth=1.5, label=f"{short}  ({PAR_ALGO})")
+            plotted += 1
+        # par_topo_iter (dashed, same color) — self-scaling reference.
+        xs, ys = [], []
+        for t in threads:
+            tv = med.get((f, t, SURROGATE_BASELINE))
+            if tv and tv > 0:
+                xs.append(t); ys.append(base / tv)
+        if xs:
+            ax.plot(xs, ys, marker="s", linestyle="--",
+                    color=cmap(i % 10), linewidth=1.0, alpha=0.6,
+                    label=f"{short}  ({SURROGATE_BASELINE})")
+
+    if plotted == 0:
+        print(f"  skip {out_path.name}: no overlapping cells")
+        plt.close(fig)
+        return
+
+    ax.set_xscale("log", base=2); ax.set_yscale("log", base=2)
+    ax.set_xticks(threads); ax.set_xticklabels([str(t) for t in threads])
+    ax.set_xlabel("threads")
+    ax.set_ylabel(f"speedup ({SURROGATE_BASELINE}@T=1 / algo)  [close_ms]")
+    ax.set_title(f"gates — top-{top_n} files, {PAR_ALGO} vs "
+                 f"{SURROGATE_BASELINE} (surrogate seq baseline = "
+                 f"{SURROGATE_BASELINE}@T=1)")
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend(fontsize=7, loc="best", ncol=2)
+    _save(fig, out_path)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("run_dir",
                     help="runs/<ts>/ folder; processes synthetic.csv, "
-                         "random.csv, cube_decomp.csv, and egg.csv if "
-                         "present")
+                         "random.csv, cube_decomp.csv, egg.csv, and "
+                         "gates.csv if present")
     ap.add_argument("--top-n", type=int, default=10,
-                    help="N for top-N longest-close egg files (default 10)")
+                    help="N for top-N longest-close egg/gates files "
+                         "(default 10)")
     args = ap.parse_args()
 
     run_dir = Path(args.run_dir)
@@ -389,9 +513,19 @@ def main():
         else:
             print("  no usable rows in egg.csv")
 
+    gates_csv = run_dir / "gates.csv"
+    if gates_csv.exists():
+        any_csv = True
+        print(f"reading {gates_csv}")
+        med = _collect_gates(_read_csv(gates_csv))
+        if med:
+            plot_gates(med, figs / "gates_async_speedup.png", args.top_n)
+        else:
+            print("  no usable rows in gates.csv")
+
     if not any_csv:
-        sys.exit(f"no synthetic.csv, random.csv, cube_decomp.csv, or "
-                 f"egg.csv under {run_dir}")
+        sys.exit(f"no synthetic.csv, random.csv, cube_decomp.csv, "
+                 f"egg.csv, or gates.csv under {run_dir}")
     print("done.")
 
 
