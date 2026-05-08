@@ -48,11 +48,38 @@ namespace pe {
 
 namespace {
 
-// Monotone CAS-max via parlay's helper. Used to stamp the surviving
-// root of every union with the current round number; if two threads
-// race and one is writing R-1 while the other writes R, only the
-// larger value survives.
+// Stamp `slot` with round number `r`. Cheap load-then-conditional-store
+// (no CAS): safe in this rounds-based algorithm because every writer
+// within a single parallel_for captures the same `R` value, so all
+// concurrent writers want to write the same number. Worst-case race:
+//
+//   T_A loads → sees 0 (stale, < R)
+//   T_B loads → sees 0
+//   T_A stores R                  ← winner
+//   T_B stores R                  ← redundant but identical, no harm
+//
+// The load + conditional skip lets us avoid the redundant store on
+// the common path where another thread already stamped this slot.
+// Both load and store use memory_order_relaxed: we don't need ordering
+// because the surrounding parallel_for/barrier already supplies it.
+//
+// IMPORTANT: this is NOT safe in a barrier-free variant where threads
+// from different rounds could race with different R values. In that
+// case use `mark_round_cas_max` (CAS-loop) below instead — a
+// stale-R writer must not overwrite a fresh-R one.
 inline void mark_round(std::atomic<std::uint64_t>& slot, std::uint64_t r) {
+  if (slot.load(std::memory_order_relaxed) < r) {
+    slot.store(r, std::memory_order_relaxed);
+  }
+}
+
+// Monotone CAS-max version, kept available for the eventual
+// barrier-free async path where writers from different rounds may
+// race. Unused by the current rounds-based code; left here as a
+// reference for the algorithm-level invariant document above.
+[[maybe_unused]]
+inline void mark_round_cas_max(std::atomic<std::uint64_t>& slot,
+                                std::uint64_t r) {
   parlay::write_max(&slot, r, std::less<std::uint64_t>{});
 }
 
@@ -103,7 +130,8 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds(
       for (Id c : cs) {
         const std::uint64_t m =
             last_marked_[uf_.find_root(c)].v.load(std::memory_order_relaxed);
-        if (m == R - 1 || m == R) return true;
+        // note this is unsound in the true async version, you also have to check if m == R
+        if (m == R - 1) return true;
       }
       return false;
     });
