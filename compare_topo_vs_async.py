@@ -66,6 +66,13 @@ CUBE_DECOMP_KS = [5, 55, 105, 155]
 #   par_close         — BSP parallel CC (parents_-frontier)
 #   par_topo_iter     — parallel topo_iter (rounds-based, sound)
 #   par_async         — async-rounds CC (mark-based dirty filter)
+#   par_async_cont    — truly-async CC (semisorter + unioner via
+#                        parlay::par_do, deque mailbox, drain-gated
+#                        BSP-with-overlap; same dirty-filter as
+#                        par_async but pipelined within each round)
+#   par_naive         — naive rounds CC (semisort all non-leaves every
+#                        round; no dirty filter; the "ablation" against
+#                        par_async that quantifies what filtering buys)
 ALGOS_OF_INTEREST = [
     "nelson_seq",
     "nelson_topo",
@@ -73,6 +80,8 @@ ALGOS_OF_INTEREST = [
     "par_close",
     "par_topo_iter",
     "par_async",
+    "par_async_cont",
+    "par_naive",
 ]
 ALGO_HEADERS = {
     "nelson_seq":       "nelson",
@@ -81,6 +90,8 @@ ALGO_HEADERS = {
     "par_close":        "par_close",
     "par_topo_iter":    "par_topo_it",
     "par_async":        "par_async",
+    "par_async_cont":   "par_a_cont",
+    "par_naive":        "par_naive",
 }
 
 # Sequential = every algo not starting with "par_". Run only at T=1.
@@ -262,7 +273,9 @@ EGG_ALGOS: list[tuple[str, str | None, str | None]] = [
     ("par_close",        None,         None),
     ("par_topo_iter",    None,         "PE_USE_TOPO"),
     ("par_async",        None,         "PE_USE_ASYNC"),
+    ("par_async_cont",   None,         "PE_USE_ASYNC_CONT"),
     ("par_async_min_id", None,         "PE_USE_ASYNC_MIN_ID"),
+    ("par_naive",        None,         "PE_USE_NAIVE"),
 ]
 
 EGG_TIMING_RE = re.compile(
@@ -466,9 +479,10 @@ def summarize(csv_path: Path, group_keys: list[str]):
     print(f"--- {csv_path.name} ---")
     print(fixed + " ".join(header_cells)
           + " | "
-          + f"{'topo/async':>10} {'topo_it_spd':>12}")
+          + f"{'topo/async':>10} {'naive/async':>12} "
+          + f"{'cont/async':>11} {'topo_it_spd':>12}")
     total_w = (len(fixed) + sum(col_w.values()) + len(ALGOS_OF_INTEREST) - 1
-               + len(" | ") + 10 + 1 + 12)
+               + len(" | ") + 10 + 1 + 12 + 1 + 11 + 1 + 12)
     print("-" * total_w)
 
     # Sequential algos only run at T=1; cache that median per workload.
@@ -492,15 +506,24 @@ def summarize(csv_path: Path, group_keys: list[str]):
                              else f"{'-':>{col_w[a]}}")
             pt = vals.get("par_topo_iter")
             pa = vals.get("par_async")
+            pc = vals.get("par_async_cont")
+            pn = vals.get("par_naive")
             ni = vals.get("nelson_topo_iter")
             ratio_topo_async = (f"{pt/pa:>9.2f}x"
                                 if (pt and pa and pa > 0) else f"{'-':>10}")
+            ratio_naive_async = (f"{pn/pa:>11.2f}x"
+                                 if (pn and pa and pa > 0)
+                                 else f"{'-':>12}")
+            ratio_cont_async = (f"{pc/pa:>10.2f}x"
+                                if (pc and pa and pa > 0)
+                                else f"{'-':>11}")
             topo_it_spd = (f"{ni/pt:>11.2f}x"
                            if (ni and pt and pt > 0) else f"{'-':>12}")
             wl_str = "/".join(str(x) for x in wl)
             print(f"{wl_str:<20} {t:>4} | "
                   + " ".join(cells)
-                  + f" | {ratio_topo_async} {topo_it_spd}")
+                  + f" | {ratio_topo_async} {ratio_naive_async} "
+                  + f"{ratio_cont_async} {topo_it_spd}")
         print()
 
 
@@ -530,8 +553,9 @@ def main():
                     help="comma-separated algorithm whitelist. Default: "
                          "all. Names: nelson_seq, nelson_topo, "
                          "nelson_topo_iter, nelson_dst, par_close, "
-                         "par_topo_iter, par_async, par_async_min_id. "
-                         "Sets PE_BENCH_ALGOS for the C++ binaries and "
+                         "par_topo_iter, par_async, par_async_cont, "
+                         "par_async_min_id, par_naive. Sets "
+                         "PE_BENCH_ALGOS for the C++ binaries and "
                          "filters the egg dispatch loop, so unwanted "
                          "algos are never run.")
     ap.add_argument("--egg-dir", default=DEFAULT_EGG_DIR,

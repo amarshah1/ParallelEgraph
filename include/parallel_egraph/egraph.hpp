@@ -111,6 +111,15 @@ inline constexpr async_t async{};
 struct topo_t { explicit topo_t() = default; };
 inline constexpr topo_t topo{};
 
+// Tag selecting the bare-UF closure layout used by
+// `parallel_close_naive_rounds`. The ctor only initializes the union-find
+// and stores `nodes_`; it skips `parents_`, `last_marked_`, and
+// `depth_buckets_` so the naive variant doesn't pay for auxiliary state
+// it never reads. Calling any other closure variant on an instance built
+// this way is undefined.
+struct naive_t { explicit naive_t() = default; };
+inline constexpr naive_t naive{};
+
 // Round-stamp slot used by the async closure path. Padded to 64 bytes
 // (one cache line) so that concurrent CAS-max updates on adjacent
 // class ids don't false-share. Without padding, eight slots fit in
@@ -192,6 +201,17 @@ class EGraph {
     });
   }
 
+  // Naive-flavor ctor: bulk-init the UF and stash nodes_; skip every
+  // auxiliary index (`parents_`, `last_marked_`, `depth_buckets_`).
+  // Used only by `parallel_close_naive_rounds`, which semisorts every
+  // non-leaf term every round and so needs nothing beyond the UF and
+  // the node list.
+  EGraph(parlay::sequence<ENode> nodes, naive_t) : uf_(nodes.size()) {
+    const std::size_t n = nodes.size();
+    uf_.bulk_init(n);
+    nodes_ = std::move(nodes);
+  }
+
   // Topo-flavor ctor: compute each class's depth (longest path from any
   // leaf — leaves are 0, parents are 1 + max(child depth)) via a single
   // sequential bottom-up sweep (cheap because nodes_ is already in DAG
@@ -254,6 +274,41 @@ class EGraph {
   // Defined out-of-line as an explicit specialization on
   // `ConcurrentUnionFind`.
   void parallel_close_async_rounds(
+      parlay::sequence<std::pair<Id, Id>> initial_unions);
+
+  // Naive rounds-based closure: same skeleton as
+  // `parallel_close_async_rounds` but without dirty tracking or the
+  // `last_marked_` filter. Every round semisorts *all* non-leaf terms
+  // by their current canonical signature, dnc_unions every multi-root
+  // bucket, and loops until a full pass produces no new union (detected
+  // by checking whether any bucket's snapshot roots disagreed). Costs
+  // O(non_leaves) work per round vs the async variant's O(dirty), so
+  // it serves as the "no filter" baseline for measuring what
+  // last_marked_-driven filtering buys. Defined out-of-line as an
+  // explicit specialization on `ConcurrentUnionFind`.
+  void parallel_close_naive_rounds(
+      parlay::sequence<std::pair<Id, Id>> initial_unions);
+
+  // Truly-async continuous closure. Same `last_marked_` dirty-tracking
+  // primitive as `parallel_close_async_rounds`, but the round structure
+  // is dissolved: a single semisorter and a single unioner team run
+  // concurrently via `parlay::par_do`, communicating through a
+  // mutex-protected mailbox of CanonEntry groups.
+  //
+  //   * Semisorter: bumps a global `R` per scan, filters non_leaf for
+  //     dirty terms (any child root has last_marked_ ∈ {R-1, R}),
+  //     semisorts, pushes multi-member groups to the mailbox.
+  //   * Unioner pool: pulls groups from the mailbox, runs dnc_union,
+  //     reads R *at write time* and write_max-stamps the surviving
+  //     root's last_marked_ with that R. Monotonic, so racy reads with
+  //     concurrent semisort R-bumps can only over-mark.
+  //
+  // Termination: an `outstanding` counter tracks groups in mailbox +
+  // groups in-flight. When semisorter sees an empty dirty filter AND
+  // outstanding == 0, it sets `done`. The unioner pool drains and
+  // exits on `done`. Defined out-of-line as an explicit specialization
+  // on `ConcurrentUnionFind`. Uses the async-flavor ctor (`pe::async`).
+  void parallel_close_async_continuous(
       parlay::sequence<std::pair<Id, Id>> initial_unions);
 
   // MIN_ID variant of `parallel_close_async_rounds`. Same algorithm —

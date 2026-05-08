@@ -261,6 +261,63 @@ BuiltGraph<UF> build_async(const Workload& w) {
   return {std::move(eg), std::move(eq_seq)};
 }
 
+// Naive-flavor build: workload generation identical, EGraph via the
+// naive-tagged ctor (UF only — no parents_/last_marked_/depth_buckets_).
+// Used by bench_parallel_close_naive.
+template <typename UF>
+BuiltGraph<UF> build_naive(const Workload& w) {
+  const std::size_t depth = std::max<std::size_t>(w.depth, 1);
+  const std::size_t per_level = w.n_nodes / depth;
+  std::vector<std::size_t> level_starts;
+  level_starts.reserve(depth + 1);
+  level_starts.push_back(2 * w.n_leaves);
+  for (std::size_t lvl = 0; lvl < depth; ++lvl) {
+    const std::size_t count = (lvl + 1 == depth)
+                                ? (w.n_nodes - per_level * (depth - 1))
+                                : per_level;
+    level_starts.push_back(level_starts[lvl] + count);
+  }
+  const std::size_t total = level_starts.back();
+  parlay::random_generator gen(0xC0FFEEULL ^ static_cast<std::size_t>(w.n_nodes));
+
+  auto all_nodes = parlay::tabulate(total, [&](std::size_t i) -> ENode {
+    if (i < w.n_leaves) {
+      return ENode{std::string("x") + std::to_string(i), {}};
+    }
+    if (i < 2 * w.n_leaves) {
+      return ENode{std::string("y") + std::to_string(i - w.n_leaves), {}};
+    }
+    std::size_t lvl = static_cast<std::size_t>(
+        std::upper_bound(level_starts.begin(), level_starts.end(), i) -
+        level_starts.begin()) - 1;
+    const std::size_t prev_start = (lvl == 0) ? 0 : level_starts[lvl - 1];
+    const std::size_t prev_size = level_starts[lvl] - prev_start;
+    auto r = gen[i];
+    ENode n;
+    n.op = std::string("f") + std::to_string(lvl) + "_" +
+           std::to_string(r() % w.n_fns);
+    n.children = {static_cast<Id>(prev_start + r() % prev_size),
+                  static_cast<Id>(prev_start + r() % prev_size)};
+    return n;
+  });
+
+  auto eg = std::make_unique<EGraph<UF>>(std::move(all_nodes), pe::naive);
+
+  const std::size_t n_x_merges = w.n_merges / 2;
+  auto eq_seq = parlay::tabulate(w.n_merges, [&](std::size_t i) {
+    auto r = gen[total + i];
+    if (i < n_x_merges) {
+      return std::pair<Id, Id>{static_cast<Id>(r() % w.n_leaves),
+                               static_cast<Id>(r() % w.n_leaves)};
+    }
+    return std::pair<Id, Id>{
+        static_cast<Id>(w.n_leaves + r() % w.n_leaves),
+        static_cast<Id>(w.n_leaves + r() % w.n_leaves)};
+  });
+
+  return {std::move(eg), std::move(eq_seq)};
+}
+
 double median(std::vector<double> xs) {
   std::sort(xs.begin(), xs.end());
   return xs[xs.size() / 2];
@@ -351,6 +408,22 @@ std::vector<double> bench_parallel_close(const Workload& w) {
   return times;
 }
 
+std::vector<double> bench_parallel_close_async_continuous(const Workload& w) {
+  for (int i = 0; i < WARMUP; ++i) {
+    auto g = build_async<ConcurrentUnionFind>(w);
+    g.eg->parallel_close_async_continuous(std::move(g.eqs));
+  }
+  std::vector<double> times;
+  times.reserve(TRIALS);
+  for (int i = 0; i < TRIALS; ++i) {
+    auto g = build_async<ConcurrentUnionFind>(w);
+    auto t0 = clk::now();
+    g.eg->parallel_close_async_continuous(std::move(g.eqs));
+    times.push_back(elapsed_ms(t0));
+  }
+  return times;
+}
+
 std::vector<double> bench_parallel_close_async(const Workload& w) {
   for (int i = 0; i < WARMUP; ++i) {
     auto g = build_async<ConcurrentUnionFind>(w);
@@ -378,6 +451,22 @@ std::vector<double> bench_parallel_close_async_min(const Workload& w) {
     auto g = build_async<ConcurrentUnionFind>(w);
     auto t0 = clk::now();
     g.eg->parallel_close_async_rounds_min_id(std::move(g.eqs));
+    times.push_back(elapsed_ms(t0));
+  }
+  return times;
+}
+
+std::vector<double> bench_parallel_close_naive(const Workload& w) {
+  for (int i = 0; i < WARMUP; ++i) {
+    auto g = build_naive<ConcurrentUnionFind>(w);
+    g.eg->parallel_close_naive_rounds(std::move(g.eqs));
+  }
+  std::vector<double> times;
+  times.reserve(TRIALS);
+  for (int i = 0; i < TRIALS; ++i) {
+    auto g = build_naive<ConcurrentUnionFind>(w);
+    auto t0 = clk::now();
+    g.eg->parallel_close_naive_rounds(std::move(g.eqs));
     times.push_back(elapsed_ms(t0));
   }
   return times;
@@ -445,8 +534,8 @@ int main() {
   // PE_BENCH_ALGOS=algo1,algo2,... restricts which algorithms run+emit.
   // Names must match CSV `algorithm` tags: nelson_seq, nelson_topo,
   // nelson_topo_iter, nelson_dst, par_close, par_topo_iter, par_async,
-  // par_async_min_id. Empty/unset = run all (subject to par_only and
-  // skip_nelson). Combining narrows further.
+  // par_async_min_id, par_naive. Empty/unset = run all (subject to
+  // par_only and skip_nelson). Combining narrows further.
   std::set<std::string> algo_filter;
   if (const char* algos_env = std::getenv("PE_BENCH_ALGOS")) {
     std::string s(algos_env);
@@ -541,7 +630,7 @@ int main() {
         md   = median(dst);
       }
     }
-    std::vector<double> par, pti, pa, pam;
+    std::vector<double> par, pti, pa, pam, pnv;
     double mp = 0.0, mpti = 0.0, mpa = 0.0, mpam = 0.0;
     if (algo_enabled("par_close")) {
       par = bench_parallel_close(w);
@@ -559,6 +648,13 @@ int main() {
       pam  = bench_parallel_close_async_min(w);
       mpam = median(pam);
     }
+    if (algo_enabled("par_naive")) {
+      pnv = bench_parallel_close_naive(w);
+    }
+    std::vector<double> pac;
+    if (algo_enabled("par_async_cont")) {
+      pac = bench_parallel_close_async_continuous(w);
+    }
 
     if (csv) {
       if (!skip_nelson && algo_enabled("nelson_seq"))
@@ -572,6 +668,8 @@ int main() {
       if (algo_enabled("par_topo_iter"))    emit_csv(w, "par_topo_iter", pti);
       if (algo_enabled("par_async"))        emit_csv(w, "par_async", pa);
       if (algo_enabled("par_async_min_id")) emit_csv(w, "par_async_min_id", pam);
+      if (algo_enabled("par_naive"))        emit_csv(w, "par_naive", pnv);
+      if (algo_enabled("par_async_cont"))   emit_csv(w, "par_async_cont", pac);
     } else if (skip_nelson) {
       std::printf("%-8s %8zu %10zu %9zu |   skipped   %9.2fms %9.2fms %9.2fms | %9.2fms %9.2fms %9.2fms %9.2fms %6.2fx\n",
                   w.name, w.n_leaves, w.n_nodes, w.n_merges, mt, mi, md, mp, mpti, mpa, mpam, mi / mp);
