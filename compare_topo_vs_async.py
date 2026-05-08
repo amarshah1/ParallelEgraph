@@ -446,13 +446,21 @@ def run_gates(out_dir: Path, thread_counts: list[int],
               gates_root: str, suites: list[str],
               files_glob: str | None,
               *, warmup: int, trials: int,
+              algos: list[str] | None,
               numactl_prefix: list[str]):
     """gates_bench across all matched .gates files at every thread
-    count. Only par algorithms (par_topo_iter, par_async) are run —
-    gates_bench has no sequential mode. CSV schema is gates_bench's
-    native: file,suite,n_gates,n_literals,n_not_terms,total_classes,
-            algorithm,trial,parlay_threads,read_s,parse_s,build_s,
-            close_ms.
+    count. By default runs all three algorithms (nelson_topo_iter,
+    par_topo_iter, par_async); --algos restricts via PE_BENCH_ALGOS.
+    nelson_topo_iter is sequential — its time doesn't depend on
+    PARLAY_NUM_THREADS, but we re-run it at every T anyway because
+    the per-(file, threads) cell is the unit of measurement here and
+    skipping it would create awkward gaps in the CSV. The duplicated
+    measurements should be near-identical; downstream plotters average
+    across T or pick the T=1 row.
+
+    CSV schema is gates_bench's native:
+      file,suite,n_gates,n_literals,n_not_terms,total_classes,
+      algorithm,trial,parlay_threads,read_s,parse_s,build_s,close_ms.
 
     One subprocess per (file, threads) cell, mirroring run_egg's
     per-file granularity. Two reasons we don't batch all files into
@@ -499,6 +507,16 @@ def run_gates(out_dir: Path, thread_counts: list[int],
                 env["PARLAY_NUM_THREADS"] = str(t)
                 if first:
                     env["PE_BENCH_HEADER"] = "1"
+                # gates_bench understands a comma-separated list of EXACT
+                # algo names: nelson_topo_iter, par_topo_iter, par_async.
+                # Only forward the subset our --algos whitelist allows.
+                if algos:
+                    gates_algos = [a for a in algos
+                                   if a in ("nelson_topo_iter",
+                                            "par_topo_iter",
+                                            "par_async")]
+                    if gates_algos:
+                        env["PE_BENCH_ALGOS"] = ",".join(gates_algos)
                 proc = subprocess.run(cmd, capture_output=True, text=True,
                                       env=env)
                 wall = time.perf_counter() - t0
@@ -813,6 +831,7 @@ def main():
             suites=[s.strip() for s in args.gates_suites.split(",") if s.strip()],
             files_glob=args.gates_files,
             warmup=args.warmup, trials=args.trials,
+            algos=algos,
             numactl_prefix=numactl_prefix)
 
     for p, keys in csv_paths:
