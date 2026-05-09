@@ -417,6 +417,47 @@ bool test_seq_dst_cross_depth() {
   return true;
 }
 
+// `sequential_close_simple` should match `parallel_close` on the same
+// cross-depth input — confirms the worklist + hashcons baseline handles
+// arbitrary initial-union shapes.
+bool test_seq_simple_cross_depth() {
+  auto build_nodes = []() {
+    return make_nodes({
+        ENode{"a",  {}}, ENode{"b",  {}},
+        ENode{"ta1", {}}, ENode{"ta2", {}}, ENode{"t",  {}},
+        ENode{"f", {0}}, ENode{"f", {1}},
+        ENode{"g", {2, 4}}, ENode{"g", {3, 4}},
+    });
+  };
+  auto unions = []() {
+    parlay::sequence<std::pair<Id, Id>> eqs;
+    eqs.push_back({0, 1});
+    eqs.push_back({2, 5});
+    eqs.push_back({3, 6});
+    return eqs;
+  };
+
+  auto eg_par = std::make_unique<ConcurrentEGraph>(build_nodes());
+  eg_par->parallel_close(unions());
+
+  auto eg_simple = std::make_unique<SequentialEGraph>(build_nodes());
+  eg_simple->sequential_close_simple(unions());
+
+  for (Id i = 0; i < 9; ++i) {
+    for (Id j = i + 1; j < 9; ++j) {
+      if (eg_par->equiv(i, j) != eg_simple->equiv(i, j)) {
+        std::fprintf(stderr,
+                     "FAIL seq_simple vs parallel_close on (%u, %u): "
+                     "oracle=%d simple=%d\n",
+                     i, j, int(eg_par->equiv(i, j)),
+                     int(eg_simple->equiv(i, j)));
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 // Same input shape but with the g's reordered before the f's — the
 // adversarial ordering that defeats sequential_close_topo. The dst path
 // is order-independent and should still match parallel_close.
@@ -815,6 +856,7 @@ int main() {
       {"seq_topo_adversarial", test_seq_topo_adversarial_order},
       {"seq_dst_cross_depth", test_seq_dst_cross_depth},
       {"seq_dst_adversarial", test_seq_dst_adversarial_order},
+      {"seq_simple_cross_depth", test_seq_simple_cross_depth},
       {"seq_topo_iter_adversarial", test_seq_topo_iter_adversarial_order},
       {"par_async_cross_depth", test_par_async_cross_depth},
       {"par_async_min_cross_depth", test_par_async_min_cross_depth},

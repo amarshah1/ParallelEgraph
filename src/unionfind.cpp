@@ -46,25 +46,25 @@ std::pair<Id, std::uint32_t> ConcurrentUnionFind::find(Id u) {
   return {root, rank};
 }
 
-void ConcurrentUnionFind::union_(Id u, Id v) {
+Id ConcurrentUnionFind::union_(Id u, Id v) {
   for (;;) {
     auto [u_root, ru] = find(u);
     auto [v_root, rv] = find(v);
-    if (u_root == v_root) return;
+    if (u_root == v_root) return u_root;
 
     if (ru < rv) {
       std::uint32_t expected = make_rank(ru);
       if (data_[u_root].compare_exchange_strong(expected, v_root,
                                                 std::memory_order_release,
                                                 std::memory_order_relaxed)) {
-        return;
+        return v_root;
       }
     } else if (ru > rv) {
       std::uint32_t expected = make_rank(rv);
       if (data_[v_root].compare_exchange_strong(expected, u_root,
                                                 std::memory_order_release,
                                                 std::memory_order_relaxed)) {
-        return;
+        return u_root;
       }
     } else {
       // Equal ranks: smaller id merges into larger id.
@@ -86,14 +86,14 @@ void ConcurrentUnionFind::union_(Id u, Id v) {
         data_[hi].compare_exchange_strong(expected_winner, make_rank(r + 1),
                                           std::memory_order_release,
                                           std::memory_order_relaxed);
-        return;
+        return hi;
       }
     }
     // CAS failed; retry from the top.
   }
 }
 
-bool ConcurrentUnionFind::union_min_id(Id u, Id v) {
+std::pair<Id, bool> ConcurrentUnionFind::union_min_id(Id u, Id v) {
   // MIN_ID merge: the lower-id root always survives. Repeatedly resolve
   // both sides to roots, then attempt to swing the higher-id root's slot
   // to point at the lower-id one. CAS races: if some other thread merges
@@ -108,7 +108,7 @@ bool ConcurrentUnionFind::union_min_id(Id u, Id v) {
   for (;;) {
     auto [u_root, ru] = find(u);
     auto [v_root, rv] = find(v);
-    if (u_root == v_root) return false;
+    if (u_root == v_root) return {u_root, false};
 
     Id loser, winner;
     std::uint32_t loser_rank;
@@ -126,7 +126,7 @@ bool ConcurrentUnionFind::union_min_id(Id u, Id v) {
     if (data_[loser].compare_exchange_strong(expected, winner,
                                               std::memory_order_release,
                                               std::memory_order_relaxed)) {
-      return true;
+      return {winner, true};
     }
     // CAS failed: someone else either bumped loser's rank or merged
     // loser into a different root. Retry — find() will follow the new
@@ -156,21 +156,24 @@ Id SequentialUnionFind::find_root(Id u) {
   return root;
 }
 
-void SequentialUnionFind::union_(Id u, Id v) {
+Id SequentialUnionFind::union_(Id u, Id v) {
   Id ru = find_root(u);
   Id rv = find_root(v);
-  if (ru == rv) return;
+  if (ru == rv) return ru;
   std::uint32_t ranku = rank_of(ru);
   std::uint32_t rankv = rank_of(rv);
   if (ranku < rankv) {
     data_[ru] = rv;
+    return rv;
   } else if (ranku > rankv) {
     data_[rv] = ru;
+    return ru;
   } else {
     Id lo, hi;
     if (ru < rv) { lo = ru; hi = rv; } else { lo = rv; hi = ru; }
     data_[lo] = hi;
     data_[hi] = make_rank(ranku + 1);
+    return hi;
   }
 }
 

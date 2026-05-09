@@ -48,7 +48,10 @@ class ConcurrentUnionFind {
   // thread-safety in C++ is orthogonal to const-correctness.
   std::pair<Id, std::uint32_t> find(Id u);
   Id find_root(Id u) { return find(u).first; }
-  void union_(Id u, Id v);
+  // Returns the surviving root after the merge — i.e., the post-call
+  // find_root(u) (== find_root(v)). Lets callers (e.g., dnc_union)
+  // hand the survivor outward without a separate find_root call.
+  Id union_(Id u, Id v);
 
   // MIN_ID variant: lower class id always wins (becomes root). Drops
   // by-rank balancing — path compression keeps chains short in practice.
@@ -56,11 +59,12 @@ class ConcurrentUnionFind {
   // the canonical-id-stable invariant that lets DAG-ordered cascades
   // collapse in one BSP round on regular workloads (Family C).
   //
-  // Returns true if the call actually merged two distinct classes,
-  // false if the operands were already in the same class. Callers that
-  // need fixpoint detection (e.g., `parallel_close_topo_iter`) capture
-  // this bool to know when to stop iterating.
-  bool union_min_id(Id u, Id v);
+  // Returns (survivor, did_merge): survivor is the post-call root
+  // (always min(u_root, v_root)); did_merge is true iff the call
+  // actually merged two distinct classes (false if u and v were
+  // already in the same class). Callers that need fixpoint detection
+  // (e.g., `parallel_close_topo_iter`) capture did_merge.
+  std::pair<Id, bool> union_min_id(Id u, Id v);
 
   bool same_set(Id u, Id v);
 
@@ -87,7 +91,8 @@ class SequentialUnionFind {
   void bulk_init(std::size_t /*n*/) {}
 
   Id find_root(Id u);
-  void union_(Id u, Id v);
+  // Returns the surviving root (= find_root(u) == find_root(v) post-call).
+  Id union_(Id u, Id v);
 
   // Merge `dying` into `survivor` unconditionally — `dying` becomes a
   // child of `survivor`, no by-rank tie-breaking. Caller must guarantee

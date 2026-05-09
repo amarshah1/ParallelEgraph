@@ -31,12 +31,20 @@ namespace {
 
 int usage(const char* prog) {
   std::fprintf(stderr,
+<<<<<<< HEAD
       "usage: %s [--timing] [--sequential[=nelson|topo|topo_iter|dst]] <file.smt2>\n"
       "  --sequential            run sequential_close_nelson (default seq algo)\n"
       "  --sequential=nelson     same as --sequential\n"
       "  --sequential=topo       run sequential_close_topo\n"
       "  --sequential=topo_iter  run sequential_close_topo_iter\n"
       "  --sequential=dst        run sequential_close_dst\n"
+=======
+      "usage: %s [--timing] [--sequential[=nelson|topo|simple]] <file.smt2>\n"
+      "  --sequential          run sequential_close_nelson (default seq algo)\n"
+      "  --sequential=nelson   same as --sequential\n"
+      "  --sequential=topo     run sequential_close_topo\n"
+      "  --sequential=simple   run sequential_close_simple (worklist + hashcons)\n"
+>>>>>>> 7cb4b6d (seq baseline)
       "Without --sequential, the parallel path is used; selector via env:\n"
       "  PE_USE_ASYNC=1       parallel_close_async_rounds (integer-sort)\n"
       "  PE_USE_ASYNC_GBK=1   parallel_close_async_rounds_groupby (group_by_key)\n"
@@ -65,8 +73,14 @@ double elapsed_ms(clk::time_point t0, clk::time_point t1) {
 int main(int argc, char** argv) {
   bool emit_timing = false;
   const char* path = nullptr;
+<<<<<<< HEAD
   // --sequential family.
   enum class SeqAlgo { None, Nelson, Topo, TopoIter, Dst };
+=======
+  // --sequential family: None=parallel (default), or one of the
+  // sequential algorithms.
+  enum class SeqAlgo { None, Nelson, Topo, Simple };
+>>>>>>> 7cb4b6d (seq baseline)
   SeqAlgo seq_algo = SeqAlgo::None;
   for (int i = 1; i < argc; ++i) {
     const char* a = argv[i];
@@ -77,10 +91,15 @@ int main(int argc, char** argv) {
       seq_algo = SeqAlgo::Nelson;
     } else if (std::strcmp(a, "--sequential=topo") == 0) {
       seq_algo = SeqAlgo::Topo;
+<<<<<<< HEAD
     } else if (std::strcmp(a, "--sequential=topo_iter") == 0) {
       seq_algo = SeqAlgo::TopoIter;
     } else if (std::strcmp(a, "--sequential=dst") == 0) {
       seq_algo = SeqAlgo::Dst;
+=======
+    } else if (std::strcmp(a, "--sequential=simple") == 0) {
+      seq_algo = SeqAlgo::Simple;
+>>>>>>> 7cb4b6d (seq baseline)
     } else if (path == nullptr) {
       path = a;
     } else {
@@ -215,6 +234,8 @@ int main(int argc, char** argv) {
       eg->sequential_close_topo_iter(equalities);
     } else if (seq_algo == SeqAlgo::Dst) {
       eg->sequential_close_dst(equalities);
+    } else if (seq_algo == SeqAlgo::Simple) {
+      eg->sequential_close_simple(equalities);
     } else {
       eg->sequential_close_nelson(equalities);
     }
