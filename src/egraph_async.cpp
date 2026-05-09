@@ -840,9 +840,10 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds_min_id(
     return !nodes_[i].children.empty();
   });
 
-  // Lambda dispatching dnc_union_with onto the MIN_ID merge.
-  auto union_min_fn = [](ConcurrentUnionFind& uf, Id a, Id b) {
-    uf.union_min_id(a, b);
+  // Lambda dispatching dnc_union_with onto the MIN_ID merge. Returns
+  // the surviving root so dnc_union_with can chain across recursion.
+  auto union_min_fn = [](ConcurrentUnionFind& uf, Id a, Id b) -> Id {
+    return uf.union_min_id(a, b).first;
   };
 
   std::size_t round = 0;

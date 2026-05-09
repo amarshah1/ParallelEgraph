@@ -3,8 +3,10 @@
 #include "parallel_egraph/dnc_union.hpp"
 
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <optional>
 #include <string>
 #include <utility>
@@ -245,13 +247,14 @@ void EGraph<ConcurrentUnionFind>::parallel_close_topo_iter(
     uf_.union_min_id(initial_unions[i].first, initial_unions[i].second);
   });
 
-  // Lambda dispatched into dnc_union_with — also sets `*changed` when
-  // an actual merge commits.
+  // Lambda dispatched into dnc_union_with — returns the surviving root
+  // (so dnc_union_with can chain), and sets `*changed` when an actual
+  // merge commits.
   std::atomic<bool> changed{false};
-  auto union_track = [&changed](ConcurrentUnionFind& u, Id a, Id b) {
-    if (u.union_min_id(a, b)) {
-      changed.store(true, std::memory_order_relaxed);
-    }
+  auto union_track = [&changed](ConcurrentUnionFind& u, Id a, Id b) -> Id {
+    auto [survivor, did_merge] = u.union_min_id(a, b);
+    if (did_merge) changed.store(true, std::memory_order_relaxed);
+    return survivor;
   };
 
   std::size_t round = 0;
@@ -630,6 +633,88 @@ void EGraph<SequentialUnionFind>::sequential_close_dst(
       }
       src.clear();
     }
+  }
+}
+
+// ---- sequential_close_simple ----------------------------------------------
+//
+// Worklist closure with all non-leaves seeded upfront. Distinguishing
+// feature vs `sequential_close_dst`: that one drives the loop from
+// pre-existing congruences detected during initial hashcons seeding;
+// this one drives it from a deque containing every non-leaf node.
+// Simpler shape, more like a textbook Nelson-Oppen worklist.
+//
+// `class_preds` is a self-contained scratch structure (vector<vector>),
+// rebuilt fresh from `nodes_` after applying initial unions. It plays
+// the role of `parents_` but isn't that field — keeps the function
+// independent of the EGraph's BSP-flavor `parents_` and avoids
+// mutating it. The original sketch this came from named the helper
+// `build_class_preds`; same idea here.
+
+template <>
+void EGraph<SequentialUnionFind>::sequential_close_simple(
+    const parlay::sequence<std::pair<Id, Id>>& initial_unions) {
+  for (auto [a, b] : initial_unions) uf_.union_(a, b);
+
+  const std::size_t n = nodes_.size();
+
+  // Build per-class predecessor lists post-initial-unions: each parent
+  // u goes into the slot of its child's CURRENT root, not the literal
+  // child id. Captures the right "which classes have u as a successor"
+  // mapping for the worklist's union-splice step below.
+  std::vector<std::vector<Id>> class_preds(n);
+  for (Id u = 0; u < n; ++u) {
+    for (Id c : nodes_[u].children) {
+      class_preds[uf_.find_root(c)].push_back(u);
+    }
+  }
+
+  ankerl::unordered_dense::map<Signature, Id, SignatureHash> sig_table;
+  sig_table.reserve(n);
+
+  // FIFO worklist; seeded with every non-leaf in DAG order.
+  std::vector<std::uint8_t> in_queue(n, 0);
+  std::deque<Id> pending;
+  for (Id v = 0; v < static_cast<Id>(n); ++v) {
+    if (!nodes_[v].children.empty()) {
+      pending.push_back(v);
+      in_queue[v] = 1;
+    }
+  }
+
+  while (!pending.empty()) {
+    Id v = pending.front();
+    pending.pop_front();
+    in_queue[v] = 0;
+
+    auto sig = canonical_sig(nodes_[v], uf_);
+    auto [it, inserted] = sig_table.try_emplace(std::move(sig), v);
+    if (inserted) continue;
+
+    Id w = it->second;
+    if (uf_.find_root(v) == uf_.find_root(w)) continue;
+
+    // Collision on a different class → merge. union_ returns the
+    // surviving root (post-refactor), so we can identify the loser
+    // without an extra find_root call. Splice loser's predecessors
+    // into the winner's list and re-queue them: their canonical sigs
+    // each contain a child whose root just moved.
+    const Id rv = uf_.find_root(v);
+    const Id rw = uf_.find_root(w);
+    const Id new_root = uf_.union_(rv, rw);
+    const Id loser    = (new_root == rv) ? rw : rv;
+
+    auto& dst = class_preds[new_root];
+    auto& src = class_preds[loser];
+    for (Id p : src) {
+      dst.push_back(p);
+      if (!in_queue[p]) {
+        pending.push_back(p);
+        in_queue[p] = 1;
+      }
+    }
+    src.clear();
+    src.shrink_to_fit();
   }
 }
 

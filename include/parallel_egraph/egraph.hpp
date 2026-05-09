@@ -370,6 +370,19 @@ class EGraph {
   void sequential_close_nelson(
       const parlay::sequence<std::pair<Id, Id>>& initial_unions);
 
+  // Simple sequential CC baseline: seed a worklist with every non-leaf
+  // node, pop one at a time, canonicalize against a sig→class hashcons.
+  // Repeated sig ⇒ union the two classes; on union, splice the loser's
+  // class predecessors into the winner's list and re-queue them (their
+  // signatures contain a now-stale child root). Self-contained class-
+  // predecessor map built fresh inside the function (post-initial-
+  // unions) — does not mutate `parents_`. Distinguishing feature vs
+  // `sequential_close_dst`: seeded with every non-leaf rather than
+  // driven by pre-existing congruences in the hashcons. Defined out-
+  // of-line as an explicit specialization on `SequentialUnionFind`.
+  void sequential_close_simple(
+      const parlay::sequence<std::pair<Id, Id>>& initial_unions);
+
   // Single-pass sequential closure: walks `nodes_` in reverse topological
   // order (children before parents — guaranteed by the EGraph ctor's DAG-
   // order invariant, so plain forward index iteration suffices) and
