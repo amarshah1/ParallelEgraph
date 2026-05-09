@@ -352,16 +352,24 @@ def plot_random(med, out_path: Path):
 
 
 def plot_gates(med, out_path: Path, top_n: int):
-    """Gates has no sequential baseline (gates_bench only runs the two
-    parallel algorithms). Use par_topo_iter at T=1 as the surrogate
-    baseline — it's the closest "best-rounds-based-CC at one core"
-    measurement available, sits roughly where nelson_topo_iter would
-    on these workloads (within ~2x), and keeps the y-axis directly
-    interpretable as "speedup over a strong single-core baseline."
+    """gates_bench can be run with any subset of {nelson_topo_iter,
+    par_topo_iter, par_async}, so the plotter picks a baseline based
+    on what's actually in the CSV. Preference order:
 
-    Two lines per file: par_topo_iter(T) and par_async(T) both
-    normalized to par_topo_iter(T=1). par_topo_iter's line is the
-    self-scaling reference; par_async's line is what we're evaluating.
+      1. nelson_topo_iter (if present at T=1) — true sequential
+         baseline, best for "speedup over best sequential."
+      2. par_topo_iter(T=1) — surrogate; closest "best-rounds-based-
+         CC at one core" measurement available.
+      3. par_async(T=1) — last-resort self-relative baseline. The
+         resulting speedup is just par_async(T=1)/par_async(T) and
+         degenerates to 1.0 at T=1, but it still surfaces async's
+         strong-scaling curve when no other algorithm was run.
+
+    Plot lines:
+      * par_async(T) — solid, the algorithm we're evaluating.
+      * par_topo_iter(T) — dashed, plotted only when par_topo_iter
+        rows are present; serves as a parallel-scaling reference.
+
     Pick top-N files by par_async closure cost at T_max so we focus
     on workloads with enough work for parallelism to matter.
     """
@@ -369,12 +377,13 @@ def plot_gates(med, out_path: Path, top_n: int):
     if not threads:
         print(f"  skip {out_path.name}: no rows")
         return
-
-    SURROGATE_BASELINE = "par_topo_iter"
     if 1 not in threads:
         print(f"  skip {out_path.name}: no T=1 measurement to use as baseline")
         return
     t_max = threads[-1]
+
+    # Discover which algorithms are present at all.
+    algos_present = {a for (_, _, a) in med}
 
     # Rank files by par_async closure cost at T_max — the more work
     # par_async did, the more interesting the scaling.
@@ -388,16 +397,35 @@ def plot_gates(med, out_path: Path, top_n: int):
     top_files = [f for f, _ in
                  sorted(cost_at_max.items(), key=lambda x: -x[1])[:top_n]]
 
-    # Surrogate sequential baseline: par_topo_iter(T=1) per file.
+    # Pick baseline: try in preference order. For each candidate we
+    # require T=1 rows for at least one of the top files; the loser
+    # files (no baseline value) get dropped silently from the plot.
+    BASELINE_CANDIDATES = ["nelson_topo_iter", "par_topo_iter", PAR_ALGO]
+    chosen_baseline: str | None = None
     base_by_file: dict[str, float] = {}
-    for f in top_files:
-        v = med.get((f, 1, SURROGATE_BASELINE))
-        if v is not None and v > 0:
-            base_by_file[f] = v
-    if not base_by_file:
-        print(f"  skip {out_path.name}: no {SURROGATE_BASELINE}(T=1) rows "
-              f"for top files")
+    for cand in BASELINE_CANDIDATES:
+        if cand not in algos_present:
+            continue
+        candidate_base: dict[str, float] = {}
+        for f in top_files:
+            v = med.get((f, 1, cand))
+            if v is not None and v > 0:
+                candidate_base[f] = v
+        if candidate_base:
+            chosen_baseline = cand
+            base_by_file = candidate_base
+            break
+
+    if chosen_baseline is None:
+        print(f"  skip {out_path.name}: no usable baseline at T=1 "
+              f"(tried {BASELINE_CANDIDATES})")
         return
+    print(f"  gates baseline: {chosen_baseline}@T=1")
+
+    # Did par_topo_iter rows show up for any top file? If yes, we'll
+    # plot par_topo_iter as a dashed reference line alongside async.
+    have_topo_curve = "par_topo_iter" in algos_present and any(
+        med.get((f, t, "par_topo_iter")) for f in top_files for t in threads)
 
     fig, ax = plt.subplots(figsize=(9, 6))
     ax.plot(threads, threads, color="grey", linestyle=":", linewidth=1,
@@ -410,7 +438,7 @@ def plot_gates(med, out_path: Path, top_n: int):
         if base is None:
             continue
         short = f.replace(".gates", "")
-        # par_async (solid).
+        # par_async (solid) — what we're evaluating.
         xs, ys = [], []
         for t in threads:
             par = med.get((f, t, PAR_ALGO))
@@ -420,16 +448,17 @@ def plot_gates(med, out_path: Path, top_n: int):
             ax.plot(xs, ys, marker="o", color=cmap(i % 10),
                     linewidth=1.5, label=f"{short}  ({PAR_ALGO})")
             plotted += 1
-        # par_topo_iter (dashed, same color) — self-scaling reference.
-        xs, ys = [], []
-        for t in threads:
-            tv = med.get((f, t, SURROGATE_BASELINE))
-            if tv and tv > 0:
-                xs.append(t); ys.append(base / tv)
-        if xs:
-            ax.plot(xs, ys, marker="s", linestyle="--",
-                    color=cmap(i % 10), linewidth=1.0, alpha=0.6,
-                    label=f"{short}  ({SURROGATE_BASELINE})")
+        # par_topo_iter (dashed) — only if rows are available.
+        if have_topo_curve:
+            xs, ys = [], []
+            for t in threads:
+                tv = med.get((f, t, "par_topo_iter"))
+                if tv and tv > 0:
+                    xs.append(t); ys.append(base / tv)
+            if xs:
+                ax.plot(xs, ys, marker="s", linestyle="--",
+                        color=cmap(i % 10), linewidth=1.0, alpha=0.6,
+                        label=f"{short}  (par_topo_iter)")
 
     if plotted == 0:
         print(f"  skip {out_path.name}: no overlapping cells")
@@ -439,10 +468,17 @@ def plot_gates(med, out_path: Path, top_n: int):
     ax.set_xscale("log", base=2); ax.set_yscale("log", base=2)
     ax.set_xticks(threads); ax.set_xticklabels([str(t) for t in threads])
     ax.set_xlabel("threads")
-    ax.set_ylabel(f"speedup ({SURROGATE_BASELINE}@T=1 / algo)  [close_ms]")
+    # Title and y-axis annotate the baseline used so the reader can
+    # interpret the y-values correctly. self-relative (par_async@T=1)
+    # is annotated specially since it's degenerate at T=1.
+    if chosen_baseline == PAR_ALGO:
+        baseline_tag = f"{PAR_ALGO}@T=1 (self-relative)"
+    else:
+        baseline_tag = f"{chosen_baseline}@T=1"
+    ax.set_ylabel(f"speedup ({baseline_tag} / algo)  [close_ms]")
+    title_extra = "" if have_topo_curve else "  (no par_topo_iter rows)"
     ax.set_title(f"gates — top-{top_n} files, {PAR_ALGO} vs "
-                 f"{SURROGATE_BASELINE} (surrogate seq baseline = "
-                 f"{SURROGATE_BASELINE}@T=1)")
+                 f"{baseline_tag}{title_extra}")
     ax.grid(True, which="both", alpha=0.3)
     ax.legend(fontsize=7, loc="best", ncol=2)
     _save(fig, out_path)
