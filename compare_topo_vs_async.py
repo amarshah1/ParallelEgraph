@@ -88,27 +88,19 @@ GATES_DEFAULT_SUITES = ["iwls22", "hwmcc12"]
 #   par_naive         — naive rounds CC (semisort all non-leaves every
 #                        round; no dirty filter; the "ablation" against
 #                        par_async that quantifies what filtering buys)
+# Default algo set: sequential baseline (nelson_simple) plus the two
+# parallel headlines (par_async, par_topo_iter). Other algos are still
+# recognized via --algos but are off by default. Add "par_async_gbk",
+# "nelson_seq", etc. via --algos when comparing more thoroughly.
 ALGOS_OF_INTEREST = [
-    "nelson_seq",
-    "nelson_topo",
-    "nelson_topo_iter",
-    "par_close",
-    "par_topo_iter",
+    "nelson_simple",
     "par_async",
-    "par_async_gbk",
-    "par_async_cont",
-    "par_naive",
+    "par_topo_iter",
 ]
 ALGO_HEADERS = {
-    "nelson_seq":       "nelson",
-    "nelson_topo":      "nl_topo",
-    "nelson_topo_iter": "nl_topo_it",
-    "par_close":        "par_close",
-    "par_topo_iter":    "par_topo_it",
-    "par_async":        "par_async",
-    "par_async_gbk":    "par_a_gbk",
-    "par_async_cont":   "par_a_cont",
-    "par_naive":        "par_naive",
+    "nelson_simple":  "nl_simple",
+    "par_async":      "par_async",
+    "par_topo_iter":  "par_topo_it",
 }
 
 # Sequential = every algo not starting with "par_". Run only at T=1.
@@ -373,6 +365,7 @@ EGG_ALGOS: list[tuple[str, str | None, str | None]] = [
     ("nelson_topo",      "topo",       None),
     ("nelson_topo_iter", "topo_iter",  None),
     ("nelson_dst",       "dst",        None),
+    ("nelson_simple",    "simple",     None),
     ("par_close",        None,         None),
     ("par_topo_iter",    None,         "PE_USE_TOPO"),
     ("par_async",        None,         "PE_USE_ASYNC"),
@@ -730,10 +723,9 @@ def summarize(csv_path: Path, group_keys: list[str]):
     print(f"--- {csv_path.name} ---")
     print(fixed + " ".join(header_cells)
           + " | "
-          + f"{'topo/async':>10} {'naive/async':>12} "
-          + f"{'cont/async':>11} {'gbk/async':>10} {'topo_it_spd':>12}")
+          + f"{'simple/async':>12} {'topo_it/async':>13}")
     total_w = (len(fixed) + sum(col_w.values()) + len(ALGOS_OF_INTEREST) - 1
-               + len(" | ") + 10 + 1 + 12 + 1 + 11 + 1 + 10 + 1 + 12)
+               + len(" | ") + 12 + 1 + 13)
     print("-" * total_w)
 
     # Sequential algos only run at T=1; cache that median per workload.
@@ -755,30 +747,24 @@ def summarize(csv_path: Path, group_keys: list[str]):
                 vals[a] = v
                 cells.append(f"{v:>{col_w[a]}.2f}" if v is not None
                              else f"{'-':>{col_w[a]}}")
-            pt = vals.get("par_topo_iter")
+            # Headline ratios:
+            #   simple/async   = sequential baseline / par_async (parallel
+            #                    speedup over single-threaded simple).
+            #   topo_it/async  = par_topo_iter / par_async (relative cost
+            #                    of the depth-stratified parallel path).
             pa = vals.get("par_async")
-            pc = vals.get("par_async_cont")
-            pg = vals.get("par_async_gbk")
-            pn = vals.get("par_naive")
-            ni = vals.get("nelson_topo_iter")
-            ratio_topo_async = (f"{pt/pa:>9.2f}x"
-                                if (pt and pa and pa > 0) else f"{'-':>10}")
-            ratio_naive_async = (f"{pn/pa:>11.2f}x"
-                                 if (pn and pa and pa > 0)
-                                 else f"{'-':>12}")
-            ratio_cont_async = (f"{pc/pa:>10.2f}x"
-                                if (pc and pa and pa > 0)
-                                else f"{'-':>11}")
-            ratio_gbk_async = (f"{pg/pa:>9.2f}x"
-                               if (pg and pa and pa > 0)
-                               else f"{'-':>10}")
-            topo_it_spd = (f"{ni/pt:>11.2f}x"
-                           if (ni and pt and pt > 0) else f"{'-':>12}")
+            ns = vals.get("nelson_simple")
+            pt = vals.get("par_topo_iter")
+            ratio_simple_async = (f"{ns/pa:>11.2f}x"
+                                  if (ns and pa and pa > 0)
+                                  else f"{'-':>12}")
+            ratio_topo_async = (f"{pt/pa:>12.2f}x"
+                                if (pt and pa and pa > 0)
+                                else f"{'-':>13}")
             wl_str = "/".join(str(x) for x in wl)
             print(f"{wl_str:<20} {t:>4} | "
                   + " ".join(cells)
-                  + f" | {ratio_topo_async} {ratio_naive_async} "
-                  + f"{ratio_cont_async} {ratio_gbk_async} {topo_it_spd}")
+                  + f" | {ratio_simple_async} {ratio_topo_async}")
         print()
 
 
@@ -805,15 +791,18 @@ def main():
                     choices=["random", "synthetic", "cube_decomp", "egg",
                              "gates"],
                     help="skip a phase; repeatable")
-    ap.add_argument("--algos", default=None,
+    ap.add_argument("--algos",
+                    default="par_async,par_topo_iter,nelson_simple",
                     help="comma-separated algorithm whitelist. Default: "
-                         "all. Names: nelson_seq, nelson_topo, "
-                         "nelson_topo_iter, nelson_dst, par_close, "
-                         "par_topo_iter, par_async, par_async_gbk, "
-                         "par_async_cont, par_async_min_id, par_naive. "
-                         "Sets PE_BENCH_ALGOS for the C++ binaries and "
-                         "filters the egg dispatch loop, so unwanted "
-                         "algos are never run.")
+                         "par_async,par_topo_iter,nelson_simple (the two "
+                         "parallel headlines plus the sequential "
+                         "baseline). Other valid names: nelson_seq, "
+                         "nelson_topo, nelson_topo_iter, nelson_dst, "
+                         "par_close, par_async_gbk, par_async_cont, "
+                         "par_async_min_id, par_naive. Pass 'all' to run "
+                         "every recognized algo. Sets PE_BENCH_ALGOS for "
+                         "the C++ binaries and filters the egg dispatch "
+                         "loop, so unwanted algos are never run.")
     ap.add_argument("--random-modes", default="default",
                     help="comma-separated random-phase modes. Valid: "
                          "'default' (6 baked-in workloads) and 'xl' "
@@ -876,14 +865,19 @@ def main():
         except ValueError:
             sys.exit("--ns expects comma-separated integers")
 
-    valid_algos = {row[0] for row in EGG_ALGOS}  # full 8 names
+    valid_algos = {row[0] for row in EGG_ALGOS}
     algos: list[str] | None = None
     if args.algos:
-        algos = [a.strip() for a in args.algos.split(",") if a.strip()]
-        unknown = [a for a in algos if a not in valid_algos]
-        if unknown:
-            sys.exit(f"unknown algos: {','.join(unknown)}. "
-                     f"valid: {sorted(valid_algos)}")
+        if args.algos.strip() == "all":
+            # Sentinel: run every recognized algo (no filter passed to
+            # the binaries, no filter on the egg dispatch loop).
+            algos = None
+        else:
+            algos = [a.strip() for a in args.algos.split(",") if a.strip()]
+            unknown = [a for a in algos if a not in valid_algos]
+            if unknown:
+                sys.exit(f"unknown algos: {','.join(unknown)}. "
+                         f"valid: {sorted(valid_algos)}")
 
     valid_random_modes = {"default", "xl"}
     random_modes = [m.strip() for m in args.random_modes.split(",")

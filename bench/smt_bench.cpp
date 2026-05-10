@@ -199,6 +199,9 @@ int main(int argc, char** argv) {
     run_one<pe::SequentialUnionFind>(script, stem, family, n, trials,
         warmup, par_threads, "nelson_dst", std::monostate{},
         [](auto& eg, auto& eqs) { eg.sequential_close_dst(eqs); });
+    run_one<pe::SequentialUnionFind>(script, stem, family, n, trials,
+        warmup, par_threads, "nelson_simple", std::monostate{},
+        [](auto& eg, auto& eqs) { eg.sequential_close_simple(eqs); });
     run_one<pe::ConcurrentUnionFind>(script, stem, family, n, trials,
         warmup, par_threads, "par_close", std::monostate{},
         [](auto& eg, auto& eqs) { eg.parallel_close(std::move(eqs)); });

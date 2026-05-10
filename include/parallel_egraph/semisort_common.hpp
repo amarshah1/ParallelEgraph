@@ -125,12 +125,22 @@ parlay::sequence<Id> semisort_with_equality(
   auto groups = parlay::group_by_key(keyed, hash_fn, equal_fn);
   if (timings) timings->group_by_ms = ms_since(t1);
 
-  // For each non-singleton group, union all members and emit their
-  // pre-round roots into next_work. Skip groups whose members all
-  // already share a single root: the unions would be no-ops and the
-  // shared root would re-enter next_work with parents_[root] unchanged
-  // — looping the BSP forever. Reachable any time a class is merged
-  // with one of its own descendants (e.g. an asserted f(a,b) = a).
+  // For each non-singleton group: precheck all_same_root (a cheap
+  // O(n) read scan) to skip buckets where every member already shares
+  // a root — those buckets would do dnc_union with all-no-op union_
+  // calls and emit nothing. Otherwise dnc_union returns the surviving
+  // root directly (no separate find_root needed), and we emit losers
+  // (members whose pre-union .root differs from the survivor) into
+  // next_work. Skipping the survivor saves one entry per merged
+  // bucket vs the older "emit every member" pattern.
+  // For each non-singleton group: first scan for all_same_root and
+  // skip those buckets — they'd produce O(bucket_size) `union_`
+  // no-ops in dnc_union (each with a find()-and-CAS chain), and
+  // empirically they dominate late-round work on big workloads
+  // (~30% on 8XL). The precheck is purely a perf optimization
+  // post-loser-only emission: with loser-only, an all_same_root
+  // bucket would naturally produce empty output, so correctness is
+  // preserved either way (see test_self_merge_no_loop).
   auto t2 = timings ? clk::now() : clk::time_point{};
   auto per_group = parlay::map(groups, [&](auto& kv) -> parlay::sequence<Id> {
     auto& values = kv.second;
@@ -139,8 +149,12 @@ parlay::sequence<Id> semisort_with_equality(
     bool all_same_root = parlay::all_of(
         values, [root_ref](const CanonEntry& e) { return e.root == root_ref; });
     if (all_same_root) return {};
-    dnc_union(values, 0, values.size(), uf);
-    return parlay::map(values, [](const CanonEntry& e) { return e.root; });
+    const Id survivor = dnc_union(values, 0, values.size(), uf);
+    return parlay::map_maybe(values, [survivor](const detail::CanonEntry& e)
+                                    -> std::optional<Id> {
+      if (e.root == survivor) return std::nullopt;  // winner
+      return e.root;  // loser
+    });
   });
   auto out = parlay::flatten(per_group);
   if (timings) timings->per_group_ms = ms_since(t2);
