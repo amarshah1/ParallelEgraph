@@ -56,11 +56,27 @@ class SmtToEGraphBuilder {
               stack.push_back({WK::Process, &*it, {}, 0});
             }
             break;
+          // Nested = and not (i.e., not at the top of an assertion) are
+          // treated as uninterpreted functions named "=" and "not". The
+          // top-of-assertion cases are dispatched before add_term() is
+          // called on the whole term, so reaching here means the symbol
+          // appears as a sub-term — fine to hashcons as an App.
           case Term::Kind::Eq:
+            stack.push_back({WK::Build, nullptr, "=", t.args.size()});
+            for (auto it = t.args.rbegin(); it != t.args.rend(); ++it) {
+              stack.push_back({WK::Process, &*it, {}, 0});
+            }
+            break;
           case Term::Kind::Not:
+            stack.push_back({WK::Build, nullptr, "not", t.args.size()});
+            for (auto it = t.args.rbegin(); it != t.args.rend(); ++it) {
+              stack.push_back({WK::Process, &*it, {}, 0});
+            }
+            break;
+          case Term::Kind::Distinct:
             throw std::runtime_error(
-                "= and not are not first-class terms; only allowed at "
-                "the top of an assertion");
+                "(distinct ...) is only allowed at the top of an "
+                "assertion, not as a sub-term");
         }
       } else {
         std::size_t start = results.size() - w.nargs;
