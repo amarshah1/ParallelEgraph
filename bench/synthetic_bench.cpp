@@ -473,6 +473,24 @@ std::vector<double> bench_nelson_dst(Family f, std::size_t n,
   return times;
 }
 
+std::vector<double> bench_nelson_simple(Family f, std::size_t n,
+                                         std::size_t g_arity,
+                                         int warmup, int trials) {
+  for (int i = 0; i < warmup; ++i) {
+    auto g = build<SequentialUnionFind>(f, n, g_arity);
+    g.eg->sequential_close_simple(g.eqs);
+  }
+  std::vector<double> times;
+  times.reserve(trials);
+  for (int i = 0; i < trials; ++i) {
+    auto g = build<SequentialUnionFind>(f, n, g_arity);
+    auto t0 = clk::now();
+    g.eg->sequential_close_simple(g.eqs);
+    times.push_back(elapsed_ms(t0));
+  }
+  return times;
+}
+
 std::vector<double> bench_parallel_close(Family f, std::size_t n,
                                           std::size_t g_arity,
                                           int warmup, int trials) {
@@ -782,6 +800,10 @@ int main() {
           md   = median(dst);
         }
       }
+      std::vector<double> nsim;
+      if (!par_only && algo_enabled("nelson_simple")) {
+        nsim = bench_nelson_simple(f, n, g_arity, warmup, trials);
+      }
       std::vector<double> par, pti, pa, pam, pnv, pac, pagbk;
       double mp = 0.0, mpti = 0.0, mpa = 0.0, mpam = 0.0;
       if (algo_enabled("par_close")) {
@@ -822,6 +844,8 @@ int main() {
             emit_csv(f, n, classes, merges, "nelson_topo_iter", iter);
           if (algo_enabled("nelson_dst"))
             emit_csv(f, n, classes, merges, "nelson_dst", dst);
+          if (algo_enabled("nelson_simple"))
+            emit_csv(f, n, classes, merges, "nelson_simple", nsim);
         }
         if (algo_enabled("par_close"))
           emit_csv(f, n, classes, merges, "par_close", par);

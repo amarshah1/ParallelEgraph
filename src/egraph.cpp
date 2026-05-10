@@ -1,12 +1,12 @@
 #include "parallel_egraph/egraph.hpp"
 #include "parallel_egraph/detail.hpp"
 #include "parallel_egraph/dnc_union.hpp"
+#include "parallel_egraph/ring_buffer.hpp"
 
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <deque>
 #include <optional>
 #include <string>
 #include <utility>
@@ -672,35 +672,41 @@ void EGraph<SequentialUnionFind>::sequential_close_simple(
   ankerl::unordered_dense::map<Signature, Id, SignatureHash> sig_table;
   sig_table.reserve(n);
 
-  // FIFO worklist; seeded with every non-leaf in DAG order.
+  // FIFO worklist as a fixed-capacity ring buffer. `in_queue` ensures
+  // each node is enqueued at most once at any time, so live entries
+  // never exceed `n` and the ring can't overflow. Replaces an earlier
+  // `std::deque<Id>` whose lazily-grown chunks didn't change wall-
+  // clock here, but the ring's contiguous storage keeps the
+  // allocation pattern aligned with the function's other pre-sized
+  // structures (sig_table, class_preds, in_queue).
   std::vector<std::uint8_t> in_queue(n, 0);
-  std::deque<Id> pending;
+  RingBuffer<Id> pending(n);
+
   for (Id v = 0; v < static_cast<Id>(n); ++v) {
     if (!nodes_[v].children.empty()) {
-      pending.push_back(v);
+      pending.push(v);
       in_queue[v] = 1;
     }
   }
 
   while (!pending.empty()) {
-    Id v = pending.front();
-    pending.pop_front();
+    Id v = pending.pop();
     in_queue[v] = 0;
 
     auto sig = canonical_sig(nodes_[v], uf_);
     auto [it, inserted] = sig_table.try_emplace(std::move(sig), v);
     if (inserted) continue;
 
-    Id w = it->second;
-    if (uf_.find_root(v) == uf_.find_root(w)) continue;
+    const Id w = it->second;
+    const Id rv = uf_.find_root(v);
+    const Id rw = uf_.find_root(w);
+    if (rv == rw) continue;
 
     // Collision on a different class → merge. union_ returns the
     // surviving root (post-refactor), so we can identify the loser
     // without an extra find_root call. Splice loser's predecessors
     // into the winner's list and re-queue them: their canonical sigs
     // each contain a child whose root just moved.
-    const Id rv = uf_.find_root(v);
-    const Id rw = uf_.find_root(w);
     const Id new_root = uf_.union_(rv, rw);
     const Id loser    = (new_root == rv) ? rw : rv;
 
@@ -709,7 +715,7 @@ void EGraph<SequentialUnionFind>::sequential_close_simple(
     for (Id p : src) {
       dst.push_back(p);
       if (!in_queue[p]) {
-        pending.push_back(p);
+        pending.push(p);
         in_queue[p] = 1;
       }
     }
