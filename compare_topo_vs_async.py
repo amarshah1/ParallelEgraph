@@ -121,6 +121,26 @@ def cmake_build(targets: list[str]):
     )
 
 
+# par_async_cont uses parlay::par_do(semisorter, unioner) and deadlocks
+# under PARLAY_NUM_THREADS=1 (the two logical threads serialize, and
+# the semisorter's drain-gate waits forever for the unioner that never
+# runs). All four phases skip it at T=1.
+#
+# Returns:
+#   None  → caller hadn't requested any filter; pass through unchanged
+#           (binaries default to running every algo).
+#   list  → use as PE_BENCH_ALGOS. An EMPTY list means "after stripping
+#           the unsafe algos, nothing is left to run" — callers MUST
+#           skip the binary invocation entirely. Calling the bench with
+#           PE_BENCH_ALGOS unset (or unset because we treated [] as
+#           falsy) would silently default to running everything, which
+#           is precisely the deadlock we're trying to avoid.
+def _filter_algos_for_t(algos: "list[str] | None", t: int) -> "list[str] | None":
+    if algos is None or t != 1:
+        return algos
+    return [a for a in algos if a != "par_async_cont"]
+
+
 def _numactl_prefix(no_numactl: bool) -> list[str]:
     if no_numactl:
         return []
@@ -223,8 +243,14 @@ def run_random_xl(out_dir: Path, thread_counts: list[int],
                     env["PE_BENCH_HEADER"] = "1"
                 if par_only:
                     env["PE_BENCH_PAR_ONLY"] = "1"
-                if algos:
-                    env["PE_BENCH_ALGOS"] = ",".join(algos)
+                _filtered = _filter_algos_for_t(algos, t)
+                if _filtered == []:  # all algos stripped at T=1; skip cell
+                    print(f"    [random-xl] T={t} all algos filtered "
+                          f"(par_async_cont unsafe at T=1); skip",
+                          flush=True)
+                    continue
+                if _filtered is not None:
+                    env["PE_BENCH_ALGOS"] = ",".join(_filtered)
                 stdout = _run_binary(binary, env=env,
                                      numactl_prefix=numactl_prefix,
                                      phase_label=f"random-xl {label} T={t}",
@@ -264,8 +290,13 @@ def run_random(out_dir: Path, thread_counts: list[int],
                 env["PE_BENCH_HEADER"] = "1"
             if par_only:
                 env["PE_BENCH_PAR_ONLY"] = "1"
-            if algos:
-                env["PE_BENCH_ALGOS"] = ",".join(algos)
+            _filtered = _filter_algos_for_t(algos, t)
+            if _filtered == []:
+                print(f"    [random] T={t} all algos filtered "
+                      f"(par_async_cont unsafe at T=1); skip", flush=True)
+                continue
+            if _filtered is not None:
+                env["PE_BENCH_ALGOS"] = ",".join(_filtered)
             stdout = _run_binary(binary, env=env,
                                  numactl_prefix=numactl_prefix,
                                  phase_label=f"random T={t}",
@@ -312,8 +343,13 @@ def run_synthetic(out_dir: Path, families: list[str],
                         env["PE_BENCH_HEADER"] = "1"
                     if par_only:
                         env["PE_BENCH_PAR_ONLY"] = "1"
-                    if algos:
-                        env["PE_BENCH_ALGOS"] = ",".join(algos)
+                    _filtered = _filter_algos_for_t(algos, t)
+                    if _filtered == []:
+                        print(f"    [synthetic] {fam} n={n} T={t} "
+                              f"all algos filtered; skip", flush=True)
+                        continue
+                    if _filtered is not None:
+                        env["PE_BENCH_ALGOS"] = ",".join(_filtered)
                     stdout = _run_binary(
                         binary, env=env, numactl_prefix=numactl_prefix,
                         phase_label=f"synthetic {fam} n={n} T={t}",
@@ -359,8 +395,13 @@ def run_cube_decomp(out_dir: Path, thread_counts: list[int],
                         env["PE_BENCH_HEADER"] = "1"
                     if par_only:
                         env["PE_BENCH_PAR_ONLY"] = "1"
-                    if algos:
-                        env["PE_BENCH_ALGOS"] = ",".join(algos)
+                    _filtered = _filter_algos_for_t(algos, t)
+                    if _filtered == []:
+                        print(f"    [cube_decomp] d={d} k={k} T={t} "
+                              f"all algos filtered; skip", flush=True)
+                        continue
+                    if _filtered is not None:
+                        env["PE_BENCH_ALGOS"] = ",".join(_filtered)
                     stdout = _run_binary(
                         binary, env=env, numactl_prefix=numactl_prefix,
                         phase_label=f"cube_decomp d={d} k={k} T={t}",
@@ -481,10 +522,14 @@ def run_egg(out_dir: Path, thread_counts: list[int],
             print(f"  [egg] WARN: --algos contains {sorted(missing)} which "
                   "egraph-cc does not support; ignoring.", flush=True)
 
-    # (algo, T) cells: skip sequential algos when T>1.
+    # (algo, T) cells: skip sequential algos when T>1; skip
+    # par_async_cont at T=1 (deadlocks under PARLAY_NUM_THREADS=1, see
+    # _filter_algos_for_t).
     cells: list[tuple[str, str | None, str | None, int]] = []
     for t in thread_counts:
         for algo, seq_arg, env_var in egg_algos:
+            if algo == "par_async_cont" and t == 1:
+                continue
             if seq_arg is not None and t != 1:
                 continue
             cells.append((algo, seq_arg, env_var, t))
@@ -679,10 +724,20 @@ def run_gates(out_dir: Path, thread_counts: list[int],
                     env["PE_BENCH_PAR_ONLY"] = "1"
                 if first:
                     env["PE_BENCH_HEADER"] = "1"
-                if algos:
-                    gates_algos = [a for a in algos if a in GATES_OK]
-                    if gates_algos:
-                        env["PE_BENCH_ALGOS"] = ",".join(gates_algos)
+                _filtered = _filter_algos_for_t(algos, t)
+                if _filtered == []:
+                    print(f"    [gates] T={t} {fname} all algos filtered "
+                          f"(par_async_cont unsafe at T=1); skip",
+                          flush=True)
+                    continue
+                if _filtered is not None:
+                    gates_algos = [a for a in _filtered if a in GATES_OK]
+                    if not gates_algos:
+                        print(f"    [gates] T={t} {fname} no algos "
+                              f"recognized by gates_bench; skip",
+                              flush=True)
+                        continue
+                    env["PE_BENCH_ALGOS"] = ",".join(gates_algos)
                 proc = subprocess.run(cmd, capture_output=True, text=True,
                                       env=env)
                 wall = time.perf_counter() - t0
