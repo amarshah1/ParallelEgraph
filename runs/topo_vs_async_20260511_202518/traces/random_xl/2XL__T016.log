@@ -1,0 +1,49 @@
+[bench] running custom ...
+[pe] round=  0 work=    99964 frontier=  1333333 next=  1332457 consolidate=  2.830ms frontier=  5.715ms semisort= 27.361ms (keyed= 4.181ms group_by=  0.394ms per_group=11.724ms)
+[pe] round=  1 work=  1332457 frontier=  1333333 next=  1265846 consolidate= 23.319ms frontier=  4.621ms semisort= 30.588ms (keyed= 3.234ms group_by=  0.433ms per_group=13.561ms)
+[pe] round=  2 work=  1265846 frontier=  1333330 next=        9 consolidate= 35.702ms frontier= 36.658ms semisort= 17.462ms (keyed= 2.804ms group_by=  0.299ms per_group= 1.984ms)
+[pe] round=  3 work=        9 (tail-skip: all parents empty)
+[pe] round=  0 work=    99964 frontier=  1333333 next=  1332457 consolidate=  1.795ms frontier=  3.588ms semisort= 21.489ms (keyed= 3.733ms group_by=  0.302ms per_group= 8.782ms)
+[pe] round=  1 work=  1332457 frontier=  1333333 next=  1265846 consolidate= 19.269ms frontier=  4.668ms semisort= 25.267ms (keyed= 3.217ms group_by=  0.330ms per_group=11.759ms)
+[pe] round=  2 work=  1265846 frontier=  1333330 next=        9 consolidate= 32.850ms frontier= 36.947ms semisort= 14.257ms (keyed= 2.411ms group_by=  0.287ms per_group= 1.887ms)
+[pe] round=  3 work=        9 (tail-skip: all parents empty)
+[pe] round=  0 work=    99964 frontier=  1333333 next=  1332457 consolidate=  1.861ms frontier=  3.621ms semisort= 21.619ms (keyed= 3.678ms group_by=  0.273ms per_group= 8.994ms)
+[pe] round=  1 work=  1332457 frontier=  1333333 next=  1265846 consolidate= 19.006ms frontier=  4.695ms semisort= 24.925ms (keyed= 3.110ms group_by=  0.331ms per_group=11.612ms)
+[pe] round=  2 work=  1265846 frontier=  1333330 next=        9 consolidate= 32.821ms frontier= 36.570ms semisort= 14.941ms (keyed= 2.995ms group_by=  0.323ms per_group= 1.905ms)
+[pe] round=  3 work=        9 (tail-skip: all parents empty)
+[pe] round=  0 work=    99964 frontier=  1333333 next=  1332457 consolidate=  1.703ms frontier=  3.863ms semisort= 22.427ms (keyed= 3.739ms group_by=  0.271ms per_group= 9.151ms)
+[pe] round=  1 work=  1332457 frontier=  1333333 next=  1265846 consolidate= 18.836ms frontier=  4.359ms semisort= 25.789ms (keyed= 3.098ms group_by=  0.342ms per_group=11.520ms)
+[pe] round=  2 work=  1265846 frontier=  1333330 next=        9 consolidate= 32.882ms frontier= 37.347ms semisort= 14.710ms (keyed= 2.694ms group_by=  0.299ms per_group= 1.898ms)
+[pe] round=  3 work=        9 (tail-skip: all parents empty)
+[pe] round=  0 work=    99964 frontier=  1333333 next=  1332457 consolidate=  2.069ms frontier=  4.581ms semisort= 24.933ms (keyed= 3.576ms group_by=  0.257ms per_group=11.781ms)
+[pe] round=  1 work=  1332457 frontier=  1333333 next=  1265846 consolidate= 19.026ms frontier=  4.800ms semisort= 25.076ms (keyed= 2.979ms group_by=  0.347ms per_group=11.673ms)
+[pe] round=  2 work=  1265846 frontier=  1333330 next=        9 consolidate= 33.177ms frontier= 37.727ms semisort= 14.447ms (keyed= 2.441ms group_by=  0.289ms per_group= 1.924ms)
+[pe] round=  3 work=        9 (tail-skip: all parents empty)
+[pe] round=  0 work=    99964 frontier=  1333333 next=  1332457 consolidate=  1.780ms frontier=  3.737ms semisort= 24.605ms (keyed= 5.014ms group_by=  0.280ms per_group=10.530ms)
+[pe] round=  1 work=  1332457 frontier=  1333333 next=  1265846 consolidate= 18.979ms frontier=  5.193ms semisort= 25.807ms (keyed= 2.839ms group_by=  0.340ms per_group=11.643ms)
+[pe] round=  2 work=  1265846 frontier=  1333330 next=        9 consolidate= 33.490ms frontier= 36.454ms semisort= 14.712ms (keyed= 2.391ms group_by=  0.272ms per_group= 1.946ms)
+[pe] round=  3 work=        9 (tail-skip: all parents empty)
+[pe-async] round=  0 R=2 dirty=  1333333 runs=      876 filter= 10.708ms semisort= 15.918ms
+[pe-async] round=  1 R=3 dirty=  1333333 runs=    67487 filter=  9.918ms semisort= 19.292ms
+[pe-async] round=  2 R=4 dirty=  1333330 runs=  1333321 filter=  6.715ms semisort=  7.503ms
+[pe-async] round=  3 R=5 dirty=        0 filter=  6.789ms (clean break)
+[pe-async] round=  0 R=2 dirty=  1333333 runs=      876 filter=  9.210ms semisort= 13.141ms
+[pe-async] round=  1 R=3 dirty=  1333333 runs=    67487 filter=  9.508ms semisort= 18.836ms
+[pe-async] round=  2 R=4 dirty=  1333330 runs=  1333321 filter=  6.278ms semisort=  7.286ms
+[pe-async] round=  3 R=5 dirty=        0 filter=  6.538ms (clean break)
+[pe-async] round=  0 R=2 dirty=  1333333 runs=      876 filter=  8.401ms semisort= 12.210ms
+[pe-async] round=  1 R=3 dirty=  1333333 runs=    67487 filter=  8.921ms semisort= 18.090ms
+[pe-async] round=  2 R=4 dirty=  1333330 runs=  1333321 filter=  6.412ms semisort=  7.228ms
+[pe-async] round=  3 R=5 dirty=        0 filter=  6.526ms (clean break)
+[pe-async] round=  0 R=2 dirty=  1333333 runs=      876 filter=  8.373ms semisort= 12.656ms
+[pe-async] round=  1 R=3 dirty=  1333333 runs=    67487 filter=  9.066ms semisort= 18.366ms
+[pe-async] round=  2 R=4 dirty=  1333330 runs=  1333321 filter=  6.407ms semisort=  7.221ms
+[pe-async] round=  3 R=5 dirty=        0 filter=  6.566ms (clean break)
+[pe-async] round=  0 R=2 dirty=  1333333 runs=      876 filter=  8.354ms semisort= 12.399ms
+[pe-async] round=  1 R=3 dirty=  1333333 runs=    67487 filter=  9.000ms semisort= 18.161ms
+[pe-async] round=  2 R=4 dirty=  1333330 runs=  1333321 filter=  6.279ms semisort=  7.400ms
+[pe-async] round=  3 R=5 dirty=        0 filter=  6.552ms (clean break)
+[pe-async] round=  0 R=2 dirty=  1333333 runs=      876 filter=  8.353ms semisort= 13.948ms
+[pe-async] round=  1 R=3 dirty=  1333333 runs=    67487 filter=  8.751ms semisort= 18.097ms
+[pe-async] round=  2 R=4 dirty=  1333330 runs=  1333321 filter=  6.287ms semisort=  7.479ms
+[pe-async] round=  3 R=5 dirty=        0 filter=  6.589ms (clean break)
