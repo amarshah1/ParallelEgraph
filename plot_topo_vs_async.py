@@ -385,8 +385,8 @@ def plot_random(med, out_path: Path, par_algo: str = PAR_ALGO):
 
 def plot_gates(med, out_path: Path, top_n: int, par_algo: str = PAR_ALGO):
     """gates_bench can be run with any subset of {nelson_simple,
-    nelson_topo_iter, par_parents, par_topo_iter, par_filter,
-    par_filter_cont}, so the plotter picks a baseline based on what's
+    nelson_topo_iter, par_parents, par_topo_iter, par_filter}, so the
+    plotter picks a baseline based on what's
     actually in the CSV. Preference order:
 
       1. min(nelson_simple, nelson_topo_iter) at T=1 — best

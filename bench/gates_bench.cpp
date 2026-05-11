@@ -22,7 +22,7 @@
 //   PE_BENCH_ALGOS=...       comma-separated EXACT names from
 //                            {nelson_simple, nelson_topo_iter,
 //                             par_parents, par_topo_iter, par_filter,
-//                             par_filter_cont, par_filter_hybrid}.
+//                             par_filter_gbk, par_filter_hybrid}.
 //                            Default = run all seven.
 //   PE_BENCH_PAR_ONLY=1      skip every sequential algo (nelson_*).
 //                            Set on T>1 invocations so we don't
@@ -109,7 +109,7 @@ int main(int argc, char** argv) {
   // Parse PE_BENCH_ALGOS as a comma-separated list of EXACT algorithm
   // names. Default (env unset) = run every algorithm. If the env is set,
   // only the listed ones run. Exact-match (not substring) so e.g.
-  // "par_filter" does NOT match "par_filter_cont".
+  // "par_filter" does NOT match "par_filter_hybrid".
   bool run_nelson_simple             = true;
   bool run_nelson_simple_hash        = true;
   bool run_nelson_simple_arity       = true;
@@ -121,7 +121,7 @@ int main(int argc, char** argv) {
   bool run_par_parents_gbk    = true;
   bool run_topo             = true;
   bool run_async            = true;
-  bool run_async_cont       = true;
+  bool run_async_gbk        = true;
   bool run_async_hybrid     = true;
   if (const char* a = std::getenv("PE_BENCH_ALGOS")) {
     std::string s(a);
@@ -156,15 +156,15 @@ int main(int argc, char** argv) {
     run_par_parents_gbk       = has("par_parents_gbk");
     run_topo                = has("par_topo_iter");
     run_async               = has("par_filter");
-    run_async_cont          = has("par_filter_cont");
+    run_async_gbk           = has("par_filter_gbk");
     run_async_hybrid        = has("par_filter_hybrid");
     if (!run_nelson_simple && !run_nelson_simple_hash && !run_nelson_simple_arity && !run_nelson_simple_bump && !run_nelson_simple_arity_bump && !run_nelson_simple_inline && !run_nelson_topo_iter && !run_par_parents && !run_par_parents_gbk &&
-        !run_topo && !run_async && !run_async_cont && !run_async_hybrid) {
+        !run_topo && !run_async && !run_async_gbk && !run_async_hybrid) {
       std::fprintf(stderr,
           "PE_BENCH_ALGOS=%s matched nothing; valid algos are "
           "nelson_simple, nelson_simple_hash, nelson_simple_arity, nelson_simple_bump, "
           "nelson_topo_iter, par_parents, par_topo_iter, "
-          "par_filter, par_filter_cont, par_filter_hybrid\n", a);
+          "par_filter, par_filter_gbk, par_filter_hybrid\n", a);
       return 2;
     }
   }
@@ -432,18 +432,17 @@ int main(int argc, char** argv) {
       }
     }
 
-    if (run_async_cont) {
-      // Truly-async (continuous): same filter_t-tagged ctor as par_filter.
+    if (run_async_gbk) {
       for (int i = 0; i < warmup; ++i) {
         run_one<pe::ConcurrentUnionFind>(
             deep_copy_nodes(), deep_copy_eqs(), pe::filter,
-            [](auto& eg, auto eqs) { eg.parallel_filter_continuous(std::move(eqs)); });
+            [](auto& eg, auto eqs) { eg.parallel_filter_groupby(std::move(eqs)); });
       }
       for (int i = 0; i < trials; ++i) {
         double ms = run_one<pe::ConcurrentUnionFind>(
             deep_copy_nodes(), deep_copy_eqs(), pe::filter,
-            [](auto& eg, auto eqs) { eg.parallel_filter_continuous(std::move(eqs)); });
-        emit_row("par_filter_cont", i, ms);
+            [](auto& eg, auto eqs) { eg.parallel_filter_groupby(std::move(eqs)); });
+        emit_row("par_filter_gbk", i, ms);
       }
     }
 

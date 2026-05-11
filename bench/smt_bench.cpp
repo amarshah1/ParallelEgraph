@@ -232,11 +232,6 @@ int main(int argc, char** argv) {
           eg.parallel_naive_rounds(std::move(eqs));
         });
     run_one<pe::ConcurrentUnionFind>(script, stem, family, n, trials,
-        warmup, par_threads, "par_filter_cont", pe::filter,
-        [](auto& eg, auto& eqs) {
-          eg.parallel_filter_continuous(std::move(eqs));
-        });
-    run_one<pe::ConcurrentUnionFind>(script, stem, family, n, trials,
         warmup, par_threads, "par_filter_gbk", pe::filter,
         [](auto& eg, auto& eqs) {
           eg.parallel_filter_groupby(std::move(eqs));

@@ -562,23 +562,6 @@ std::vector<double> bench_parallel_filter(Family f, std::size_t n,
   return times;
 }
 
-std::vector<double> bench_parallel_filter_continuous(
-    Family f, std::size_t n, std::size_t g_arity, int warmup, int trials) {
-  for (int i = 0; i < warmup; ++i) {
-    auto g = build_async<ConcurrentUnionFind>(f, n, g_arity);
-    g.eg->parallel_filter_continuous(std::move(g.eqs));
-  }
-  std::vector<double> times;
-  times.reserve(trials);
-  for (int i = 0; i < trials; ++i) {
-    auto g = build_async<ConcurrentUnionFind>(f, n, g_arity);
-    auto t0 = clk::now();
-    g.eg->parallel_filter_continuous(std::move(g.eqs));
-    times.push_back(elapsed_ms(t0));
-  }
-  return times;
-}
-
 std::vector<double> bench_parallel_filter_min(Family f, std::size_t n,
                                                      std::size_t g_arity,
                                                      int warmup, int trials) {
@@ -826,7 +809,7 @@ int main() {
       if (!par_only && algo_enabled("nelson_simple_hash")) {
         nsimh = bench_nelson_simple_hash(f, n, g_arity, warmup, trials);
       }
-      std::vector<double> par, pti, pa, pam, pnv, pac, pagbk;
+      std::vector<double> par, pti, pa, pam, pnv, pagbk;
       double mp = 0.0, mpti = 0.0, mpa = 0.0, mpam = 0.0;
       if (algo_enabled("par_parents")) {
         par = bench_parallel_parents(f, n, g_arity, warmup, trials);
@@ -846,10 +829,6 @@ int main() {
       }
       if (algo_enabled("par_naive")) {
         pnv = bench_parallel_naive(f, n, g_arity, warmup, trials);
-      }
-      if (algo_enabled("par_filter_cont")) {
-        pac = bench_parallel_filter_continuous(f, n, g_arity,
-                                                     warmup, trials);
       }
       if (algo_enabled("par_filter_gbk")) {
         pagbk = bench_parallel_filter_groupby(f, n, g_arity,
@@ -881,8 +860,6 @@ int main() {
           emit_csv(f, n, classes, merges, "par_filter_min_id", pam);
         if (algo_enabled("par_naive"))
           emit_csv(f, n, classes, merges, "par_naive", pnv);
-        if (algo_enabled("par_filter_cont"))
-          emit_csv(f, n, classes, merges, "par_filter_cont", pac);
         if (algo_enabled("par_filter_gbk"))
           emit_csv(f, n, classes, merges, "par_filter_gbk", pagbk);
       } else if (skip_nelson) {

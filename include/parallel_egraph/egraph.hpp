@@ -350,28 +350,6 @@ class EGraph {
   void parallel_naive_rounds(
       parlay::sequence<std::pair<Id, Id>> initial_unions);
 
-  // Truly-async continuous closure. Same `last_marked_` dirty-tracking
-  // primitive as `parallel_filter`, but the round structure
-  // is dissolved: a single semisorter and a single unioner team run
-  // concurrently via `parlay::par_do`, communicating through a
-  // mutex-protected mailbox of CanonEntry groups.
-  //
-  //   * Semisorter: bumps a global `R` per scan, filters non_leaf for
-  //     dirty terms (any child root has last_marked_ ∈ {R-1, R}),
-  //     semisorts, pushes multi-member groups to the mailbox.
-  //   * Unioner pool: pulls groups from the mailbox, runs dnc_union,
-  //     reads R *at write time* and write_max-stamps the surviving
-  //     root's last_marked_ with that R. Monotonic, so racy reads with
-  //     concurrent semisort R-bumps can only over-mark.
-  //
-  // Termination: an `outstanding` counter tracks groups in mailbox +
-  // groups in-flight. When semisorter sees an empty dirty filter AND
-  // outstanding == 0, it sets `done`. The unioner pool drains and
-  // exits on `done`. Defined out-of-line as an explicit specialization
-  // on `ConcurrentUnionFind`. Uses the async-flavor ctor (`pe::filter`).
-  void parallel_filter_continuous(
-      parlay::sequence<std::pair<Id, Id>> initial_unions);
-
   // Hybrid filter / parents-walk closure. Starts in `par_filter`-style
   // filter mode: each round scans the non_leaf set checking
   // `last_marked_[find_root(child)] == R-1` to find dirty terms. Once

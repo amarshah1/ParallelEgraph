@@ -675,49 +675,6 @@ bool test_par_filter_cross_depth() {
 }
 
 // ---------------------------------------------------------------------------
-// `parallel_filter_continuous` should match `parallel_parents` on the
-// cross-depth init scenario — confirms the truly-async pipelined variant
-// converges to the same closure as the rounded async path.
-// ---------------------------------------------------------------------------
-bool test_par_filter_cont_cross_depth() {
-  auto build_nodes = []() {
-    return make_nodes({
-        ENode{"a",  {}}, ENode{"b",  {}},
-        ENode{"ta1", {}}, ENode{"ta2", {}}, ENode{"t",  {}},
-        ENode{"f", {0}}, ENode{"f", {1}},
-        ENode{"g", {2, 4}}, ENode{"g", {3, 4}},
-    });
-  };
-  auto unions = []() {
-    parlay::sequence<std::pair<Id, Id>> eqs;
-    eqs.push_back({0, 1});
-    eqs.push_back({2, 5});
-    eqs.push_back({3, 6});
-    return eqs;
-  };
-
-  auto eg_par = std::make_unique<ConcurrentEGraph>(build_nodes());
-  eg_par->parallel_parents(unions());
-
-  auto eg_cont = std::make_unique<ConcurrentEGraph>(build_nodes(), pe::filter);
-  eg_cont->parallel_filter_continuous(unions());
-
-  for (Id i = 0; i < 9; ++i) {
-    for (Id j = i + 1; j < 9; ++j) {
-      if (eg_par->equiv(i, j) != eg_cont->equiv(i, j)) {
-        std::fprintf(stderr,
-                     "FAIL par_filter_cont vs parallel_parents on (%u, %u): "
-                     "oracle=%d cont=%d\n",
-                     i, j, int(eg_par->equiv(i, j)),
-                     int(eg_cont->equiv(i, j)));
-        return false;
-      }
-    }
-  }
-  return true;
-}
-
-// ---------------------------------------------------------------------------
 // `parallel_naive_rounds` should match `parallel_parents` on the
 // cross-depth init scenario — confirms the no-filter naive baseline
 // converges to the same closure as the dirty-filter async variant.
@@ -949,7 +906,6 @@ int main() {
       {"seq_topo_iter_adversarial", test_seq_topo_iter_adversarial_order},
       {"par_filter_cross_depth", test_par_filter_cross_depth},
       {"par_filter_min_cross_depth", test_par_filter_min_cross_depth},
-      {"par_filter_cont_cross_depth", test_par_filter_cont_cross_depth},
       {"par_naive_cross_depth", test_par_naive_cross_depth},
       {"par_topo_iter_cross_depth", test_par_topo_iter_cross_depth},
       {"self_merge_no_loop", test_self_merge_no_loop},

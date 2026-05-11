@@ -81,10 +81,6 @@ GATES_DEFAULT_SUITES = ["iwls22_with_not", "hwmcc12_with_not"]
 #   par_filter_gbk     — same as par_filter but using parlay::group_by_key
 #                        (hash table + per-bucket sequence allocation);
 #                        kept as A/B baseline for the integer-sort swap
-#   par_filter_cont    — truly-async CC (semisorter + unioner via
-#                        parlay::par_do, deque mailbox, drain-gated
-#                        BSP-with-overlap; same dirty-filter as
-#                        par_filter but pipelined within each round)
 #   par_naive         — naive rounds CC (semisort all non-leaves every
 #                        round; no dirty filter; the "ablation" against
 #                        par_filter that quantifies what filtering buys)
@@ -119,26 +115,6 @@ def cmake_build(targets: list[str]):
         + sum([["--target", t] for t in targets], []),
         check=True,
     )
-
-
-# par_filter_cont uses parlay::par_do(semisorter, unioner) and deadlocks
-# under PARLAY_NUM_THREADS=1 (the two logical threads serialize, and
-# the semisorter's drain-gate waits forever for the unioner that never
-# runs). All four phases skip it at T=1.
-#
-# Returns:
-#   None  → caller hadn't requested any filter; pass through unchanged
-#           (binaries default to running every algo).
-#   list  → use as PE_BENCH_ALGOS. An EMPTY list means "after stripping
-#           the unsafe algos, nothing is left to run" — callers MUST
-#           skip the binary invocation entirely. Calling the bench with
-#           PE_BENCH_ALGOS unset (or unset because we treated [] as
-#           falsy) would silently default to running everything, which
-#           is precisely the deadlock we're trying to avoid.
-def _filter_algos_for_t(algos: "list[str] | None", t: int) -> "list[str] | None":
-    if algos is None or t != 1:
-        return algos
-    return [a for a in algos if a != "par_filter_cont"]
 
 
 def _numactl_prefix(no_numactl: bool) -> list[str]:
@@ -243,14 +219,8 @@ def run_random_xl(out_dir: Path, thread_counts: list[int],
                     env["PE_BENCH_HEADER"] = "1"
                 if par_only:
                     env["PE_BENCH_PAR_ONLY"] = "1"
-                _filtered = _filter_algos_for_t(algos, t)
-                if _filtered == []:  # all algos stripped at T=1; skip cell
-                    print(f"    [random-xl] T={t} all algos filtered "
-                          f"(par_filter_cont unsafe at T=1); skip",
-                          flush=True)
-                    continue
-                if _filtered is not None:
-                    env["PE_BENCH_ALGOS"] = ",".join(_filtered)
+                if algos is not None:
+                    env["PE_BENCH_ALGOS"] = ",".join(algos)
                 stdout = _run_binary(binary, env=env,
                                      numactl_prefix=numactl_prefix,
                                      phase_label=f"random-xl {label} T={t}",
@@ -290,13 +260,8 @@ def run_random(out_dir: Path, thread_counts: list[int],
                 env["PE_BENCH_HEADER"] = "1"
             if par_only:
                 env["PE_BENCH_PAR_ONLY"] = "1"
-            _filtered = _filter_algos_for_t(algos, t)
-            if _filtered == []:
-                print(f"    [random] T={t} all algos filtered "
-                      f"(par_filter_cont unsafe at T=1); skip", flush=True)
-                continue
-            if _filtered is not None:
-                env["PE_BENCH_ALGOS"] = ",".join(_filtered)
+            if algos is not None:
+                env["PE_BENCH_ALGOS"] = ",".join(algos)
             stdout = _run_binary(binary, env=env,
                                  numactl_prefix=numactl_prefix,
                                  phase_label=f"random T={t}",
@@ -343,13 +308,8 @@ def run_synthetic(out_dir: Path, families: list[str],
                         env["PE_BENCH_HEADER"] = "1"
                     if par_only:
                         env["PE_BENCH_PAR_ONLY"] = "1"
-                    _filtered = _filter_algos_for_t(algos, t)
-                    if _filtered == []:
-                        print(f"    [synthetic] {fam} n={n} T={t} "
-                              f"all algos filtered; skip", flush=True)
-                        continue
-                    if _filtered is not None:
-                        env["PE_BENCH_ALGOS"] = ",".join(_filtered)
+                    if algos is not None:
+                        env["PE_BENCH_ALGOS"] = ",".join(algos)
                     stdout = _run_binary(
                         binary, env=env, numactl_prefix=numactl_prefix,
                         phase_label=f"synthetic {fam} n={n} T={t}",
@@ -395,13 +355,8 @@ def run_cube_decomp(out_dir: Path, thread_counts: list[int],
                         env["PE_BENCH_HEADER"] = "1"
                     if par_only:
                         env["PE_BENCH_PAR_ONLY"] = "1"
-                    _filtered = _filter_algos_for_t(algos, t)
-                    if _filtered == []:
-                        print(f"    [cube_decomp] d={d} k={k} T={t} "
-                              f"all algos filtered; skip", flush=True)
-                        continue
-                    if _filtered is not None:
-                        env["PE_BENCH_ALGOS"] = ",".join(_filtered)
+                    if algos is not None:
+                        env["PE_BENCH_ALGOS"] = ",".join(algos)
                     stdout = _run_binary(
                         binary, env=env, numactl_prefix=numactl_prefix,
                         phase_label=f"cube_decomp d={d} k={k} T={t}",
@@ -436,7 +391,6 @@ EGG_ALGOS: list[tuple[str, str | None, str | None]] = [
     ("par_topo_iter",    None,         "PE_USE_TOPO"),
     ("par_filter",        None,         "PE_USE_ASYNC"),
     ("par_filter_gbk",    None,         "PE_USE_ASYNC_GBK"),
-    ("par_filter_cont",   None,         "PE_USE_ASYNC_CONT"),
     ("par_filter_hybrid", None,         "PE_USE_ASYNC_HYBRID"),
     ("par_filter_min_id", None,         "PE_USE_ASYNC_MIN_ID"),
     ("par_naive",        None,         "PE_USE_NAIVE"),
@@ -539,14 +493,10 @@ def run_egg(out_dir: Path, thread_counts: list[int],
                   f"{sorted(missing)} which egraph-cc does not support; "
                   "ignoring.", flush=True)
 
-    # (algo, T) cells: skip sequential algos when T>1; skip
-    # par_filter_cont at T=1 (deadlocks under PARLAY_NUM_THREADS=1, see
-    # _filter_algos_for_t).
+    # (algo, T) cells: skip sequential algos when T>1.
     cells: list[tuple[str, str | None, str | None, int]] = []
     for t in thread_counts:
         for algo, seq_arg, env_var in egg_algos:
-            if algo == "par_filter_cont" and t == 1:
-                continue
             if seq_arg is not None and t != 1:
                 continue
             cells.append((algo, seq_arg, env_var, t))
@@ -728,7 +678,7 @@ def run_gates(out_dir: Path, thread_counts: list[int],
     # Algo names gates_bench currently understands.
     GATES_OK = ("nelson_simple", "nelson_simple_hash", "nelson_simple_arity",
                 "nelson_topo_iter",
-                "par_parents", "par_topo_iter", "par_filter", "par_filter_cont")
+                "par_parents", "par_topo_iter", "par_filter")
 
     first = True
     with open(csv_path, "w") as out:
@@ -750,14 +700,8 @@ def run_gates(out_dir: Path, thread_counts: list[int],
                     env["PE_BENCH_PAR_ONLY"] = "1"
                 if first:
                     env["PE_BENCH_HEADER"] = "1"
-                _filtered = _filter_algos_for_t(algos, t)
-                if _filtered == []:
-                    print(f"    [gates] T={t} {fname} all algos filtered "
-                          f"(par_filter_cont unsafe at T=1); skip",
-                          flush=True)
-                    continue
-                if _filtered is not None:
-                    gates_algos = [a for a in _filtered if a in GATES_OK]
+                if algos is not None:
+                    gates_algos = [a for a in algos if a in GATES_OK]
                     if not gates_algos:
                         print(f"    [gates] T={t} {fname} no algos "
                               f"recognized by gates_bench; skip",
@@ -962,7 +906,7 @@ def main():
                          "parallel headlines plus the sequential "
                          "baseline). Other valid names: nelson_seq, "
                          "nelson_topo, nelson_topo_iter, nelson_dst, "
-                         "par_parents, par_filter_gbk, par_filter_cont, "
+                         "par_parents, par_filter_gbk, "
                          "par_filter_min_id, par_naive. Pass 'all' to run "
                          "every recognized algo. Sets PE_BENCH_ALGOS for "
                          "the C++ binaries and filters the egg dispatch "
