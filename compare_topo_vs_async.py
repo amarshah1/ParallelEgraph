@@ -65,7 +65,7 @@ CUBE_DECOMP_KS = [5, 55, 105, 155]
 # default. *_with_not variants are skipped by default since the
 # gates_bench builder synthesizes NOT terms automatically — running
 # both would double-count.
-GATES_DEFAULT_ROOT   = "../miter-benchmarks/miter-cc-benchmarks"
+GATES_DEFAULT_ROOT   = "./miter-cc-benchmarks"
 GATES_DEFAULT_SUITES = ["iwls22", "hwmcc12"]
 
 # Algorithms surfaced in the per-phase summary table (in column order).
@@ -129,12 +129,20 @@ def _numactl_prefix(no_numactl: bool) -> list[str]:
 
 
 def _run_binary(binary: str, *, env: dict, numactl_prefix: list[str],
-                phase_label: str) -> str:
+                phase_label: str,
+                trace_path: "Path | None" = None) -> str:
     cmd = list(numactl_prefix) + [binary]
     proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr)
         raise RuntimeError(f"{binary} failed during {phase_label}")
+    # Forensic stderr capture (PE_TRACE per-round detail, build sizes,
+    # etc). Each caller passes a unique path so a killed run still
+    # leaves the partial traces on disk.
+    if trace_path is not None:
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(trace_path, "w") as tf:
+            tf.write(proc.stderr)
     return proc.stdout
 
 
@@ -195,6 +203,7 @@ def run_random_xl(out_dir: Path, thread_counts: list[int],
     mode = "a" if append else "w"
     print(f"=== random (XL ladder, {[l for l, _ in ladder]}) "
           f"-> {csv_path}{' (append)' if append else ''}", flush=True)
+    traces_dir = out_dir / "traces" / "random_xl"
     first = not append
     with open(csv_path, mode) as out:
         for label, params in ladder:
@@ -209,6 +218,7 @@ def run_random_xl(out_dir: Path, thread_counts: list[int],
                 env["PE_BENCH_WARMUP"] = str(warmup)
                 env["PARLAY_NUM_THREADS"] = str(t)
                 env["PE_BENCH_CUSTOM"] = spec
+                env["PE_TRACE"] = "1"
                 if first:
                     env["PE_BENCH_HEADER"] = "1"
                 if par_only:
@@ -217,7 +227,9 @@ def run_random_xl(out_dir: Path, thread_counts: list[int],
                     env["PE_BENCH_ALGOS"] = ",".join(algos)
                 stdout = _run_binary(binary, env=env,
                                      numactl_prefix=numactl_prefix,
-                                     phase_label=f"random-xl {label} T={t}")
+                                     phase_label=f"random-xl {label} T={t}",
+                                     trace_path=traces_dir
+                                     / f"{label}__T{t:03d}.log")
                 out.write(_retag_random_xl_rows(
                     stdout, label, emit_header=first))
                 out.flush()
@@ -235,6 +247,7 @@ def run_random(out_dir: Path, thread_counts: list[int],
     mode = "a" if append else "w"
     print(f"=== random (closure_compare_bench) → {csv_path}"
           f"{' (append)' if append else ''}", flush=True)
+    traces_dir = out_dir / "traces" / "random"
     first = not append  # skip CSV header on append so we don't duplicate it
     with open(csv_path, mode) as out:
         for t in thread_counts:
@@ -246,6 +259,7 @@ def run_random(out_dir: Path, thread_counts: list[int],
             env["PE_BENCH_TRIALS"] = str(trials)
             env["PE_BENCH_WARMUP"] = str(warmup)
             env["PARLAY_NUM_THREADS"] = str(t)
+            env["PE_TRACE"] = "1"
             if first:
                 env["PE_BENCH_HEADER"] = "1"
             if par_only:
@@ -254,7 +268,8 @@ def run_random(out_dir: Path, thread_counts: list[int],
                 env["PE_BENCH_ALGOS"] = ",".join(algos)
             stdout = _run_binary(binary, env=env,
                                  numactl_prefix=numactl_prefix,
-                                 phase_label=f"random T={t}")
+                                 phase_label=f"random T={t}",
+                                 trace_path=traces_dir / f"T{t:03d}.log")
             out.write(stdout); out.flush()
             first = False
     return csv_path
@@ -274,6 +289,7 @@ def run_synthetic(out_dir: Path, families: list[str],
     csv_path = out_dir / "synthetic.csv"
     binary = "./build/synthetic_bench"
     print(f"=== synthetic (synthetic_bench) → {csv_path}", flush=True)
+    traces_dir = out_dir / "traces" / "synthetic"
     first = True
     with open(csv_path, "w") as out:
         for fam in families:
@@ -291,6 +307,7 @@ def run_synthetic(out_dir: Path, families: list[str],
                     env["PE_BENCH_TRIALS"] = str(trials)
                     env["PE_BENCH_WARMUP"] = str(warmup)
                     env["PARLAY_NUM_THREADS"] = str(t)
+                    env["PE_TRACE"] = "1"
                     if first:
                         env["PE_BENCH_HEADER"] = "1"
                     if par_only:
@@ -299,7 +316,9 @@ def run_synthetic(out_dir: Path, families: list[str],
                         env["PE_BENCH_ALGOS"] = ",".join(algos)
                     stdout = _run_binary(
                         binary, env=env, numactl_prefix=numactl_prefix,
-                        phase_label=f"synthetic {fam} n={n} T={t}")
+                        phase_label=f"synthetic {fam} n={n} T={t}",
+                        trace_path=traces_dir
+                        / f"{fam}__n{n}__T{t:03d}.log")
                     out.write(stdout); out.flush()
                     first = False
     return csv_path
@@ -317,6 +336,7 @@ def run_cube_decomp(out_dir: Path, thread_counts: list[int],
     binary = "./build/synthetic_bench"
     print(f"=== cube_decomp (synthetic_bench cube only) → {csv_path}",
           flush=True)
+    traces_dir = out_dir / "traces" / "cube_decomp"
     first = True
     with open(csv_path, "w") as out:
         for d in CUBE_DECOMP_DS:
@@ -334,6 +354,7 @@ def run_cube_decomp(out_dir: Path, thread_counts: list[int],
                     env["PE_BENCH_TRIALS"] = str(trials)
                     env["PE_BENCH_WARMUP"] = str(warmup)
                     env["PARLAY_NUM_THREADS"] = str(t)
+                    env["PE_TRACE"] = "1"
                     if first:
                         env["PE_BENCH_HEADER"] = "1"
                     if par_only:
@@ -342,7 +363,9 @@ def run_cube_decomp(out_dir: Path, thread_counts: list[int],
                         env["PE_BENCH_ALGOS"] = ",".join(algos)
                     stdout = _run_binary(
                         binary, env=env, numactl_prefix=numactl_prefix,
-                        phase_label=f"cube_decomp d={d} k={k} T={t}")
+                        phase_label=f"cube_decomp d={d} k={k} T={t}",
+                        trace_path=traces_dir
+                        / f"d{d}__k{k}__T{t:03d}.log")
                     out.write(stdout); out.flush()
                     first = False
     return csv_path
@@ -468,15 +491,18 @@ def run_egg(out_dir: Path, thread_counts: list[int],
 
     print(f"=== egg ({len(files)} files × {len(cells)} cells) "
           f"→ {csv_path}", flush=True)
+    traces_dir = out_dir / "traces" / "egg"
 
     def run_invocation(path: str, t: int, seq_arg: str | None,
-                       env_var: str | None):
+                       env_var: str | None,
+                       trace_path: "Path | None" = None):
         cmd = list(numactl_prefix) + [binary, "--timing"]
         if seq_arg is not None:
             cmd.append(f"--sequential={seq_arg}")
         cmd.append(path)
         env = os.environ.copy()
         env["PARLAY_NUM_THREADS"] = str(t)
+        env["PE_TRACE"] = "1"
         if env_var is not None:
             env[env_var] = "1"
         t0 = time.perf_counter()
@@ -484,6 +510,10 @@ def run_egg(out_dir: Path, thread_counts: list[int],
             proc = subprocess.run(cmd, capture_output=True, text=True,
                                   env=env, timeout=timeout)
             wall = time.perf_counter() - t0
+            if trace_path is not None:
+                trace_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(trace_path, "w") as tf:
+                    tf.write(proc.stderr)
             if proc.returncode != 0:
                 return (wall, "ERROR", None,
                         proc.stderr.strip()[:200])
@@ -504,9 +534,12 @@ def run_egg(out_dir: Path, thread_counts: list[int],
             for algo, seq_arg, env_var, t in cells:
                 # Warmup; if it fails (TIMEOUT/ERROR) skip the trial loop.
                 bail = False
-                for _ in range(warmup):
+                for wi in range(warmup):
+                    wtp = (traces_dir
+                           / f"{algo}__T{t:03d}__{name[:-len('.smt2')]}"
+                           f"__warmup{wi}.log")
                     _, w_result, _, _ = run_invocation(
-                        path, t, seq_arg, env_var)
+                        path, t, seq_arg, env_var, trace_path=wtp)
                     if w_result in ("TIMEOUT", "ERROR"):
                         writer.writerow([name, expected, algo, t, -1,
                                          w_result, "", *[""] * 6,
@@ -520,8 +553,11 @@ def run_egg(out_dir: Path, thread_counts: list[int],
                 if bail:
                     continue
                 for trial in range(trials):
+                    tp = (traces_dir
+                          / f"{algo}__T{t:03d}__{name[:-len('.smt2')]}"
+                          f"__trial{trial}.log")
                     wall, result, timing, error = run_invocation(
-                        path, t, seq_arg, env_var)
+                        path, t, seq_arg, env_var, trace_path=tp)
                     row = [name, expected, algo, t, trial, result,
                            f"{wall:.6f}"]
                     row += [f"{timing[k]:.6f}" if timing else ""
@@ -575,6 +611,29 @@ def run_gates(out_dir: Path, thread_counts: list[int],
     csv_path = out_dir / "gates.csv"
     binary = "./build/gates_bench"
 
+    # Auto-init + auto-decompress only when pointed at the default
+    # submodule checkout. Custom --gates-root values are left alone so
+    # the driver never mutates a path the user supplied explicitly.
+    if not files_glob and gates_root == GATES_DEFAULT_ROOT:
+        if not os.path.isdir(gates_root):
+            print(f"Initializing submodule: {gates_root}", flush=True)
+            subprocess.run(
+                ["git", "submodule", "update", "--init", "--recursive",
+                 gates_root],
+                check=True,
+            )
+        # The submodule ships .gates.xz; decompress per-suite (in place)
+        # if any are still compressed. decompress.sh removes the .xz
+        # after success, so subsequent runs are no-ops.
+        decompress = os.path.join(gates_root, "decompress.sh")
+        need_run = [s for s in suites
+                    if os.path.isdir(os.path.join(gates_root, s))
+                    and glob.glob(os.path.join(gates_root, s,
+                                                "*.gates.xz"))]
+        if need_run and os.path.isfile(decompress):
+            print(f"Decompressing .gates.xz in: {need_run}", flush=True)
+            subprocess.run(["bash", decompress, *need_run], check=True)
+
     # Resolve input files: explicit glob wins; otherwise walk suites.
     if files_glob:
         files = sorted(glob.glob(files_glob))
@@ -592,6 +651,14 @@ def run_gates(out_dir: Path, thread_counts: list[int],
     print(f"  [gates] {len(files)} file(s) × {len(thread_counts)} thread "
           f"count(s)", flush=True)
 
+    # Per-cell PE_TRACE stderr capture, mirroring the other phases.
+    traces_dir = out_dir / "traces" / "gates"
+    traces_dir.mkdir(parents=True, exist_ok=True)
+
+    # Algo names gates_bench currently understands.
+    GATES_OK = ("nelson_simple", "nelson_topo_iter",
+                "par_close", "par_topo_iter", "par_async", "par_async_cont")
+
     first = True
     with open(csv_path, "w") as out:
         for t in thread_counts:
@@ -604,16 +671,16 @@ def run_gates(out_dir: Path, thread_counts: list[int],
                 env["PE_BENCH_TRIALS"] = str(trials)
                 env["PE_BENCH_WARMUP"] = str(warmup)
                 env["PARLAY_NUM_THREADS"] = str(t)
+                env["PE_TRACE"] = "1"
+                # Sequential algos at T>1 just duplicate the T=1 number
+                # at higher noise; skip them. Mirrors run_random /
+                # run_synthetic.
+                if t > 1:
+                    env["PE_BENCH_PAR_ONLY"] = "1"
                 if first:
                     env["PE_BENCH_HEADER"] = "1"
-                # gates_bench understands a comma-separated list of EXACT
-                # algo names: nelson_topo_iter, par_topo_iter, par_async.
-                # Only forward the subset our --algos whitelist allows.
                 if algos:
-                    gates_algos = [a for a in algos
-                                   if a in ("nelson_topo_iter",
-                                            "par_topo_iter",
-                                            "par_async")]
+                    gates_algos = [a for a in algos if a in GATES_OK]
                     if gates_algos:
                         env["PE_BENCH_ALGOS"] = ",".join(gates_algos)
                 proc = subprocess.run(cmd, capture_output=True, text=True,
@@ -623,9 +690,16 @@ def run_gates(out_dir: Path, thread_counts: list[int],
                     sys.stderr.write(proc.stderr)
                     raise RuntimeError(
                         f"gates_bench failed at T={t} on {fname}")
-                # Mirror the bench's [gates_bench] progress / sizing
-                # line and write the trial rows out immediately so a
-                # killed run leaves a checkpointed CSV.
+                # Forensic trace: stash stderr (carries [gates_bench]
+                # sizing line + PE_TRACE per-round detail) per cell so a
+                # killed driver doesn't lose it.
+                stem = fname[:-len(".gates")] if fname.endswith(".gates") \
+                    else fname
+                trace_path = traces_dir / f"T{t:03d}__{stem}.log"
+                with open(trace_path, "w") as tf:
+                    tf.write(proc.stderr)
+                # Also tee the bench's sizing line to the driver's stderr
+                # so the operator sees progress.
                 if proc.stderr:
                     sys.stderr.write(proc.stderr)
                 out.write(proc.stdout); out.flush()
