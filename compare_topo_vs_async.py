@@ -786,9 +786,16 @@ def run_gates(out_dir: Path, thread_counts: list[int],
     return csv_path
 
 
+def _geomean(vs: list[float]) -> float | None:
+    # statistics.geometric_mean raises on <=0 values; filter and return
+    # None if nothing positive remains so callers can show "-".
+    pos = [v for v in vs if v > 0]
+    return statistics.geometric_mean(pos) if pos else None
+
+
 def summarize_gates(csv_path: Path):
     """Custom summary for the gates phase: pairs par_topo_iter vs
-    par_async per (file, threads), prints both medians + ratio + each
+    par_async per (file, threads), prints both geomeans + ratio + each
     algorithm's strong-scaling speedup against its own T=1.
     """
     rows = list(csvmod.DictReader(open(csv_path)))
@@ -805,10 +812,11 @@ def summarize_gates(csv_path: Path):
         key = (r["file"], int(r["parlay_threads"]), r["algorithm"])
         buckets.setdefault(key, []).append(ms)
         file_meta[r["file"]] = (int(r["n_gates"]), int(r["total_classes"]))
-    medians = {k: statistics.median(v) for k, v in buckets.items() if v}
+    geomeans = {k: g for k, v in buckets.items()
+                if (g := _geomean(v)) is not None}
 
-    files = sorted({k[0] for k in medians})
-    threads = sorted({k[1] for k in medians})
+    files = sorted({k[0] for k in geomeans})
+    threads = sorted({k[1] for k in geomeans})
 
     print()
     print(f"{'file':<32} {'thr':>4} | {'topo_ms':>10} {'async_ms':>10}"
@@ -817,11 +825,11 @@ def summarize_gates(csv_path: Path):
     print("-" * 120)
     for f in files:
         gates, total = file_meta.get(f, (0, 0))
-        topo_t1 = medians.get((f, threads[0], "par_topo_iter"))
-        async_t1 = medians.get((f, threads[0], "par_async"))
+        topo_t1 = geomeans.get((f, threads[0], "par_topo_iter"))
+        async_t1 = geomeans.get((f, threads[0], "par_async"))
         for t in threads:
-            tm = medians.get((f, t, "par_topo_iter"))
-            am = medians.get((f, t, "par_async"))
+            tm = geomeans.get((f, t, "par_topo_iter"))
+            am = geomeans.get((f, t, "par_async"))
             tm_s = f"{tm:>10.2f}" if tm is not None else f"{'-':>10}"
             am_s = f"{am:>10.2f}" if am is not None else f"{'-':>10}"
             ratio = (f"{tm/am:>9.2f}x"
@@ -860,10 +868,11 @@ def summarize(csv_path: Path, group_keys: list[str]):
         except (KeyError, ValueError):
             continue
         buckets.setdefault((wl, t, algo), []).append(ms)
-    medians = {k: statistics.median(v) for k, v in buckets.items() if v}
+    geomeans = {k: g for k, v in buckets.items()
+                if (g := _geomean(v)) is not None}
 
-    workloads = sorted({wl for (wl, _, _) in medians})
-    threads = sorted({t for (_, t, _) in medians})
+    workloads = sorted({wl for (wl, _, _) in geomeans})
+    threads = sorted({t for (_, t, _) in geomeans})
     if not workloads:
         return
 
@@ -880,11 +889,11 @@ def summarize(csv_path: Path, group_keys: list[str]):
                + len(" | ") + 12 + 1 + 13)
     print("-" * total_w)
 
-    # Sequential algos only run at T=1; cache that median per workload.
+    # Sequential algos only run at T=1; cache that geomean per workload.
     seq_at_t1: dict[tuple, dict[str, float]] = {}
     for wl in workloads:
-        seq_at_t1[wl] = {a: medians[(wl, 1, a)]
-                         for a in SEQ_ALGOS if (wl, 1, a) in medians}
+        seq_at_t1[wl] = {a: geomeans[(wl, 1, a)]
+                         for a in SEQ_ALGOS if (wl, 1, a) in geomeans}
 
     for wl in workloads:
         for t in threads:
@@ -895,7 +904,7 @@ def summarize(csv_path: Path, group_keys: list[str]):
                     # Display the T=1 value on every row for context.
                     v = seq_at_t1[wl].get(a)
                 else:
-                    v = medians.get((wl, t, a))
+                    v = geomeans.get((wl, t, a))
                 vals[a] = v
                 cells.append(f"{v:>{col_w[a]}.2f}" if v is not None
                              else f"{'-':>{col_w[a]}}")
@@ -1003,220 +1012,221 @@ def main():
     args = ap.parse_args()
 
     try:
-        thread_counts = sorted(set(int(t) for t in
-                                   args.threads_sweep.split(",") if t))
-    except ValueError:
-        sys.exit("--threads-sweep expects comma-separated integers")
-    if not thread_counts:
-        sys.exit("--threads-sweep empty")
-    if 1 not in thread_counts:
-        print("WARN: T=1 not in --threads-sweep; sequential algos will not "
-              "be measured. Add 1 if you want a baseline.", file=sys.stderr)
-
-    if args.families:
-        families = [f.strip() for f in args.families.split(",") if f.strip()]
-        unknown = [f for f in families if f not in DEFAULT_FAMILY_NS]
-        if unknown:
-            sys.exit(f"unknown families: {','.join(unknown)}")
-    else:
-        families = list(DEFAULT_FAMILY_NS)
-
-    override_ns = None
-    if args.ns:
         try:
-            override_ns = [int(x) for x in args.ns.split(",") if x.strip()]
+            thread_counts = sorted(set(int(t) for t in
+                                       args.threads_sweep.split(",") if t))
         except ValueError:
-            sys.exit("--ns expects comma-separated integers")
+            sys.exit("--threads-sweep expects comma-separated integers")
+        if not thread_counts:
+            sys.exit("--threads-sweep empty")
+        if 1 not in thread_counts:
+            print("WARN: T=1 not in --threads-sweep; sequential algos will not "
+                  "be measured. Add 1 if you want a baseline.", file=sys.stderr)
 
-    valid_algos = {row[0] for row in EGG_ALGOS}
-    algos: list[str] | None = None
-    if args.algos:
-        if args.algos.strip() == "all":
-            # Sentinel: run every recognized algo (no filter passed to
-            # the binaries, no filter on the egg dispatch loop).
-            algos = None
-        else:
-            algos = [a.strip() for a in args.algos.split(",") if a.strip()]
-            unknown = [a for a in algos if a not in valid_algos]
+        if args.families:
+            families = [f.strip() for f in args.families.split(",") if f.strip()]
+            unknown = [f for f in families if f not in DEFAULT_FAMILY_NS]
             if unknown:
-                sys.exit(f"unknown algos: {','.join(unknown)}. "
-                         f"valid: {sorted(valid_algos)}")
+                sys.exit(f"unknown families: {','.join(unknown)}")
+        else:
+            families = list(DEFAULT_FAMILY_NS)
 
-    valid_random_modes = {"default", "xl"}
-    random_modes = [m.strip() for m in args.random_modes.split(",")
-                    if m.strip()]
-    unknown = [m for m in random_modes if m not in valid_random_modes]
-    if unknown:
-        sys.exit(f"unknown random modes: {','.join(unknown)}. "
-                 f"valid: {sorted(valid_random_modes)}")
-    if not random_modes:
-        sys.exit("--random-modes is empty")
-    # Preserve user-given order in case it matters (it doesn't downstream;
-    # plotting groups by workload). Dedup while preserving first occurrence.
-    seen: set[str] = set()
-    random_modes = [m for m in random_modes
-                    if not (m in seen or seen.add(m))]
+        override_ns = None
+        if args.ns:
+            try:
+                override_ns = [int(x) for x in args.ns.split(",") if x.strip()]
+            except ValueError:
+                sys.exit("--ns expects comma-separated integers")
 
-    xl_labels = None
-    if args.xl_labels:
-        xl_labels = [s.strip() for s in args.xl_labels.split(",")
-                     if s.strip()]
-        if "xl" not in random_modes:
-            print("WARN: --xl-labels given but 'xl' not in --random-modes; "
-                  "ignoring.", file=sys.stderr)
-            xl_labels = None
+        valid_algos = {row[0] for row in EGG_ALGOS}
+        algos: list[str] | None = None
+        if args.algos:
+            if args.algos.strip() == "all":
+                # Sentinel: run every recognized algo (no filter passed to
+                # the binaries, no filter on the egg dispatch loop).
+                algos = None
+            else:
+                algos = [a.strip() for a in args.algos.split(",") if a.strip()]
+                unknown = [a for a in algos if a not in valid_algos]
+                if unknown:
+                    sys.exit(f"unknown algos: {','.join(unknown)}. "
+                             f"valid: {sorted(valid_algos)}")
 
-    skip = set(args.skip)
-    # custom_smt phase: comma-separated list of dirs. Each dir runs
-    # through run_egg (phase_name=basename), producing one CSV per dir.
-    # Empty list / unset / explicit skip → phase is a no-op.
-    custom_smt_dirs: list[str] = []
-    if args.custom_smt and "custom_smt" not in skip:
-        custom_smt_dirs = [d.strip() for d in args.custom_smt.split(",")
-                           if d.strip()]
-        missing = [d for d in custom_smt_dirs if not os.path.isdir(d)]
-        if missing:
-            sys.exit(f"--custom-smt: not a directory: {missing}")
+        valid_random_modes = {"default", "xl"}
+        random_modes = [m.strip() for m in args.random_modes.split(",")
+                        if m.strip()]
+        unknown = [m for m in random_modes if m not in valid_random_modes]
+        if unknown:
+            sys.exit(f"unknown random modes: {','.join(unknown)}. "
+                     f"valid: {sorted(valid_random_modes)}")
+        if not random_modes:
+            sys.exit("--random-modes is empty")
+        # Preserve user-given order in case it matters (it doesn't downstream;
+        # plotting groups by workload). Dedup while preserving first occurrence.
+        seen: set[str] = set()
+        random_modes = [m for m in random_modes
+                        if not (m in seen or seen.add(m))]
 
-    targets: list[str] = []
-    if "random" not in skip:
-        targets.append("closure_compare_bench")
-    if ("synthetic" not in skip) or ("cube_decomp" not in skip):
-        targets.append("synthetic_bench")
-    # egraph-cc is the binary for both the egg phase and the custom_smt
-    # phase; build it if either will run.
-    if "egg" not in skip or custom_smt_dirs:
-        targets.append("egraph-cc")
-    if "gates" not in skip:
-        targets.append("gates_bench")
-    if not targets:
-        sys.exit("nothing to do (everything skipped)")
-    cmake_build(targets)
+        xl_labels = None
+        if args.xl_labels:
+            xl_labels = [s.strip() for s in args.xl_labels.split(",")
+                         if s.strip()]
+            if "xl" not in random_modes:
+                print("WARN: --xl-labels given but 'xl' not in --random-modes; "
+                      "ignoring.", file=sys.stderr)
+                xl_labels = None
 
-    numactl_prefix = _numactl_prefix(args.no_numactl)
+        skip = set(args.skip)
+        # custom_smt phase: comma-separated list of dirs. Each dir runs
+        # through run_egg (phase_name=basename), producing one CSV per dir.
+        # Empty list / unset / explicit skip → phase is a no-op.
+        custom_smt_dirs: list[str] = []
+        if args.custom_smt and "custom_smt" not in skip:
+            custom_smt_dirs = [d.strip() for d in args.custom_smt.split(",")
+                               if d.strip()]
+            missing = [d for d in custom_smt_dirs if not os.path.isdir(d)]
+            if missing:
+                sys.exit(f"--custom-smt: not a directory: {missing}")
 
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = (Path(args.out) if args.out
-               else Path("runs") / f"topo_vs_async_{ts}")
-    out_dir.mkdir(parents=True, exist_ok=True)
+        targets: list[str] = []
+        if "random" not in skip:
+            targets.append("closure_compare_bench")
+        if ("synthetic" not in skip) or ("cube_decomp" not in skip):
+            targets.append("synthetic_bench")
+        # egraph-cc is the binary for both the egg phase and the custom_smt
+        # phase; build it if either will run.
+        if "egg" not in skip or custom_smt_dirs:
+            targets.append("egraph-cc")
+        if "gates" not in skip:
+            targets.append("gates_bench")
+        if not targets:
+            sys.exit("nothing to do (everything skipped)")
+        cmake_build(targets)
 
-    print(f"Output:        {out_dir}")
-    print(f"Phases:        {[p for p in ('random','synthetic','cube_decomp','egg') if p not in skip]}")
-    if custom_smt_dirs:
-        print(f"Custom SMT:    {custom_smt_dirs}")
-    if "random" not in skip:
-        rm_label = ",".join(random_modes)
-        if "xl" in random_modes:
-            rm_label += f" (xl={xl_labels or list(RANDOM_XL_LADDER)})"
-        print(f"Random modes:  {rm_label}")
-    print(f"Threads:       {thread_counts}")
-    print(f"Families:      {families}")
-    if override_ns:
-        print(f"Override ns:   {override_ns}")
-    print(f"Warmup/trials: {args.warmup}/{args.trials}")
-    if algos:
-        print(f"Algos:         {algos}  (PE_BENCH_ALGOS filter active)")
-    else:
-        print(f"Algos shown:   {ALGOS_OF_INTEREST}")
-        print(f"  (sequential, T=1 only): {SEQ_ALGOS}")
-    print(f"numactl:       "
-          f"{' '.join(numactl_prefix) if numactl_prefix else 'none'}")
-    print()
+        numactl_prefix = _numactl_prefix(args.no_numactl)
 
-    csv_paths: list[tuple[Path, list[str]]] = []
-    if "random" not in skip:
-        # Run each requested mode; second/third call appends so they all
-        # land in one random.csv that downstream plotters can consume.
-        first = True
-        last_p = None
-        for m in random_modes:
-            if m == "default":
-                last_p = run_random(out_dir, thread_counts,
-                                    warmup=args.warmup, trials=args.trials,
-                                    algos=algos,
-                                    numactl_prefix=numactl_prefix,
-                                    append=not first)
-            else:  # "xl"
-                last_p = run_random_xl(out_dir, thread_counts,
-                                       warmup=args.warmup,
-                                       trials=args.trials,
-                                       labels=xl_labels, algos=algos,
-                                       numactl_prefix=numactl_prefix,
-                                       append=not first)
-            first = False
-        if last_p is not None:
-            csv_paths.append((last_p, ["workload"]))
-    if "synthetic" not in skip:
-        p = run_synthetic(out_dir, families, DEFAULT_FAMILY_NS, override_ns,
-                          thread_counts,
-                          warmup=args.warmup, trials=args.trials,
-                          algos=algos,
-                          numactl_prefix=numactl_prefix)
-        csv_paths.append((p, ["family", "n"]))
-    if "cube_decomp" not in skip:
-        p = run_cube_decomp(out_dir, thread_counts,
-                            warmup=args.warmup, trials=args.trials,
-                            algos=algos,
-                            numactl_prefix=numactl_prefix)
-        csv_paths.append((p, ["family", "n", "d"]))
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = (Path(args.out) if args.out
+                   else Path("runs") / f"topo_vs_async_{ts}")
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-    if "egg" not in skip:
-        p = run_egg(out_dir, thread_counts,
-                    egg_dir=args.egg_dir, pattern=args.egg_pattern,
+        print(f"Output:        {out_dir}")
+        print(f"Phases:        {[p for p in ('random','synthetic','cube_decomp','egg','gates') if p not in skip]}")
+        if custom_smt_dirs:
+            print(f"Custom SMT:    {custom_smt_dirs}")
+        if "random" not in skip:
+            rm_label = ",".join(random_modes)
+            if "xl" in random_modes:
+                rm_label += f" (xl={xl_labels or list(RANDOM_XL_LADDER)})"
+            print(f"Random modes:  {rm_label}")
+        print(f"Threads:       {thread_counts}")
+        print(f"Families:      {families}")
+        if override_ns:
+            print(f"Override ns:   {override_ns}")
+        print(f"Warmup/trials: {args.warmup}/{args.trials}")
+        if algos:
+            print(f"Algos:         {algos}  (PE_BENCH_ALGOS filter active)")
+        else:
+            print(f"Algos shown:   {ALGOS_OF_INTEREST}")
+            print(f"  (sequential, T=1 only): {SEQ_ALGOS}")
+        print(f"numactl:       "
+              f"{' '.join(numactl_prefix) if numactl_prefix else 'none'}")
+        print()
+
+        csv_paths: list[tuple[Path, list[str]]] = []
+        if "random" not in skip:
+            # Run each requested mode; second/third call appends so they all
+            # land in one random.csv that downstream plotters can consume.
+            first = True
+            last_p = None
+            for m in random_modes:
+                if m == "default":
+                    last_p = run_random(out_dir, thread_counts,
+                                        warmup=args.warmup, trials=args.trials,
+                                        algos=algos,
+                                        numactl_prefix=numactl_prefix,
+                                        append=not first)
+                else:  # "xl"
+                    last_p = run_random_xl(out_dir, thread_counts,
+                                           warmup=args.warmup,
+                                           trials=args.trials,
+                                           labels=xl_labels, algos=algos,
+                                           numactl_prefix=numactl_prefix,
+                                           append=not first)
+                first = False
+            if last_p is not None:
+                csv_paths.append((last_p, ["workload"]))
+        if "synthetic" not in skip:
+            p = run_synthetic(out_dir, families, DEFAULT_FAMILY_NS, override_ns,
+                              thread_counts,
+                              warmup=args.warmup, trials=args.trials,
+                              algos=algos,
+                              numactl_prefix=numactl_prefix)
+            csv_paths.append((p, ["family", "n"]))
+        if "cube_decomp" not in skip:
+            p = run_cube_decomp(out_dir, thread_counts,
+                                warmup=args.warmup, trials=args.trials,
+                                algos=algos,
+                                numactl_prefix=numactl_prefix)
+            csv_paths.append((p, ["family", "n", "d"]))
+
+        if "egg" not in skip:
+            p = run_egg(out_dir, thread_counts,
+                        egg_dir=args.egg_dir, pattern=args.egg_pattern,
+                        timeout=args.egg_timeout,
+                        warmup=args.warmup, trials=args.trials,
+                        algos=algos,
+                        numactl_prefix=numactl_prefix)
+            # egg.csv has a different schema (file/algorithm/threads, no
+            # family/n/wallclock_ms) — `summarize` won't grok it. Skip in the
+            # per-phase summary; downstream plotters handle it directly.
+
+        # custom_smt: one run_egg invocation per user-supplied dir. Each
+        # uses the dir's basename as the phase_name (drives CSV filename,
+        # log prefix, traces subdir). Refuses "egg" as a basename to keep
+        # egg.csv reserved for the cc-benchmarks phase.
+        seen_phase_names: set[str] = set()
+        for d in custom_smt_dirs:
+            phase = os.path.basename(os.path.normpath(d))
+            if phase == "egg":
+                sys.exit(f"--custom-smt: basename 'egg' collides with the "
+                         f"built-in egg phase: {d}")
+            if phase in seen_phase_names:
+                sys.exit(f"--custom-smt: duplicate phase name '{phase}' "
+                         f"(two dirs with the same basename: {d})")
+            seen_phase_names.add(phase)
+            run_egg(out_dir, thread_counts,
+                    egg_dir=d, pattern=args.egg_pattern,
                     timeout=args.egg_timeout,
                     warmup=args.warmup, trials=args.trials,
                     algos=algos,
-                    numactl_prefix=numactl_prefix)
-        # egg.csv has a different schema (file/algorithm/threads, no
-        # family/n/wallclock_ms) — `summarize` won't grok it. Skip in the
-        # per-phase summary; downstream plotters handle it directly.
+                    numactl_prefix=numactl_prefix,
+                    phase_name=phase)
 
-    # custom_smt: one run_egg invocation per user-supplied dir. Each
-    # uses the dir's basename as the phase_name (drives CSV filename,
-    # log prefix, traces subdir). Refuses "egg" as a basename to keep
-    # egg.csv reserved for the cc-benchmarks phase.
-    seen_phase_names: set[str] = set()
-    for d in custom_smt_dirs:
-        phase = os.path.basename(os.path.normpath(d))
-        if phase == "egg":
-            sys.exit(f"--custom-smt: basename 'egg' collides with the "
-                     f"built-in egg phase: {d}")
-        if phase in seen_phase_names:
-            sys.exit(f"--custom-smt: duplicate phase name '{phase}' "
-                     f"(two dirs with the same basename: {d})")
-        seen_phase_names.add(phase)
-        run_egg(out_dir, thread_counts,
-                egg_dir=d, pattern=args.egg_pattern,
-                timeout=args.egg_timeout,
+        gates_csv: Path | None = None
+        if "gates" not in skip:
+            gates_csv = run_gates(
+                out_dir, thread_counts,
+                gates_root=args.gates_root,
+                suites=[s.strip() for s in args.gates_suites.split(",") if s.strip()],
+                files_glob=args.gates_files,
                 warmup=args.warmup, trials=args.trials,
                 algos=algos,
-                numactl_prefix=numactl_prefix,
-                phase_name=phase)
+                numactl_prefix=numactl_prefix)
 
-    gates_csv: Path | None = None
-    if "gates" not in skip:
-        gates_csv = run_gates(
-            out_dir, thread_counts,
-            gates_root=args.gates_root,
-            suites=[s.strip() for s in args.gates_suites.split(",") if s.strip()],
-            files_glob=args.gates_files,
-            warmup=args.warmup, trials=args.trials,
-            algos=algos,
-            numactl_prefix=numactl_prefix)
+        for p, keys in csv_paths:
+            summarize(p, keys)
+        if gates_csv is not None and gates_csv.exists():
+            summarize_gates(gates_csv)
 
-    for p, keys in csv_paths:
-        summarize(p, keys)
-    if gates_csv is not None and gates_csv.exists():
-        summarize_gates(gates_csv)
-
-    print()
-    print(f"Done. CSVs under: {out_dir}")
-
-    if args.shutdown_after:
-        print("--shutdown-after set; running `shutdown -h now`", flush=True)
-        rc = subprocess.run(["sudo", "shutdown", "-h", "now"]).returncode
-        if rc != 0:
-            sys.exit(f"shutdown failed with exit code {rc}")
+        print()
+        print(f"Done. CSVs under: {out_dir}")
+    finally:
+        if args.shutdown_after:
+            print("--shutdown-after set; running `shutdown -h now`", flush=True)
+            rc = subprocess.run(["sudo", "shutdown", "-h", "now"]).returncode
+            if rc != 0:
+                sys.exit(f"shutdown failed with exit code {rc}")
 
 
 if __name__ == "__main__":
