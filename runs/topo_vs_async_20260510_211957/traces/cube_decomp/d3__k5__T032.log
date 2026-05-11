@@ -1,0 +1,16 @@
+[synthetic_bench] cube n=5 d=3 classes=444 merges=5 ...
+[pe] round=  0 work=       10 frontier=      750 next=      125 consolidate=  0.552ms frontier=  0.009ms semisort=  0.317ms (keyed= 0.119ms group_by=  0.049ms per_group= 0.092ms)
+[pe] round=  1 work=      125 frontier=      250 next=       53 consolidate=  1.523ms frontier=  0.017ms semisort=  0.093ms (keyed= 0.002ms group_by=  0.027ms per_group= 0.035ms)
+[pe] round=  2 work=       53 frontier=      106 next=       26 consolidate=  0.034ms frontier=  0.007ms semisort=  0.042ms (keyed= 0.001ms group_by=  0.008ms per_group= 0.014ms)
+[pe] round=  3 work=       26 frontier=       52 next=        9 consolidate=  0.026ms frontier=  0.005ms semisort=  0.017ms (keyed= 0.001ms group_by=  0.004ms per_group= 0.006ms)
+[pe] round=  4 work=        9 frontier=       18 next=        3 consolidate=  0.013ms frontier=  0.003ms semisort=  0.006ms (keyed= 0.000ms group_by=  0.001ms per_group= 0.002ms)
+[pe] round=  5 work=        3 frontier=        6 next=        1 consolidate=  0.005ms frontier=  0.001ms semisort=  0.003ms (keyed= 0.000ms group_by=  0.001ms per_group= 0.001ms)
+[pe] round=  6 work=        1 frontier=        0 next=        0 consolidate=  0.002ms frontier=  0.001ms semisort=  0.000ms (break)
+[pe-async] round=  0 R=2 dirty=      250 runs=      125 filter=  0.019ms semisort=  0.128ms
+[pe-async] round=  1 R=3 dirty=      142 runs=       89 filter=  0.012ms semisort=  0.025ms
+[pe-async] round=  2 R=4 dirty=       54 runs=       28 filter=  0.010ms semisort=  0.009ms
+[pe-async] round=  3 R=5 dirty=       18 runs=        9 filter=  0.007ms semisort=  0.005ms
+[pe-async] round=  4 R=6 dirty=        6 runs=        3 filter=  0.007ms semisort=  0.003ms
+[pe-async] round=  5 R=7 dirty=        2 runs=        1 filter=  0.007ms semisort=  0.003ms
+[pe-async] round=  6 R=8 dirty=        0 filter=  0.007ms (clean break)
+[pe-async-cont] scans=7 empty_scans=1 groups_pushed=255 groups_consumed=255 unions=217  total=  0.177ms

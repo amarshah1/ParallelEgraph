@@ -1,0 +1,12 @@
+[gates_bench] /ocean/projects/cis230065p/ashah12/parallel_benchmarks/miter-cc-benchmarks/iwls22/h5m-test02-xits.gates ...
+  literals=1336652  NOT=613910  gates=1128078  total_classes=3078640  read=0.017s parse=0.020s build=0.135s
+[pe] round=  0 work=  3068606 frontier=  3754811 next=     2104 consolidate= 91.057ms frontier=  9.850ms semisort=117.696ms (keyed= 5.637ms group_by= 66.415ms per_group= 7.249ms)
+[pe] round=  1 work=     2104 frontier=    29475 next=      280 consolidate=  0.613ms frontier=  0.106ms semisort=  1.234ms (keyed= 0.028ms group_by=  0.483ms per_group= 0.151ms)
+[pe] round=  2 work=      280 frontier=     2912 next=      224 consolidate=  0.108ms frontier=  0.030ms semisort=  0.634ms (keyed= 0.013ms group_by=  0.428ms per_group= 0.070ms)
+[pe] round=  3 work=      224 frontier=     7280 next=        0 consolidate=  0.092ms frontier=  0.036ms semisort=  1.344ms (keyed= 0.020ms group_by=  1.051ms per_group= 0.088ms)
+[pe-async] round=  0 R=2 dirty=  1727960 runs=  1725856 filter=  4.345ms semisort=  8.975ms
+[pe-async] round=  1 R=3 dirty=    29347 runs=    28051 filter=  4.673ms semisort=  1.573ms
+[pe-async] round=  2 R=4 dirty=     2912 runs=     2576 filter=  5.313ms semisort=  0.203ms
+[pe-async] round=  3 R=5 dirty=     7280 runs=     7168 filter=  4.997ms semisort=  0.466ms
+[pe-async] round=  4 R=6 dirty=        0 filter=  5.061ms (clean break)
+[pe-async-cont] scans=5 empty_scans=1 groups_pushed=1763651 groups_consumed=1763651 unions=2552  total= 35.229ms
