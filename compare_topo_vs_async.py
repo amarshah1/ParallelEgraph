@@ -499,10 +499,22 @@ def run_egg(out_dir: Path, thread_counts: list[int],
             *, egg_dir: str, pattern: str, timeout: float,
             warmup: int, trials: int,
             algos: list[str] | None,
-            numactl_prefix: list[str]):
-    csv_path = out_dir / "egg.csv"
+            numactl_prefix: list[str],
+            phase_name: str = "egg"):
+    """Run egraph-cc on every .smt2 in `egg_dir`.
+
+    phase_name controls:
+      * CSV filename:        <out_dir>/<phase_name>.csv
+      * Trace subdir:        <out_dir>/traces/<phase_name>/
+      * Log prefix:          [<phase_name>] in stderr
+      * cc-benchmarks auto-init: only runs for phase_name == "egg"
+        (the other phases point at user-supplied dirs that the driver
+        must not mutate).
+    """
+    csv_path = out_dir / f"{phase_name}.csv"
     binary = "./build/egraph-cc"
-    _ensure_cc_benchmarks(egg_dir)
+    if phase_name == "egg":
+        _ensure_cc_benchmarks(egg_dir)
 
     files = sorted(glob.glob(os.path.join(egg_dir, "*.smt2")))
     if pattern != "*":
@@ -510,7 +522,8 @@ def run_egg(out_dir: Path, thread_counts: list[int],
         files = [f for f in files
                  if fnmatch.fnmatch(os.path.basename(f), pattern)]
     if not files:
-        print(f"  [egg] no .smt2 files matched in {egg_dir}", flush=True)
+        print(f"  [{phase_name}] no .smt2 files matched in {egg_dir}",
+              flush=True)
         return None
 
     egg_algos = EGG_ALGOS
@@ -519,8 +532,9 @@ def run_egg(out_dir: Path, thread_counts: list[int],
         egg_algos = [row for row in EGG_ALGOS if row[0] in wanted]
         missing = wanted - {row[0] for row in EGG_ALGOS}
         if missing:
-            print(f"  [egg] WARN: --algos contains {sorted(missing)} which "
-                  "egraph-cc does not support; ignoring.", flush=True)
+            print(f"  [{phase_name}] WARN: --algos contains "
+                  f"{sorted(missing)} which egraph-cc does not support; "
+                  "ignoring.", flush=True)
 
     # (algo, T) cells: skip sequential algos when T>1; skip
     # par_async_cont at T=1 (deadlocks under PARLAY_NUM_THREADS=1, see
@@ -534,9 +548,9 @@ def run_egg(out_dir: Path, thread_counts: list[int],
                 continue
             cells.append((algo, seq_arg, env_var, t))
 
-    print(f"=== egg ({len(files)} files × {len(cells)} cells) "
+    print(f"=== {phase_name} ({len(files)} files × {len(cells)} cells) "
           f"→ {csv_path}", flush=True)
-    traces_dir = out_dir / "traces" / "egg"
+    traces_dir = out_dir / "traces" / phase_name
 
     def run_invocation(path: str, t: int, seq_arg: str | None,
                        env_var: str | None,
@@ -590,7 +604,7 @@ def run_egg(out_dir: Path, thread_counts: list[int],
                                          w_result, "", *[""] * 6,
                                          "warmup failed"])
                         f.flush()
-                        print(f"  [egg] {name} algo={algo} T={t} "
+                        print(f"  [{phase_name}] {name} algo={algo} T={t} "
                               f"warmup={w_result} (skipping trials)",
                               flush=True)
                         bail = True
@@ -612,9 +626,9 @@ def run_egg(out_dir: Path, thread_counts: list[int],
                     f.flush()
                     close_s = (f"{timing['close']:.4f}s"
                                if timing else "-")
-                    print(f"  [egg] {name} algo={algo} T={t} trial={trial} "
-                          f"{result:<8} close={close_s} wall={wall:.2f}s",
-                          flush=True)
+                    print(f"  [{phase_name}] {name} algo={algo} T={t} "
+                          f"trial={trial} {result:<8} close={close_s} "
+                          f"wall={wall:.2f}s", flush=True)
     return csv_path
 
 
@@ -918,7 +932,7 @@ def main():
                          "selected family (default: per-family ranges)")
     ap.add_argument("--skip", action="append", default=[],
                     choices=["random", "synthetic", "cube_decomp", "egg",
-                             "gates"],
+                             "gates", "custom_smt"],
                     help="skip a phase; repeatable")
     ap.add_argument("--algos",
                     default="par_async,par_topo_iter,nelson_simple",
@@ -949,6 +963,14 @@ def main():
                     help="basename glob filter for egg files (default: '*')")
     ap.add_argument("--egg-timeout", type=float, default=120.0,
                     help="per-invocation wall budget for egg (default: 120s)")
+    ap.add_argument("--custom-smt", default=None,
+                    help="comma-separated list of directories of .smt2 "
+                         "files to run egraph-cc on (the custom_smt phase). "
+                         "Each directory produces its own CSV named after "
+                         "its basename, e.g. smt_benchmarks/ → "
+                         "smt_benchmarks.csv. Inherits --algos, "
+                         "--egg-pattern, --egg-timeout from the egg phase. "
+                         "Skipped unless this flag is set.")
     ap.add_argument("--gates-root", default=GATES_DEFAULT_ROOT,
                     help=f"miter-cc-benchmarks root for the gates phase "
                          f"(default: {GATES_DEFAULT_ROOT})")
@@ -1033,12 +1055,25 @@ def main():
             xl_labels = None
 
     skip = set(args.skip)
+    # custom_smt phase: comma-separated list of dirs. Each dir runs
+    # through run_egg (phase_name=basename), producing one CSV per dir.
+    # Empty list / unset / explicit skip → phase is a no-op.
+    custom_smt_dirs: list[str] = []
+    if args.custom_smt and "custom_smt" not in skip:
+        custom_smt_dirs = [d.strip() for d in args.custom_smt.split(",")
+                           if d.strip()]
+        missing = [d for d in custom_smt_dirs if not os.path.isdir(d)]
+        if missing:
+            sys.exit(f"--custom-smt: not a directory: {missing}")
+
     targets: list[str] = []
     if "random" not in skip:
         targets.append("closure_compare_bench")
     if ("synthetic" not in skip) or ("cube_decomp" not in skip):
         targets.append("synthetic_bench")
-    if "egg" not in skip:
+    # egraph-cc is the binary for both the egg phase and the custom_smt
+    # phase; build it if either will run.
+    if "egg" not in skip or custom_smt_dirs:
         targets.append("egraph-cc")
     if "gates" not in skip:
         targets.append("gates_bench")
@@ -1055,6 +1090,8 @@ def main():
 
     print(f"Output:        {out_dir}")
     print(f"Phases:        {[p for p in ('random','synthetic','cube_decomp','egg') if p not in skip]}")
+    if custom_smt_dirs:
+        print(f"Custom SMT:    {custom_smt_dirs}")
     if "random" not in skip:
         rm_label = ",".join(random_modes)
         if "xl" in random_modes:
@@ -1121,6 +1158,28 @@ def main():
         # egg.csv has a different schema (file/algorithm/threads, no
         # family/n/wallclock_ms) — `summarize` won't grok it. Skip in the
         # per-phase summary; downstream plotters handle it directly.
+
+    # custom_smt: one run_egg invocation per user-supplied dir. Each
+    # uses the dir's basename as the phase_name (drives CSV filename,
+    # log prefix, traces subdir). Refuses "egg" as a basename to keep
+    # egg.csv reserved for the cc-benchmarks phase.
+    seen_phase_names: set[str] = set()
+    for d in custom_smt_dirs:
+        phase = os.path.basename(os.path.normpath(d))
+        if phase == "egg":
+            sys.exit(f"--custom-smt: basename 'egg' collides with the "
+                     f"built-in egg phase: {d}")
+        if phase in seen_phase_names:
+            sys.exit(f"--custom-smt: duplicate phase name '{phase}' "
+                     f"(two dirs with the same basename: {d})")
+        seen_phase_names.add(phase)
+        run_egg(out_dir, thread_counts,
+                egg_dir=d, pattern=args.egg_pattern,
+                timeout=args.egg_timeout,
+                warmup=args.warmup, trials=args.trials,
+                algos=algos,
+                numactl_prefix=numactl_prefix,
+                phase_name=phase)
 
     gates_csv: Path | None = None
     if "gates" not in skip:

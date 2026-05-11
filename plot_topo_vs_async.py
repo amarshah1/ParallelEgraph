@@ -232,10 +232,15 @@ def plot_synth(med, out_path: Path):
     _save(fig, out_path)
 
 
-def plot_egg(med, out_path: Path, top_n: int):
+def plot_egg(med, out_path: Path, top_n: int, phase_label: str = "egg"):
     """Egg uses close_s as the time metric. Pick the top-N files by
     par_async closure time at the largest T (those are the ones with
-    enough work to scale; cheap files just measure overhead)."""
+    enough work to scale; cheap files just measure overhead).
+
+    `phase_label` shows up in the title; pass the CSV stem so
+    custom_smt phases (e.g. smt_benchmarks.csv) get a self-identifying
+    plot.
+    """
     threads = sorted({t for (_, t, _) in med})
     if not threads:
         print(f"  skip {out_path.name}: no rows")
@@ -295,7 +300,7 @@ def plot_egg(med, out_path: Path, top_n: int):
     ax.set_xticks(threads); ax.set_xticklabels([str(t) for t in threads])
     ax.set_xlabel("threads")
     ax.set_ylabel(f"speedup ({BASELINE_TAG} / {PAR_ALGO})  [close_s]")
-    ax.set_title(f"egg — top-{top_n} longest-close files, "
+    ax.set_title(f"{phase_label} — top-{top_n} longest-close files, "
                  f"{PAR_ALGO} vs sequential {BASELINE_TAG}")
     ax.grid(True, which="both", alpha=0.3)
     ax.legend(fontsize=7, loc="best", ncol=2)
@@ -566,6 +571,23 @@ def main():
                      args.top_n)
         else:
             print("  no usable rows in egg.csv")
+
+    # custom_smt phases: any other CSV in the run dir produced by
+    # run_egg (same schema as egg.csv). Phase name = CSV stem.
+    handled = {"synthetic.csv", "random.csv", "cube_decomp.csv",
+               "egg.csv", "gates.csv"}
+    for csv_path in sorted(run_dir.glob("*.csv")):
+        if csv_path.name in handled:
+            continue
+        any_csv = True
+        phase = csv_path.stem
+        print(f"reading {csv_path}")
+        med = _collect_egg(_read_csv(csv_path))
+        if med:
+            plot_egg(med, figs / f"{phase}_async_speedup_vs_nelson.png",
+                     args.top_n, phase_label=phase)
+        else:
+            print(f"  no usable rows in {csv_path.name}")
 
     gates_csv = run_dir / "gates.csv"
     if gates_csv.exists():
