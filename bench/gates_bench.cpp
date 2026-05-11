@@ -22,7 +22,8 @@
 //   PE_BENCH_ALGOS=...       comma-separated EXACT names from
 //                            {nelson_simple, nelson_topo_iter,
 //                             par_close, par_topo_iter, par_async,
-//                             par_async_cont}. Default = run all six.
+//                             par_async_cont, par_async_hybrid}.
+//                            Default = run all seven.
 //   PE_BENCH_PAR_ONLY=1      skip every sequential algo (nelson_*).
 //                            Set on T>1 invocations so we don't
 //                            re-measure the thread-independent
@@ -115,6 +116,7 @@ int main(int argc, char** argv) {
   bool run_topo             = true;
   bool run_async            = true;
   bool run_async_cont       = true;
+  bool run_async_hybrid     = true;
   if (const char* a = std::getenv("PE_BENCH_ALGOS")) {
     std::string s(a);
     // Tokenize on commas.
@@ -143,12 +145,13 @@ int main(int argc, char** argv) {
     run_topo             = has("par_topo_iter");
     run_async            = has("par_async");
     run_async_cont       = has("par_async_cont");
+    run_async_hybrid     = has("par_async_hybrid");
     if (!run_nelson_simple && !run_nelson_topo_iter && !run_par_close &&
-        !run_topo && !run_async && !run_async_cont) {
+        !run_topo && !run_async && !run_async_cont && !run_async_hybrid) {
       std::fprintf(stderr,
           "PE_BENCH_ALGOS=%s matched nothing; valid algos are "
           "nelson_simple, nelson_topo_iter, par_close, par_topo_iter, "
-          "par_async, par_async_cont\n", a);
+          "par_async, par_async_cont, par_async_hybrid\n", a);
       return 2;
     }
   }
@@ -313,6 +316,22 @@ int main(int argc, char** argv) {
             deep_copy_nodes(), deep_copy_eqs(), pe::async,
             [](auto& eg, auto eqs) { eg.parallel_close_async_continuous(std::move(eqs)); });
         emit_row("par_async_cont", i, ms);
+      }
+    }
+
+    if (run_async_hybrid) {
+      // Hybrid filter / parents-walk: uses the hybrid_t-tagged ctor,
+      // which builds both `parents_` and `last_marked_`.
+      for (int i = 0; i < warmup; ++i) {
+        run_one<pe::ConcurrentUnionFind>(
+            deep_copy_nodes(), deep_copy_eqs(), pe::hybrid,
+            [](auto& eg, auto eqs) { eg.parallel_close_async_hybrid(std::move(eqs)); });
+      }
+      for (int i = 0; i < trials; ++i) {
+        double ms = run_one<pe::ConcurrentUnionFind>(
+            deep_copy_nodes(), deep_copy_eqs(), pe::hybrid,
+            [](auto& eg, auto eqs) { eg.parallel_close_async_hybrid(std::move(eqs)); });
+        emit_row("par_async_hybrid", i, ms);
       }
     }
   }

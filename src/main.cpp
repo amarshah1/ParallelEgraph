@@ -43,6 +43,7 @@ int usage(const char* prog) {
       "  PE_USE_ASYNC=1       parallel_close_async_rounds (integer-sort)\n"
       "  PE_USE_ASYNC_GBK=1   parallel_close_async_rounds_groupby (group_by_key)\n"
       "  PE_USE_ASYNC_CONT=1  parallel_close_async_continuous (par_do)\n"
+      "  PE_USE_ASYNC_HYBRID=1 parallel_close_async_hybrid (filter→parents)\n"
       "  PE_USE_NAIVE=1       parallel_close_naive_rounds (no dirty filter)\n"
       "  PE_USE_TOPO=1        parallel_close_topo\n"
       "  (none)               parallel_close (BSP)\n", prog);
@@ -183,20 +184,22 @@ int main(int argc, char** argv) {
   //                         matches what closure_compare_bench /
   //                         synthetic_bench / smt_bench tag as `par_topo`).
   // Default: parallel_close (BSP, parents_-driven).
-  const bool use_async      = std::getenv("PE_USE_ASYNC")      != nullptr;
-  const bool use_async_gbk  = std::getenv("PE_USE_ASYNC_GBK")  != nullptr;
-  const bool use_async_cont = std::getenv("PE_USE_ASYNC_CONT") != nullptr;
-  const bool use_naive      = std::getenv("PE_USE_NAIVE")      != nullptr;
-  const bool use_topo       = std::getenv("PE_USE_TOPO")       != nullptr;
+  const bool use_async        = std::getenv("PE_USE_ASYNC")        != nullptr;
+  const bool use_async_gbk    = std::getenv("PE_USE_ASYNC_GBK")    != nullptr;
+  const bool use_async_cont   = std::getenv("PE_USE_ASYNC_CONT")   != nullptr;
+  const bool use_async_hybrid = std::getenv("PE_USE_ASYNC_HYBRID") != nullptr;
+  const bool use_naive        = std::getenv("PE_USE_NAIVE")        != nullptr;
+  const bool use_topo         = std::getenv("PE_USE_TOPO")         != nullptr;
   if (int(use_async) + int(use_async_gbk) + int(use_async_cont) +
-      int(use_naive) + int(use_topo) > 1) {
+      int(use_async_hybrid) + int(use_naive) + int(use_topo) > 1) {
     std::fprintf(stderr,
                  "PE_USE_ASYNC, PE_USE_ASYNC_GBK, PE_USE_ASYNC_CONT, "
-                 "PE_USE_NAIVE, and PE_USE_TOPO are mutually exclusive\n");
+                 "PE_USE_ASYNC_HYBRID, PE_USE_NAIVE, and PE_USE_TOPO are "
+                 "mutually exclusive\n");
     return 2;
   }
   if (seq_algo != SeqAlgo::None &&
-      (use_async || use_async_gbk || use_async_cont ||
+      (use_async || use_async_gbk || use_async_cont || use_async_hybrid ||
        use_naive || use_topo)) {
     std::fprintf(stderr,
                  "--sequential and PE_USE_ASYNC*/"
@@ -239,6 +242,8 @@ int main(int argc, char** argv) {
     if (use_async || use_async_gbk || use_async_cont) {
       // All async-family variants share the async-flavor ctor.
       eg = std::make_unique<pe::ConcurrentEGraph>(std::move(nodes), pe::async);
+    } else if (use_async_hybrid) {
+      eg = std::make_unique<pe::ConcurrentEGraph>(std::move(nodes), pe::hybrid);
     } else if (use_naive) {
       eg = std::make_unique<pe::ConcurrentEGraph>(std::move(nodes), pe::naive);
     } else if (use_topo) {
@@ -254,6 +259,8 @@ int main(int argc, char** argv) {
       eg->parallel_close_async_rounds_groupby(std::move(equalities));
     } else if (use_async_cont) {
       eg->parallel_close_async_continuous(std::move(equalities));
+    } else if (use_async_hybrid) {
+      eg->parallel_close_async_hybrid(std::move(equalities));
     } else if (use_naive) {
       eg->parallel_close_naive_rounds(std::move(equalities));
     } else if (use_topo) {

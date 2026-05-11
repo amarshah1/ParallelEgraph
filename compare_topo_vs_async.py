@@ -435,6 +435,7 @@ EGG_ALGOS: list[tuple[str, str | None, str | None]] = [
     ("par_async",        None,         "PE_USE_ASYNC"),
     ("par_async_gbk",    None,         "PE_USE_ASYNC_GBK"),
     ("par_async_cont",   None,         "PE_USE_ASYNC_CONT"),
+    ("par_async_hybrid", None,         "PE_USE_ASYNC_HYBRID"),
     ("par_async_min_id", None,         "PE_USE_ASYNC_MIN_ID"),
     ("par_naive",        None,         "PE_USE_NAIVE"),
 ]

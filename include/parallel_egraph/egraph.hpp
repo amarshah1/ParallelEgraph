@@ -120,6 +120,16 @@ inline constexpr topo_t topo{};
 struct naive_t { explicit naive_t() = default; };
 inline constexpr naive_t naive{};
 
+// Tag selecting the hybrid closure layout used by
+// `parallel_close_async_hybrid`. Builds BOTH `parents_` (used by the
+// par_close-style parents-walk path) AND `last_marked_` (used by the
+// par_async-style filter scan path). The algorithm starts in filter
+// mode and switches to parents-walk mode once the dirty-set ratio
+// drops below a threshold — see PE_HYBRID_SWITCH_RATIO in
+// `parallel_close_async_hybrid`.
+struct hybrid_t { explicit hybrid_t() = default; };
+inline constexpr hybrid_t hybrid{};
+
 // Round-stamp slot used by the async closure path. Padded to 64 bytes
 // (one cache line) so that concurrent CAS-max updates on adjacent
 // class ids don't false-share. Without padding, eight slots fit in
@@ -210,6 +220,36 @@ class EGraph {
     const std::size_t n = nodes.size();
     uf_.bulk_init(n);
     nodes_ = std::move(nodes);
+  }
+
+  // Hybrid-flavor ctor: build BOTH `parents_` (inverted child→parent
+  // index, as in the BSP ctor) AND `last_marked_` (per-class round
+  // stamps, as in the async ctor). Used by
+  // `parallel_close_async_hybrid`, which starts in async-style filter
+  // mode and switches to BSP-style parents-walk mode when the
+  // dirty-set ratio falls below threshold.
+  EGraph(parlay::sequence<ENode> nodes, hybrid_t) : uf_(nodes.size()) {
+    const std::size_t n = nodes.size();
+    uf_.bulk_init(n);
+
+    auto child_pairs = parlay::flatten(parlay::tabulate(
+        n, [&](std::size_t i) -> parlay::sequence<std::pair<Id, Id>> {
+          const auto& cs = nodes[i].children;
+          parlay::sequence<std::pair<Id, Id>> result;
+          result.reserve(cs.size());
+          Id parent = static_cast<Id>(i);
+          for (Id c : cs) result.emplace_back(c, parent);
+          return result;
+        }));
+    parents_ = parlay::group_by_index(
+        std::move(child_pairs), static_cast<Id>(n));
+
+    nodes_ = std::move(nodes);
+
+    last_marked_ = parlay::sequence<PaddedMark>::uninitialized(n);
+    parlay::parallel_for(0, n, [&](std::size_t i) {
+      new (&last_marked_[i]) PaddedMark{std::atomic<std::uint64_t>(0), {}};
+    });
   }
 
   // Topo-flavor ctor: compute each class's depth (longest path from any
@@ -318,6 +358,21 @@ class EGraph {
   // exits on `done`. Defined out-of-line as an explicit specialization
   // on `ConcurrentUnionFind`. Uses the async-flavor ctor (`pe::async`).
   void parallel_close_async_continuous(
+      parlay::sequence<std::pair<Id, Id>> initial_unions);
+
+  // Hybrid filter / parents-walk closure. Starts in `par_async`-style
+  // filter mode: each round scans the non_leaf set checking
+  // `last_marked_[find_root(child)] == R-1` to find dirty terms. Once
+  // the dirty-set ratio falls below threshold (default 1% of
+  // non_leaves, configurable via PE_HYBRID_SWITCH_RATIO), switches to
+  // `par_close`-style parents-walk mode: one bulk
+  // `parallel_consolidate` of every loser collected so far, then each
+  // subsequent round walks `parents_[find_root(losers_prev_round)]`
+  // to form the dirty set. Closes the deep-cascade gap on workloads
+  // where the filter scan's O(non_leaves) per-round overhead
+  // dominates after the wide-merge phase ends. Requires the
+  // hybrid-flavor ctor (`pe::hybrid`).
+  void parallel_close_async_hybrid(
       parlay::sequence<std::pair<Id, Id>> initial_unions);
 
   // MIN_ID variant of `parallel_close_async_rounds`. Same algorithm —

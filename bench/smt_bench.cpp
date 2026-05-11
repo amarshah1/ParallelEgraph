@@ -235,6 +235,11 @@ int main(int argc, char** argv) {
         [](auto& eg, auto& eqs) {
           eg.parallel_close_async_rounds_groupby(std::move(eqs));
         });
+    run_one<pe::ConcurrentUnionFind>(script, stem, family, n, trials,
+        warmup, par_threads, "par_async_hybrid", pe::hybrid,
+        [](auto& eg, auto& eqs) {
+          eg.parallel_close_async_hybrid(std::move(eqs));
+        });
   }
   return 0;
 }

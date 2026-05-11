@@ -408,6 +408,277 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds(
   }
 }
 
+// ---- hybrid filter / parents-walk variant -------------------------------
+//
+// Same shape as `parallel_close_async_rounds` while merge activity is
+// wide — the round-level last_marked_ filter scans non_leaf and finds a
+// big dirty set cheaply relative to its absolute size — but drops to a
+// par_close-style parents-walk once activity dies down, so tail rounds
+// don't keep paying the O(non_leaves) filter cost for a 6-element
+// dirty set.
+//
+// Why the switch matters
+// ----------------------
+// On `6s104-xits-opt.gates`, par_async runs 432 rounds and pays ~14 ms
+// of filter time per round regardless of the dirty set size — the tail
+// rounds find dirty=6..100 but still scan all 3.9M non_leaves. Total
+// filter cost ~6 s, ~8× slower than par_close on the same input. The
+// trace shows par_close's per-round cost is O(parents-of-just-marked-
+// roots), which on the same workload is sub-ms in tail rounds because
+// only a handful of classes were marked.
+//
+// Switch criterion
+// ----------------
+// `|dirty| / |non_leaves| < PE_HYBRID_SWITCH_RATIO` (default 0.01).
+// Once tripped, the algorithm stays in parents-walk mode for the rest
+// of the run — activity decays monotonically across BSP rounds, so a
+// switch back would never help.
+//
+// State maintained in filter mode
+// -------------------------------
+// While in filter mode the algorithm does NOT mutate parents_ — that
+// would pay the par_close consolidate cost on every round, defeating
+// the point of the async variant. Instead, every round appends the
+// round's losers (the per-bucket non-survivors emitted by dnc_union)
+// to a `pending_losers` accumulator. At switch time, one bulk
+// `parallel_consolidate(parents_, pending_losers, find_root(.))` walk
+// brings parents_ current — moving every stranded loser's parents
+// slot into its current root's slot in a single pass. After the
+// switch, each round incrementally consolidates its own losers,
+// matching par_close's cadence.
+//
+// Correctness sketch
+// ------------------
+// Filter mode is exactly `parallel_close_async_rounds` — the
+// last_marked_-driven dirty filter — modulo the loser-list bookkeeping,
+// which doesn't affect the algorithm's decisions. Parents-walk mode is
+// exactly `parallel_close`'s frontier walk on a parents_ that's been
+// brought current via the bulk consolidate (so every loser's
+// pre-merger parents are reachable via its current root). The
+// transition is correct because the bulk consolidate restores the
+// invariant par_close maintains incrementally — `parents_[r]` holds
+// every node id with r in its child-roots — before the first parents-
+// walk round.
+//
+// Tunable cutoff
+// --------------
+// `PE_HYBRID_SWITCH_RATIO` (default 0.01): fraction of non_leaves
+// below which dirty triggers the mode switch. Lower → switch later
+// (stay in filter mode longer, helps wide workloads where filter is
+// genuinely fast). Higher → switch earlier (helps deep cascades).
+
+template <>
+void EGraph<ConcurrentUnionFind>::parallel_close_async_hybrid(
+    parlay::sequence<std::pair<Id, Id>> initial_unions) {
+  const bool trace = std::getenv("PE_TRACE") != nullptr;
+  using clk = std::chrono::steady_clock;
+  auto ms_since = [](clk::time_point t0) {
+    return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+  };
+
+  const std::size_t n = nodes_.size();
+  std::uint64_t R = 1;
+
+  // ---- step 1: apply initial unions in parallel; mark new roots --------
+  parlay::parallel_for(0, initial_unions.size(), [&](std::size_t i) {
+    auto [a, b] = initial_unions[i];
+    uf_.union_(a, b);
+    mark_round(last_marked_[uf_.find_root(a)].v, R);
+  });
+
+  // Stash both endpoints of each initial union as potential losers.
+  // parallel_consolidate skips entries where cs[i] == roots[i], so
+  // adding both ends costs only the redundant compares.
+  parlay::sequence<parlay::sequence<Id>> pending_losers_chunks;
+  {
+    parlay::sequence<Id> init_endpoints =
+        parlay::flatten(parlay::map(initial_unions, [](auto p) {
+          return parlay::sequence<Id>{p.first, p.second};
+        }));
+    pending_losers_chunks.push_back(std::move(init_endpoints));
+  }
+
+  // Filter-mode non_leaf index (round-invariant).
+  auto all_idx = parlay::iota<std::uint32_t>(static_cast<std::uint32_t>(n));
+  auto non_leaf = parlay::filter(all_idx, [&](std::uint32_t i) {
+    return !nodes_[i].children.empty();
+  });
+
+  static const double kSwitchRatio = []() {
+    const char* s = std::getenv("PE_HYBRID_SWITCH_RATIO");
+    return s ? std::atof(s) : 0.01;
+  }();
+  const std::size_t kSwitchCutoff = static_cast<std::size_t>(
+      static_cast<double>(non_leaf.size()) * kSwitchRatio);
+
+  bool in_parents_mode = false;
+  parlay::sequence<Id> work;  // populated post-switch; carries prev round's losers
+
+  std::size_t round = 0;
+  while (true) {
+    ++R;
+
+    // ---- compute dirty set, mode-dependent -----------------------------
+    parlay::sequence<std::uint32_t> dirty;
+    double prep_ms = 0.0;
+    if (!in_parents_mode) {
+      auto t = clk::now();
+      dirty = parlay::filter(non_leaf, [&](std::uint32_t i) {
+        const auto& cs = nodes_[i].children;
+        for (Id c : cs) {
+          const std::uint64_t m =
+              last_marked_[uf_.find_root(c)].v.load(std::memory_order_relaxed);
+          if (m == R - 1) return true;
+        }
+        return false;
+      });
+      prep_ms = trace ? ms_since(t) : 0.0;
+    } else {
+      // Parents-walk path: consolidate prev round's losers' parents
+      // slots into their current root, then walk parents_[unique_roots].
+      auto t = clk::now();
+      work = parlay::remove_duplicates(std::move(work));
+      auto roots = parlay::map(work, [&](Id c) { return uf_.find_root(c); });
+      detail::parallel_consolidate(parents_, work, roots);
+      auto unique_roots = parlay::remove_duplicates(roots);
+      auto frontier = parlay::flatten(parlay::map(unique_roots, [&](Id r) {
+        return parlay::make_slice(parents_[r]);
+      }));
+      static const std::size_t kFrontierDedupCutoff = [] {
+        const char* s = std::getenv("PE_FRONTIER_DEDUP_CUTOFF");
+        return s ? static_cast<std::size_t>(std::atoll(s)) : std::size_t{500'000};
+      }();
+      if (frontier.size() >= kFrontierDedupCutoff) {
+        frontier = parlay::remove_duplicates(std::move(frontier));
+      }
+      dirty = std::move(frontier);
+      prep_ms = trace ? ms_since(t) : 0.0;
+    }
+
+    if (dirty.empty()) {
+      if (trace) {
+        std::fprintf(stderr,
+                     "[pe-hybrid] round=%3zu R=%llu mode=%s dirty=        0 "
+                     "prep=%7.3fms (clean break)\n",
+                     round, (unsigned long long)R,
+                     in_parents_mode ? "parents" : "filter", prep_ms);
+      }
+      break;
+    }
+
+    // ---- semisort + dnc_union per bucket; emit losers + stamp ---------
+    auto t_semisort = clk::now();
+    auto canon_entries = parlay::map(dirty, [&](std::uint32_t i) {
+#ifdef PE_SEMISORT_SOUND
+      return detail::CanonEntry{sig_hash(nodes_[i], uf_), uf_.find_root(i),
+                                static_cast<Id>(i)};
+#else
+      auto [h1, h2] = sig_hashes(nodes_[i], uf_);
+      return detail::CanonEntry{h1, uf_.find_root(i), h2};
+#endif
+    });
+
+#ifdef PE_SEMISORT_SOUND
+    auto equal_fn = [&](const detail::CanonEntry& a,
+                        const detail::CanonEntry& b) {
+      return a.hash == b.hash &&
+             sigs_equal(a.class_id, b.class_id, uf_, nodes_);
+    };
+#else
+    auto equal_fn = [](const detail::CanonEntry& a,
+                       const detail::CanonEntry& b) {
+      return a.hash == b.hash && a.secondary_hash == b.secondary_hash;
+    };
+#endif
+
+    parlay::integer_sort_inplace(
+        parlay::make_slice(canon_entries),
+        [](const detail::CanonEntry& e) -> std::uint64_t { return e.hash; });
+
+    auto starts_flag = parlay::tabulate(canon_entries.size(), [&](std::size_t i) {
+      return i == 0 || canon_entries[i].hash != canon_entries[i - 1].hash;
+    });
+    auto run_starts = parlay::pack_index<std::uint32_t>(starts_flag);
+
+    auto per_run_losers = parlay::map(run_starts,
+        [&, total = canon_entries.size()](std::uint32_t lo32) -> parlay::sequence<Id> {
+      const std::size_t lo = lo32;
+      std::size_t hi = lo + 1;
+      while (hi < total && canon_entries[hi].hash == canon_entries[lo].hash) ++hi;
+      if (hi - lo < 2) return {};
+      parlay::sequence<Id> out;
+      std::size_t i = lo;
+      while (i < hi) {
+        std::size_t j = i + 1;
+        while (j < hi && equal_fn(canon_entries[i], canon_entries[j])) ++j;
+        if (j - i >= 2) {
+          const Id ref = canon_entries[i].root;
+          bool all_same = true;
+          for (std::size_t k = i + 1; k < j; ++k) {
+            if (canon_entries[k].root != ref) { all_same = false; break; }
+          }
+          if (!all_same) {
+            const Id survivor = detail::dnc_union(canon_entries, i, j, uf_);
+            // Stamp surviving root with R (cheap mark — see rounds-based
+            // notes on why load-then-store is sufficient here).
+            mark_round(last_marked_[uf_.find_root(survivor)].v, R);
+            for (std::size_t k = i; k < j; ++k) {
+              if (canon_entries[k].root != survivor) {
+                out.push_back(canon_entries[k].root);
+              }
+            }
+          }
+        }
+        i = j;
+      }
+      return out;
+    });
+    auto losers = parlay::flatten(per_run_losers);
+    double semisort_ms = trace ? ms_since(t_semisort) : 0.0;
+
+    // ---- mode bookkeeping / transition --------------------------------
+    if (!in_parents_mode) {
+      pending_losers_chunks.push_back(losers);  // keep for bulk consolidate
+
+      if (dirty.size() < kSwitchCutoff) {
+        // Switch: one bulk consolidate over every loser seen so far.
+        auto t_bulk = clk::now();
+        auto pending = parlay::flatten(std::move(pending_losers_chunks));
+        pending = parlay::remove_duplicates(std::move(pending));
+        auto roots = parlay::map(pending, [&](Id c) { return uf_.find_root(c); });
+        detail::parallel_consolidate(parents_, pending, roots);
+        double bulk_ms = trace ? ms_since(t_bulk) : 0.0;
+
+        in_parents_mode = true;
+        work = std::move(losers);  // this round's losers drive next round's frontier
+        if (trace) {
+          std::fprintf(stderr,
+                       "[pe-hybrid] round=%3zu R=%llu mode=filter dirty=%9zu "
+                       "runs=%9zu prep=%7.3fms semisort=%7.3fms "
+                       "SWITCH (bulk_consolidate=%7.3fms, |pending|=%zu)\n",
+                       round, (unsigned long long)R, dirty.size(),
+                       run_starts.size(), prep_ms, semisort_ms,
+                       bulk_ms, pending.size());
+        }
+        ++round;
+        continue;
+      }
+    } else {
+      work = std::move(losers);
+    }
+
+    if (trace) {
+      std::fprintf(stderr,
+                   "[pe-hybrid] round=%3zu R=%llu mode=%s dirty=%9zu runs=%9zu "
+                   "prep=%7.3fms semisort=%7.3fms\n",
+                   round, (unsigned long long)R,
+                   in_parents_mode ? "parents" : "filter",
+                   dirty.size(), run_starts.size(), prep_ms, semisort_ms);
+    }
+    ++round;
+  }
+}
+
 // ---- truly-async continuous variant -------------------------------------
 //
 // Same `last_marked_` dirty-tracking and {R-1, R} filter window as the
