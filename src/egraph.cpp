@@ -103,19 +103,54 @@ void EGraph<ConcurrentUnionFind>::parallel_close(
 
     auto t_consolidate = clk::now();
     auto roots = parlay::map(work, [&](Id c) { return uf_.find_root(c); });
+
+    // Tail-round skip: peek at every relevant parents_ slot before
+    // paying the consolidate cost. If both parents_[work[i]]
+    // (pre-consolidate content of losers) and parents_[roots[i]]
+    // (winner's pre-existing content) are empty for every i, the
+    // post-consolidate frontier would be empty and we'd break anyway.
+    // Saves the consolidate work (~9 ms on large round 1) at the
+    // cost of one O(work.size()) parallel any_of (~3 ms on the same
+    // workload). Net win ~6 ms. parlay::any_of short-circuits on
+    // the first non-empty slot, so productive rounds pay only the
+    // cost of scanning until the first hit.
+    bool has_any_parents = parlay::any_of(
+        parlay::iota(work.size()), [&](std::size_t i) {
+          return !parents_[work[i]].empty() || !parents_[roots[i]].empty();
+        });
+    if (!has_any_parents) {
+      if (trace) {
+        std::fprintf(stderr,
+                     "[pe] round=%3zu work=%9zu (tail-skip: all parents empty)\n",
+                     round, work.size());
+      }
+      break;
+    }
+
     detail::parallel_consolidate(parents_, work, roots);
     double consolidate_ms = trace ? ms_since(t_consolidate) : 0.0;
 
     auto t_frontier = clk::now();
     auto unique_roots = parlay::remove_duplicates(roots);
-    // Map each root to a non-owning slice of its parents list. Flatten then
-    // copies straight from parents_[r] into one freshly-allocated destination
-    // buffer (the generic flatten overload, since slices yield element refs)
-    // — saves one per-root sequence allocation + memcpy compared to the
-    // older "construct a fresh sequence(begin, end) per r" pattern.
     auto frontier = parlay::flatten(parlay::map(unique_roots, [&](Id r) {
       return parlay::make_slice(parents_[r]);
     }));
+    // Dedup the frontier when it's big enough that duplicates dominate.
+    // The raw frontier counts a parent once per child slot it occupies
+    // in a merged class; on flat high-fanout workloads the
+    // duplicate ratio runs ~1.7-1.8× (matches par_async's dirty
+    // count once deduped). Skipping dedup below the threshold avoids
+    // paying its ~5 ms parlay::remove_duplicates cost on workloads
+    // where the raw frontier is small enough that the saved semisort
+    // work doesn't pay it back. Cutoff is configurable via
+    // PE_FRONTIER_DEDUP_CUTOFF for sweeps.
+    static const std::size_t kFrontierDedupCutoff = [] {
+      const char* s = std::getenv("PE_FRONTIER_DEDUP_CUTOFF");
+      return s ? static_cast<std::size_t>(std::atoll(s)) : std::size_t{500'000};
+    }();
+    if (frontier.size() >= kFrontierDedupCutoff) {
+      frontier = parlay::remove_duplicates(std::move(frontier));
+    }
     double frontier_ms = trace ? ms_since(t_frontier) : 0.0;
 
     if (frontier.empty()) {
