@@ -59,7 +59,7 @@ DEFAULT_FAMILY_NS = {
 
 # cube_decomp axis: g-tree fan-in d × cube parameter k.
 CUBE_DECOMP_DS = [2, 3, 4, 5]
-CUBE_DECOMP_KS = [5, 55, 105, 155]
+CUBE_DECOMP_KS = list(range(5, 206, 25))
 
 # gates phase: where to find .gates files and which suites to walk by
 # default. *_with_not variants are skipped by default since the
