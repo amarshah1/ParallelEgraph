@@ -42,7 +42,34 @@ import matplotlib.pyplot as plt
 
 
 PAR_ALGO = "par_async"
-BASELINE_ALGO = "nelson_topo_iter"
+# Use the minimum across these per-workload as the baseline. Different
+# sequential algos win on different shapes — nelson_simple is fastest
+# on dense / shallow inputs, nelson_topo_iter on deeper DAGs — so the
+# fairest "speedup over best sequential" picks the per-workload min.
+BASELINE_ALGOS = ("nelson_topo_iter", "nelson_simple")
+BASELINE_TAG = " / ".join(BASELINE_ALGOS) + " (min)"
+
+
+def _best_baseline(med: dict, key_prefix: tuple, threads: list[int]):
+    """Return the per-workload baseline = min over BASELINE_ALGOS of the
+    T=1 measurement (or cross-T median if T=1 is missing). Returns None
+    if neither baseline algo has any rows for this workload.
+
+    `key_prefix` is the leading tuple of the med-dict key, e.g.
+    (fam, n, d) for synth, (file,) for egg/gates, (workload,) for random.
+    The full key is `key_prefix + (t, algo)`.
+    """
+    base_t = 1 if 1 in threads else None
+    candidates = []
+    for algo in BASELINE_ALGOS:
+        if base_t is not None and (key_prefix + (base_t, algo)) in med:
+            candidates.append(med[key_prefix + (base_t, algo)])
+            continue
+        vals = [med[key_prefix + (t, algo)] for t in threads
+                if (key_prefix + (t, algo)) in med]
+        if vals:
+            candidates.append(median(vals))
+    return min(candidates) if candidates else None
 
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
@@ -136,31 +163,24 @@ def _collect_egg(rows: list[dict[str, str]]):
 def plot_synth(med, out_path: Path):
     threads = sorted({t for (_, _, _, t, _) in med})
     triples = sorted({(fam, n, d) for (fam, n, d, _, a) in med
-                      if a in (PAR_ALGO, BASELINE_ALGO)})
+                      if a == PAR_ALGO or a in BASELINE_ALGOS})
     if not threads or not triples:
         print(f"  skip {out_path.name}: no rows")
         return
 
-    # nelson_topo_iter is sequential, but if it was run inside the same
-    # process as the parallel algos, parlay's worker pool stays warm and
-    # interferes with the "sequential" measurement at high T (cache
-    # contention, NUMA placement). Empirically the T=128 baseline can be
-    # ~2x the T=1 baseline. Use T=1 only; fall back to the cross-T median
-    # when T=1 is missing so older CSVs still produce a plot.
+    # Per-workload baseline = min(nelson_topo_iter, nelson_simple) at T=1
+    # (or cross-T median if T=1 is missing). Sequential rows at T>1 are
+    # inflated by parlay-worker contention when the C++ binary runs every
+    # algo in one process at PARLAY_NUM_THREADS=T — empirically the
+    # T=128 baseline can be ~2x the T=1 baseline.
     base_by_triple: dict[tuple, float] = {}
-    base_t = 1 if 1 in threads else None
-    for (fam, n, d) in triples:
-        if base_t is not None and (fam, n, d, base_t, BASELINE_ALGO) in med:
-            base_by_triple[(fam, n, d)] = med[(fam, n, d, base_t, BASELINE_ALGO)]
-            continue
-        vals = [med[(fam, n, d, t, BASELINE_ALGO)]
-                for t in threads
-                if (fam, n, d, t, BASELINE_ALGO) in med]
-        if vals:
-            base_by_triple[(fam, n, d)] = median(vals)
+    for triple in triples:
+        b = _best_baseline(med, triple, threads)
+        if b is not None:
+            base_by_triple[triple] = b
 
     if not base_by_triple:
-        print(f"  skip {out_path.name}: no {BASELINE_ALGO} rows")
+        print(f"  skip {out_path.name}: no {BASELINE_TAG} rows")
         return
 
     color_keys = sorted({(fam, n) for (fam, n, _) in base_by_triple})
@@ -205,8 +225,8 @@ def plot_synth(med, out_path: Path):
     ax.set_xscale("log", base=2); ax.set_yscale("log", base=2)
     ax.set_xticks(threads); ax.set_xticklabels([str(t) for t in threads])
     ax.set_xlabel("threads")
-    ax.set_ylabel(f"speedup ({BASELINE_ALGO} / {PAR_ALGO})")
-    ax.set_title(f"synthetic — {PAR_ALGO} vs sequential {BASELINE_ALGO}")
+    ax.set_ylabel(f"speedup ({BASELINE_TAG} / {PAR_ALGO})")
+    ax.set_title(f"synthetic — {PAR_ALGO} vs sequential {BASELINE_TAG}")
     ax.grid(True, which="both", alpha=0.3)
     ax.legend(fontsize=7, loc="best", ncol=2)
     _save(fig, out_path)
@@ -234,22 +254,15 @@ def plot_egg(med, out_path: Path, top_n: int):
     top_files = [f for f, _ in
                  sorted(par_at_max.items(), key=lambda x: -x[1])[:top_n]]
 
-    # Sequential baseline: T=1 only (avoid the parlay-worker contention
-    # inflation on egraph-cc invocations at higher T).
-    base_t = 1 if 1 in threads else None
+    # Per-file baseline = min(BASELINE_ALGOS) at T=1.
     base_by_file: dict[str, float] = {}
     for f in top_files:
-        if base_t is not None and (f, base_t, BASELINE_ALGO) in med:
-            base_by_file[f] = med[(f, base_t, BASELINE_ALGO)]
-            continue
-        vals = [med[(f, t, BASELINE_ALGO)]
-                for t in threads
-                if (f, t, BASELINE_ALGO) in med]
-        if vals:
-            base_by_file[f] = median(vals)
+        b = _best_baseline(med, (f,), threads)
+        if b is not None:
+            base_by_file[f] = b
 
     if not base_by_file:
-        print(f"  skip {out_path.name}: no {BASELINE_ALGO} rows for top files")
+        print(f"  skip {out_path.name}: no {BASELINE_TAG} rows for top files")
         return
 
     fig, ax = plt.subplots(figsize=(9, 6))
@@ -281,9 +294,9 @@ def plot_egg(med, out_path: Path, top_n: int):
     ax.set_xscale("log", base=2); ax.set_yscale("log", base=2)
     ax.set_xticks(threads); ax.set_xticklabels([str(t) for t in threads])
     ax.set_xlabel("threads")
-    ax.set_ylabel(f"speedup ({BASELINE_ALGO} / {PAR_ALGO})  [close_s]")
+    ax.set_ylabel(f"speedup ({BASELINE_TAG} / {PAR_ALGO})  [close_s]")
     ax.set_title(f"egg — top-{top_n} longest-close files, "
-                 f"{PAR_ALGO} vs sequential {BASELINE_ALGO}")
+                 f"{PAR_ALGO} vs sequential {BASELINE_TAG}")
     ax.grid(True, which="both", alpha=0.3)
     ax.legend(fontsize=7, loc="best", ncol=2)
     _save(fig, out_path)
@@ -292,30 +305,20 @@ def plot_egg(med, out_path: Path, top_n: int):
 def plot_random(med, out_path: Path):
     threads = sorted({t for (_, t, _) in med})
     workloads = sorted({wl for (wl, _, a) in med
-                        if a in (PAR_ALGO, BASELINE_ALGO)})
+                        if a == PAR_ALGO or a in BASELINE_ALGOS})
     if not threads or not workloads:
         print(f"  skip {out_path.name}: no rows")
         return
 
-    # Sequential baseline: prefer the T=1 measurement. Higher-T samples
-    # of nelson_topo_iter are inflated by parlay-worker contention when
-    # the C++ binary runs every algo in one process at PARLAY_NUM_THREADS=T,
-    # so taking a cross-T median would over-estimate the baseline by ~2x
-    # at the high end and make par_async look better than it is.
+    # Per-workload baseline = min(BASELINE_ALGOS) at T=1.
     base_by_wl: dict[str, float] = {}
-    base_t = 1 if 1 in threads else None
     for wl in workloads:
-        if base_t is not None and (wl, base_t, BASELINE_ALGO) in med:
-            base_by_wl[wl] = med[(wl, base_t, BASELINE_ALGO)]
-            continue
-        vals = [med[(wl, t, BASELINE_ALGO)]
-                for t in threads
-                if (wl, t, BASELINE_ALGO) in med]
-        if vals:
-            base_by_wl[wl] = median(vals)
+        b = _best_baseline(med, (wl,), threads)
+        if b is not None:
+            base_by_wl[wl] = b
 
     if not base_by_wl:
-        print(f"  skip {out_path.name}: no {BASELINE_ALGO} rows")
+        print(f"  skip {out_path.name}: no {BASELINE_TAG} rows")
         return
 
     fig, ax = plt.subplots(figsize=(8, 6))
@@ -344,20 +347,23 @@ def plot_random(med, out_path: Path):
     ax.set_xscale("log", base=2); ax.set_yscale("log", base=2)
     ax.set_xticks(threads); ax.set_xticklabels([str(t) for t in threads])
     ax.set_xlabel("threads")
-    ax.set_ylabel(f"speedup ({BASELINE_ALGO} / {PAR_ALGO})")
-    ax.set_title(f"random — {PAR_ALGO} vs sequential {BASELINE_ALGO}")
+    ax.set_ylabel(f"speedup ({BASELINE_TAG} / {PAR_ALGO})")
+    ax.set_title(f"random — {PAR_ALGO} vs sequential {BASELINE_TAG}")
     ax.grid(True, which="both", alpha=0.3)
     ax.legend(fontsize=8, loc="best")
     _save(fig, out_path)
 
 
 def plot_gates(med, out_path: Path, top_n: int):
-    """gates_bench can be run with any subset of {nelson_topo_iter,
-    par_topo_iter, par_async}, so the plotter picks a baseline based
-    on what's actually in the CSV. Preference order:
+    """gates_bench can be run with any subset of {nelson_simple,
+    nelson_topo_iter, par_close, par_topo_iter, par_async,
+    par_async_cont}, so the plotter picks a baseline based on what's
+    actually in the CSV. Preference order:
 
-      1. nelson_topo_iter (if present at T=1) — true sequential
-         baseline, best for "speedup over best sequential."
+      1. min(nelson_simple, nelson_topo_iter) at T=1 — best
+         sequential baseline. Picked per-file so we always compare
+         par_async against the seq algo that actually won on that
+         workload.
       2. par_topo_iter(T=1) — surrogate; closest "best-rounds-based-
          CC at one core" measurement available.
       3. par_async(T=1) — last-resort self-relative baseline. The
@@ -397,28 +403,38 @@ def plot_gates(med, out_path: Path, top_n: int):
     top_files = [f for f, _ in
                  sorted(cost_at_max.items(), key=lambda x: -x[1])[:top_n]]
 
-    # Pick baseline: try in preference order. For each candidate we
-    # require T=1 rows for at least one of the top files; the loser
-    # files (no baseline value) get dropped silently from the plot.
-    BASELINE_CANDIDATES = ["nelson_topo_iter", "par_topo_iter", PAR_ALGO]
+    # Pick baseline. First preference: per-file min over BASELINE_ALGOS
+    # (the sequential algos) at T=1. Fall back through par_topo_iter and
+    # par_async if no sequential rows are present.
     chosen_baseline: str | None = None
     base_by_file: dict[str, float] = {}
-    for cand in BASELINE_CANDIDATES:
-        if cand not in algos_present:
-            continue
-        candidate_base: dict[str, float] = {}
+    seq_present = [a for a in BASELINE_ALGOS if a in algos_present]
+    if seq_present:
         for f in top_files:
-            v = med.get((f, 1, cand))
-            if v is not None and v > 0:
-                candidate_base[f] = v
-        if candidate_base:
-            chosen_baseline = cand
-            base_by_file = candidate_base
-            break
+            vals = [med[(f, 1, a)] for a in seq_present
+                    if (f, 1, a) in med and med[(f, 1, a)] > 0]
+            if vals:
+                base_by_file[f] = min(vals)
+        if base_by_file:
+            chosen_baseline = BASELINE_TAG
+    # Fallbacks: par_topo_iter@T=1 then par_async@T=1.
+    if chosen_baseline is None:
+        for cand in ("par_topo_iter", PAR_ALGO):
+            if cand not in algos_present:
+                continue
+            candidate_base: dict[str, float] = {}
+            for f in top_files:
+                v = med.get((f, 1, cand))
+                if v is not None and v > 0:
+                    candidate_base[f] = v
+            if candidate_base:
+                chosen_baseline = cand
+                base_by_file = candidate_base
+                break
 
     if chosen_baseline is None:
         print(f"  skip {out_path.name}: no usable baseline at T=1 "
-              f"(tried {BASELINE_CANDIDATES})")
+              f"(tried {seq_present} + par_topo_iter + {PAR_ALGO})")
         return
     print(f"  gates baseline: {chosen_baseline}@T=1")
 
@@ -473,6 +489,8 @@ def plot_gates(med, out_path: Path, top_n: int):
     # is annotated specially since it's degenerate at T=1.
     if chosen_baseline == PAR_ALGO:
         baseline_tag = f"{PAR_ALGO}@T=1 (self-relative)"
+    elif chosen_baseline == BASELINE_TAG:
+        baseline_tag = f"{BASELINE_TAG}@T=1"
     else:
         baseline_tag = f"{chosen_baseline}@T=1"
     ax.set_ylabel(f"speedup ({baseline_tag} / algo)  [close_ms]")
