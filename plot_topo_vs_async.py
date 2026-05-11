@@ -42,6 +42,23 @@ import matplotlib.pyplot as plt
 
 
 PAR_ALGO = "par_async"
+# Plot the same speedup chart once per parallel algorithm we care about.
+# par_close is only plotted when the CSV actually contains par_close
+# rows (skip is internal to each plot_* fn).
+PAR_ALGOS_TO_PLOT = ("par_async", "par_close")
+
+
+def _algo_present(med: dict, algo: str) -> bool:
+    """True iff at least one med-dict key ends with `algo` (works for
+    any collector — they all put algorithm last in the key tuple)."""
+    return any(k[-1] == algo for k in med)
+
+
+def _suffix_for(par_algo: str) -> str:
+    """Filename suffix that names which parallel algo a plot is for."""
+    if par_algo == "par_async":
+        return "async_speedup_vs_nelson"
+    return f"{par_algo}_speedup_vs_nelson"
 # Use the minimum across these per-workload as the baseline. Different
 # sequential algos win on different shapes — nelson_simple is fastest
 # on dense / shallow inputs, nelson_topo_iter on deeper DAGs — so the
@@ -160,10 +177,13 @@ def _collect_egg(rows: list[dict[str, str]]):
     return {k: median(v) for k, v in buckets.items() if v}
 
 
-def plot_synth(med, out_path: Path):
+def plot_synth(med, out_path: Path, par_algo: str = PAR_ALGO):
     threads = sorted({t for (_, _, _, t, _) in med})
+    if not any(a == par_algo for (_, _, _, _, a) in med):
+        print(f"  skip {out_path.name}: no {par_algo} rows")
+        return
     triples = sorted({(fam, n, d) for (fam, n, d, _, a) in med
-                      if a == PAR_ALGO or a in BASELINE_ALGOS})
+                      if a == par_algo or a in BASELINE_ALGOS})
     if not threads or not triples:
         print(f"  skip {out_path.name}: no rows")
         return
@@ -208,7 +228,7 @@ def plot_synth(med, out_path: Path):
                 continue
             xs, ys = [], []
             for t in threads:
-                par = med.get((fam, n, d, t, PAR_ALGO))
+                par = med.get((fam, n, d, t, par_algo))
                 if par and par > 0:
                     xs.append(t); ys.append(base / par)
             if xs:
@@ -225,14 +245,15 @@ def plot_synth(med, out_path: Path):
     ax.set_xscale("log", base=2); ax.set_yscale("log", base=2)
     ax.set_xticks(threads); ax.set_xticklabels([str(t) for t in threads])
     ax.set_xlabel("threads")
-    ax.set_ylabel(f"speedup ({BASELINE_TAG} / {PAR_ALGO})")
-    ax.set_title(f"synthetic — {PAR_ALGO} vs sequential {BASELINE_TAG}")
+    ax.set_ylabel(f"speedup ({BASELINE_TAG} / {par_algo})")
+    ax.set_title(f"synthetic — {par_algo} vs sequential {BASELINE_TAG}")
     ax.grid(True, which="both", alpha=0.3)
     ax.legend(fontsize=7, loc="best", ncol=2)
     _save(fig, out_path)
 
 
-def plot_egg(med, out_path: Path, top_n: int, phase_label: str = "egg"):
+def plot_egg(med, out_path: Path, top_n: int, phase_label: str = "egg",
+             par_algo: str = PAR_ALGO):
     """Egg uses close_s as the time metric. Pick the top-N files by
     par_async closure time at the largest T (those are the ones with
     enough work to scale; cheap files just measure overhead).
@@ -247,14 +268,14 @@ def plot_egg(med, out_path: Path, top_n: int, phase_label: str = "egg"):
         return
     t_max = threads[-1]
 
-    # Files with both a baseline (T=1) and a par_async measurement
-    # at every-T. Rank by par_async at T_max.
+    # Files with both a baseline (T=1) and a par_algo measurement at
+    # every-T. Rank by par_algo at T_max.
     par_at_max: dict[str, float] = {}
     for (f, t, algo), v in med.items():
-        if algo == PAR_ALGO and t == t_max:
+        if algo == par_algo and t == t_max:
             par_at_max[f] = v
     if not par_at_max:
-        print(f"  skip {out_path.name}: no {PAR_ALGO} rows at T={t_max}")
+        print(f"  skip {out_path.name}: no {par_algo} rows at T={t_max}")
         return
     top_files = [f for f, _ in
                  sorted(par_at_max.items(), key=lambda x: -x[1])[:top_n]]
@@ -282,7 +303,7 @@ def plot_egg(med, out_path: Path, top_n: int, phase_label: str = "egg"):
             continue
         xs, ys = [], []
         for t in threads:
-            par = med.get((f, t, PAR_ALGO))
+            par = med.get((f, t, par_algo))
             if par and par > 0:
                 xs.append(t); ys.append(base / par)
         if xs:
@@ -299,18 +320,21 @@ def plot_egg(med, out_path: Path, top_n: int, phase_label: str = "egg"):
     ax.set_xscale("log", base=2); ax.set_yscale("log", base=2)
     ax.set_xticks(threads); ax.set_xticklabels([str(t) for t in threads])
     ax.set_xlabel("threads")
-    ax.set_ylabel(f"speedup ({BASELINE_TAG} / {PAR_ALGO})  [close_s]")
+    ax.set_ylabel(f"speedup ({BASELINE_TAG} / {par_algo})  [close_s]")
     ax.set_title(f"{phase_label} — top-{top_n} longest-close files, "
-                 f"{PAR_ALGO} vs sequential {BASELINE_TAG}")
+                 f"{par_algo} vs sequential {BASELINE_TAG}")
     ax.grid(True, which="both", alpha=0.3)
     ax.legend(fontsize=7, loc="best", ncol=2)
     _save(fig, out_path)
 
 
-def plot_random(med, out_path: Path):
+def plot_random(med, out_path: Path, par_algo: str = PAR_ALGO):
     threads = sorted({t for (_, t, _) in med})
+    if not any(a == par_algo for (_, _, a) in med):
+        print(f"  skip {out_path.name}: no {par_algo} rows")
+        return
     workloads = sorted({wl for (wl, _, a) in med
-                        if a == PAR_ALGO or a in BASELINE_ALGOS})
+                        if a == par_algo or a in BASELINE_ALGOS})
     if not threads or not workloads:
         print(f"  skip {out_path.name}: no rows")
         return
@@ -336,7 +360,7 @@ def plot_random(med, out_path: Path):
         base = base_by_wl[wl]
         xs, ys = [], []
         for t in threads:
-            par = med.get((wl, t, PAR_ALGO))
+            par = med.get((wl, t, par_algo))
             if par and par > 0:
                 xs.append(t); ys.append(base / par)
         if xs:
@@ -352,14 +376,14 @@ def plot_random(med, out_path: Path):
     ax.set_xscale("log", base=2); ax.set_yscale("log", base=2)
     ax.set_xticks(threads); ax.set_xticklabels([str(t) for t in threads])
     ax.set_xlabel("threads")
-    ax.set_ylabel(f"speedup ({BASELINE_TAG} / {PAR_ALGO})")
-    ax.set_title(f"random — {PAR_ALGO} vs sequential {BASELINE_TAG}")
+    ax.set_ylabel(f"speedup ({BASELINE_TAG} / {par_algo})")
+    ax.set_title(f"random — {par_algo} vs sequential {BASELINE_TAG}")
     ax.grid(True, which="both", alpha=0.3)
     ax.legend(fontsize=8, loc="best")
     _save(fig, out_path)
 
 
-def plot_gates(med, out_path: Path, top_n: int):
+def plot_gates(med, out_path: Path, top_n: int, par_algo: str = PAR_ALGO):
     """gates_bench can be run with any subset of {nelson_simple,
     nelson_topo_iter, par_close, par_topo_iter, par_async,
     par_async_cont}, so the plotter picks a baseline based on what's
@@ -396,21 +420,21 @@ def plot_gates(med, out_path: Path, top_n: int):
     # Discover which algorithms are present at all.
     algos_present = {a for (_, _, a) in med}
 
-    # Rank files by par_async closure cost at T_max — the more work
-    # par_async did, the more interesting the scaling.
+    # Rank files by par_algo closure cost at T_max — the more work
+    # par_algo did, the more interesting the scaling.
     cost_at_max: dict[str, float] = {}
     for (f, t, algo), v in med.items():
-        if algo == PAR_ALGO and t == t_max:
+        if algo == par_algo and t == t_max:
             cost_at_max[f] = v
     if not cost_at_max:
-        print(f"  skip {out_path.name}: no {PAR_ALGO} rows at T={t_max}")
+        print(f"  skip {out_path.name}: no {par_algo} rows at T={t_max}")
         return
     top_files = [f for f, _ in
                  sorted(cost_at_max.items(), key=lambda x: -x[1])[:top_n]]
 
     # Pick baseline. First preference: per-file min over BASELINE_ALGOS
     # (the sequential algos) at T=1. Fall back through par_topo_iter and
-    # par_async if no sequential rows are present.
+    # then par_algo's own T=1 if no sequential rows are present.
     chosen_baseline: str | None = None
     base_by_file: dict[str, float] = {}
     seq_present = [a for a in BASELINE_ALGOS if a in algos_present]
@@ -422,9 +446,9 @@ def plot_gates(med, out_path: Path, top_n: int):
                 base_by_file[f] = min(vals)
         if base_by_file:
             chosen_baseline = BASELINE_TAG
-    # Fallbacks: par_topo_iter@T=1 then par_async@T=1.
+    # Fallbacks: par_topo_iter@T=1 then par_algo@T=1 (self-relative).
     if chosen_baseline is None:
-        for cand in ("par_topo_iter", PAR_ALGO):
+        for cand in ("par_topo_iter", par_algo):
             if cand not in algos_present:
                 continue
             candidate_base: dict[str, float] = {}
@@ -439,7 +463,7 @@ def plot_gates(med, out_path: Path, top_n: int):
 
     if chosen_baseline is None:
         print(f"  skip {out_path.name}: no usable baseline at T=1 "
-              f"(tried {seq_present} + par_topo_iter + {PAR_ALGO})")
+              f"(tried {seq_present} + par_topo_iter + {par_algo})")
         return
     print(f"  gates baseline: {chosen_baseline}@T=1")
 
@@ -459,15 +483,15 @@ def plot_gates(med, out_path: Path, top_n: int):
         if base is None:
             continue
         short = f.replace(".gates", "")
-        # par_async (solid) — what we're evaluating.
+        # par_algo (solid) — what we're evaluating.
         xs, ys = [], []
         for t in threads:
-            par = med.get((f, t, PAR_ALGO))
+            par = med.get((f, t, par_algo))
             if par and par > 0:
                 xs.append(t); ys.append(base / par)
         if xs:
             ax.plot(xs, ys, marker="o", color=cmap(i % 10),
-                    linewidth=1.5, label=f"{short}  ({PAR_ALGO})")
+                    linewidth=1.5, label=f"{short}  ({par_algo})")
             plotted += 1
         # par_topo_iter (dashed) — only if rows are available.
         if have_topo_curve:
@@ -490,17 +514,17 @@ def plot_gates(med, out_path: Path, top_n: int):
     ax.set_xticks(threads); ax.set_xticklabels([str(t) for t in threads])
     ax.set_xlabel("threads")
     # Title and y-axis annotate the baseline used so the reader can
-    # interpret the y-values correctly. self-relative (par_async@T=1)
+    # interpret the y-values correctly. self-relative (par_algo@T=1)
     # is annotated specially since it's degenerate at T=1.
-    if chosen_baseline == PAR_ALGO:
-        baseline_tag = f"{PAR_ALGO}@T=1 (self-relative)"
+    if chosen_baseline == par_algo:
+        baseline_tag = f"{par_algo}@T=1 (self-relative)"
     elif chosen_baseline == BASELINE_TAG:
         baseline_tag = f"{BASELINE_TAG}@T=1"
     else:
         baseline_tag = f"{chosen_baseline}@T=1"
     ax.set_ylabel(f"speedup ({baseline_tag} / algo)  [close_ms]")
     title_extra = "" if have_topo_curve else "  (no par_topo_iter rows)"
-    ax.set_title(f"gates — top-{top_n} files, {PAR_ALGO} vs "
+    ax.set_title(f"gates — top-{top_n} files, {par_algo} vs "
                  f"{baseline_tag}{title_extra}")
     ax.grid(True, which="both", alpha=0.3)
     ax.legend(fontsize=7, loc="best", ncol=2)
@@ -530,13 +554,23 @@ def main():
 
     any_csv = False
 
+    # Each phase below produces one figure per par_algo in
+    # PAR_ALGOS_TO_PLOT. par_close plots are skipped automatically when
+    # the CSV lacks par_close rows — the plot_* fns short-circuit early.
+    def _par_algos_for(med: dict) -> list[str]:
+        return [pa for pa in PAR_ALGOS_TO_PLOT
+                if pa == "par_async" or _algo_present(med, pa)]
+
     synth_csv = run_dir / "synthetic.csv"
     if synth_csv.exists():
         any_csv = True
         print(f"reading {synth_csv}")
         med = _collect_synth(_read_csv(synth_csv))
         if med:
-            plot_synth(med, figs / "synthetic_async_speedup_vs_nelson.png")
+            for pa in _par_algos_for(med):
+                plot_synth(med,
+                           figs / f"synthetic_{_suffix_for(pa)}.png",
+                           par_algo=pa)
         else:
             print("  no usable rows in synthetic.csv")
 
@@ -546,7 +580,10 @@ def main():
         print(f"reading {rand_csv}")
         med = _collect_random(_read_csv(rand_csv))
         if med:
-            plot_random(med, figs / "random_async_speedup_vs_nelson.png")
+            for pa in _par_algos_for(med):
+                plot_random(med,
+                            figs / f"random_{_suffix_for(pa)}.png",
+                            par_algo=pa)
         else:
             print("  no usable rows in random.csv")
 
@@ -557,7 +594,10 @@ def main():
         # cube_decomp.csv shares synthetic_bench's schema, so plot_synth works.
         med = _collect_synth(_read_csv(cube_csv))
         if med:
-            plot_synth(med, figs / "cube_decomp_async_speedup_vs_nelson.png")
+            for pa in _par_algos_for(med):
+                plot_synth(med,
+                           figs / f"cube_decomp_{_suffix_for(pa)}.png",
+                           par_algo=pa)
         else:
             print("  no usable rows in cube_decomp.csv")
 
@@ -567,8 +607,10 @@ def main():
         print(f"reading {egg_csv}")
         med = _collect_egg(_read_csv(egg_csv))
         if med:
-            plot_egg(med, figs / "egg_async_speedup_vs_nelson.png",
-                     args.top_n)
+            for pa in _par_algos_for(med):
+                plot_egg(med,
+                         figs / f"egg_{_suffix_for(pa)}.png",
+                         args.top_n, par_algo=pa)
         else:
             print("  no usable rows in egg.csv")
 
@@ -584,8 +626,10 @@ def main():
         print(f"reading {csv_path}")
         med = _collect_egg(_read_csv(csv_path))
         if med:
-            plot_egg(med, figs / f"{phase}_async_speedup_vs_nelson.png",
-                     args.top_n, phase_label=phase)
+            for pa in _par_algos_for(med):
+                plot_egg(med,
+                         figs / f"{phase}_{_suffix_for(pa)}.png",
+                         args.top_n, phase_label=phase, par_algo=pa)
         else:
             print(f"  no usable rows in {csv_path.name}")
 
@@ -595,7 +639,11 @@ def main():
         print(f"reading {gates_csv}")
         med = _collect_gates(_read_csv(gates_csv))
         if med:
-            plot_gates(med, figs / "gates_async_speedup.png", args.top_n)
+            for pa in _par_algos_for(med):
+                suffix = ("async_speedup" if pa == "par_async"
+                          else f"{pa}_speedup")
+                plot_gates(med, figs / f"gates_{suffix}.png",
+                           args.top_n, par_algo=pa)
         else:
             print("  no usable rows in gates.csv")
 

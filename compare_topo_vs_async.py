@@ -66,7 +66,7 @@ CUBE_DECOMP_KS = list(range(5, 206, 25))
 # gates_bench builder synthesizes NOT terms automatically — running
 # both would double-count.
 GATES_DEFAULT_ROOT   = "./miter-cc-benchmarks"
-GATES_DEFAULT_SUITES = ["iwls22", "hwmcc12"]
+GATES_DEFAULT_SUITES = ["iwls22_with_not", "hwmcc12_with_not"]
 
 # Algorithms surfaced in the per-phase summary table (in column order).
 # Mapping to the binaries' CSV `algorithm` tags:
