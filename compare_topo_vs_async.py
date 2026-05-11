@@ -62,7 +62,7 @@ CUBE_DECOMP_DS = [2, 3, 4, 5]
 CUBE_DECOMP_KS = list(range(5, 206, 25))
 
 # gates phase: where to find .gates files and which suites to walk by
-# default. *_with_not variants are skipped by default since the
+# default. The non *_with_not variants are skipped by default since the
 # gates_bench builder synthesizes NOT terms automatically — running
 # both would double-count.
 GATES_DEFAULT_ROOT   = "./miter-cc-benchmarks"
