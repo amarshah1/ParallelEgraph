@@ -674,7 +674,15 @@ def run_gates(out_dir: Path, thread_counts: list[int],
     # submodule checkout. Custom --gates-root values are left alone so
     # the driver never mutates a path the user supplied explicitly.
     if not files_glob and gates_root == GATES_DEFAULT_ROOT:
-        if not os.path.isdir(gates_root):
+        # `git clone` of the parent repo creates an EMPTY placeholder
+        # dir for the gitlink, so `os.path.isdir(gates_root)` would say
+        # True even when the submodule was never fetched. Check that
+        # the expected suite subdirs are present too — that's the real
+        # "is this populated?" signal on a fresh PSC clone.
+        populated = (os.path.isdir(gates_root) and
+                     all(os.path.isdir(os.path.join(gates_root, s))
+                         for s in suites))
+        if not populated:
             print(f"Initializing submodule: {gates_root}", flush=True)
             subprocess.run(
                 ["git", "submodule", "update", "--init", "--recursive",
