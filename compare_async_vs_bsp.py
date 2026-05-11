@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Compare BSP (parallel_close) vs async-rounds (parallel_close_async_rounds)
+"""Compare BSP (parallel_parents) vs async-rounds (parallel_filter)
 on the synthetic benchmarks via ./build/synthetic_bench.
 
 For each (family, n, threads) we run both algorithms — BSP first, then
 async — and write per-trial CSV rows into a single file. The CSV uses
 synthetic_bench's native schema, with the `algorithm` column carrying
-either `par_close` (BSP) or `par_close_async` (mark-based async). At
+either `par_parents` (BSP) or `par_filter` (mark-based async). At
 the end we print a summary table showing the median ms per
 (family, n, threads, algorithm) and the async-vs-bsp ratio.
 
@@ -143,17 +143,17 @@ def summarize(csv_path: Path):
           f"| {'async/bsp':>9} {'bsp_T1/T':>9} {'async_T1/T':>11}")
     print("-" * 88)
     for (fam, n) in workloads:
-        bsp_t1 = medians.get((fam, n, threads[0], "par_close"))
-        async_t1 = medians.get((fam, n, threads[0], "par_close_async"))
+        bsp_t1 = medians.get((fam, n, threads[0], "par_parents"))
+        filter_t1 = medians.get((fam, n, threads[0], "par_filter"))
         for t in threads:
-            bm = medians.get((fam, n, t, "par_close"))
-            am = medians.get((fam, n, t, "par_close_async"))
+            bm = medians.get((fam, n, t, "par_parents"))
+            am = medians.get((fam, n, t, "par_filter"))
             bm_s = f"{bm:>10.2f}" if bm is not None else f"{'-':>10}"
             am_s = f"{am:>10.2f}" if am is not None else f"{'-':>10}"
             ratio = f"{am/bm:>8.2f}x" if (bm and am and bm > 0) else f"{'-':>9}"
             bsp_spd = f"{bsp_t1/bm:>7.2f}x" if (bm and bsp_t1) else f"{'-':>9}"
-            async_spd = (f"{async_t1/am:>9.2f}x"
-                         if (am and async_t1) else f"{'-':>11}")
+            async_spd = (f"{filter_t1/am:>9.2f}x"
+                         if (am and filter_t1) else f"{'-':>11}")
             print(f"{fam:<8} {n:>5} {t:>4} | {bm_s} {am_s} "
                   f"| {ratio} {bsp_spd} {async_spd}")
         print()
@@ -272,18 +272,18 @@ def main():
                 csv_out.write(bsp_text); csv_out.flush()
                 first = False
 
-                async_text, async_rounds = run_one(
+                filter_text, async_rounds = run_one(
                     fam, n, threads,
                     use_async=True,
                     warmup=args.warmup, trials=args.trials,
                     emit_header=False,
                     numactl_prefix=numactl_prefix,
                     trace_log_dir=trace_dir)
-                csv_out.write(async_text); csv_out.flush()
+                csv_out.write(filter_text); csv_out.flush()
 
                 bsp_ms = statistics.median(parse_wallclocks(bsp_text, first))
                 async_ms = statistics.median(
-                    parse_wallclocks(async_text, False))
+                    parse_wallclocks(filter_text, False))
                 ratio = async_ms / bsp_ms if bsp_ms > 0 else float("nan")
                 print(f"{fam:<8} {n:>5} | "
                       f"{bsp_ms:>10.2f} {bsp_rounds:>7} | "

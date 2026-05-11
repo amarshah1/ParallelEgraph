@@ -337,7 +337,7 @@ def run_random(out_dir: Path, thread_counts: list[int],
     When `also_async`, runs a second pass per thread count with
     PE_USE_ASYNC=1 and PE_BENCH_SKIP_NELSON=1 so the async closure is
     timed alongside BSP. The CSV's `algorithm` column distinguishes them
-    (nelson_seq / par_close / par_close_async).
+    (nelson_seq / par_parents / par_filter).
 
     When `only_topo`, every invocation sets PE_BENCH_SKIP_NELSON=1, which
     drops the `nelson_seq` (Nelson worklist) baseline rows and leaves
@@ -434,8 +434,8 @@ def run_synthetic(out_dir: Path, thread_counts: list[int],
     When `also_async`, runs a second invocation per (family, n, threads)
     with PE_USE_ASYNC=1 and PE_BENCH_SKIP_NELSON=1 — nelson is captured
     once in the BSP pass per (family, n) so the async pass always skips
-    it. CSV's `algorithm` column distinguishes par_close vs
-    par_close_async.
+    it. CSV's `algorithm` column distinguishes par_parents vs
+    par_filter.
     """
     csv_path = out_dir / "synthetic.csv"
     trace_csv_path = out_dir / "synthetic_trace.csv"
@@ -650,7 +650,7 @@ def run_egg(out_dir: Path, thread_counts: list[int],
 
     When `also_async`, each (file, threads) cell runs a second sweep of
     1 warmup + 5 trials with PE_USE_ASYNC=1. CSV gains an `algorithm`
-    column = `par_close` or `par_close_async` so downstream plots can
+    column = `par_parents` or `par_filter` so downstream plots can
     group correctly. egraph-cc has no sequential mode, so there is no
     nelson_seq row in egg.csv (intentionally; sequential lives in the
     synthetic / random phases).
@@ -699,9 +699,9 @@ def run_egg(out_dir: Path, thread_counts: list[int],
             return (wall, "TIMEOUT", None, f"exceeded {timeout}s", partial)
 
     binary = "./build/egraph-cc"
-    algos = [("par_close", False)]
+    algos = [("par_parents", False)]
     if also_async:
-        algos.append(("par_close_async", True))
+        algos.append(("par_filter", True))
 
     all_trace_rows: list[list] = []
     with open(csv_path, "w", newline="") as f:
@@ -809,8 +809,8 @@ def main():
                     help="run the async-rounds closure alongside BSP at "
                          "every (workload, threads) cell. Roughly doubles "
                          "the wall-clock of each phase. CSVs gain an "
-                         "`algorithm` column distinguishing par_close vs "
-                         "par_close_async (egg.csv) — random/synthetic/"
+                         "`algorithm` column distinguishing par_parents vs "
+                         "par_filter (egg.csv) — random/synthetic/"
                          "cube_decomp already had one, populated by the "
                          "binaries themselves.")
     ap.add_argument("--warmup", type=int, default=None,

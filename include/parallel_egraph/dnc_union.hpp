@@ -1,9 +1,7 @@
 #pragma once
-// Internal shared helper for both `merge_and_collect_semisort` impls
-// (semisort_secondary.hpp = default, semisort_sound.hpp = sound). Both
-// go through `dnc_union` to apply the per-group unions; the bucket type
-// is templated because the impls carry different per-element payloads —
-// `as_root()` overloads pick out the class id regardless.
+// Internal shared helper for `merge_and_collect_semisort`. Applies
+// per-group unions; the bucket type is templated and `as_root()`
+// overloads pick out the class id regardless of payload.
 //
 // Not part of the stable public API. Header-only because every helper
 // here is either `inline` or a template.

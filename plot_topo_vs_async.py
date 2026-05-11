@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot par_async speedup vs the sequential nelson_topo_iter baseline.
+"""Plot par_filter speedup vs the sequential nelson_topo_iter baseline.
 
 For each present input CSV under `<run_dir>/`:
 
@@ -9,7 +9,7 @@ For each present input CSV under `<run_dir>/`:
   egg.csv          → egg_async_speedup_vs_nelson.png          (color=top-N files by close_s)
   gates.csv        → gates_async_speedup.png                  (color=top-N files by close_ms)
 
-  speedup(T) = nelson_topo_iter / par_async(T)
+  speedup(T) = nelson_topo_iter / par_filter(T)
 
 Sequential measurements at T>1 are inflated by parlay-worker contention
 when the C++ binary runs every algo in one process at PARLAY_NUM_THREADS=T.
@@ -41,11 +41,11 @@ from statistics import median
 import matplotlib.pyplot as plt
 
 
-PAR_ALGO = "par_async"
+PAR_ALGO = "par_filter"
 # Plot the same speedup chart once per parallel algorithm we care about.
-# par_close is only plotted when the CSV actually contains par_close
+# par_parents is only plotted when the CSV actually contains par_parents
 # rows (skip is internal to each plot_* fn).
-PAR_ALGOS_TO_PLOT = ("par_async", "par_close")
+PAR_ALGOS_TO_PLOT = ("par_filter", "par_parents")
 
 
 def _algo_present(med: dict, algo: str) -> bool:
@@ -56,7 +56,7 @@ def _algo_present(med: dict, algo: str) -> bool:
 
 def _suffix_for(par_algo: str) -> str:
     """Filename suffix that names which parallel algo a plot is for."""
-    if par_algo == "par_async":
+    if par_algo == "par_filter":
         return "async_speedup_vs_nelson"
     return f"{par_algo}_speedup_vs_nelson"
 # Use the minimum across these per-workload as the baseline. Different
@@ -255,7 +255,7 @@ def plot_synth(med, out_path: Path, par_algo: str = PAR_ALGO):
 def plot_egg(med, out_path: Path, top_n: int, phase_label: str = "egg",
              par_algo: str = PAR_ALGO):
     """Egg uses close_s as the time metric. Pick the top-N files by
-    par_async closure time at the largest T (those are the ones with
+    par_filter closure time at the largest T (those are the ones with
     enough work to scale; cheap files just measure overhead).
 
     `phase_label` shows up in the title; pass the CSV stem so
@@ -385,27 +385,27 @@ def plot_random(med, out_path: Path, par_algo: str = PAR_ALGO):
 
 def plot_gates(med, out_path: Path, top_n: int, par_algo: str = PAR_ALGO):
     """gates_bench can be run with any subset of {nelson_simple,
-    nelson_topo_iter, par_close, par_topo_iter, par_async,
-    par_async_cont}, so the plotter picks a baseline based on what's
+    nelson_topo_iter, par_parents, par_topo_iter, par_filter,
+    par_filter_cont}, so the plotter picks a baseline based on what's
     actually in the CSV. Preference order:
 
       1. min(nelson_simple, nelson_topo_iter) at T=1 — best
          sequential baseline. Picked per-file so we always compare
-         par_async against the seq algo that actually won on that
+         par_filter against the seq algo that actually won on that
          workload.
       2. par_topo_iter(T=1) — surrogate; closest "best-rounds-based-
          CC at one core" measurement available.
-      3. par_async(T=1) — last-resort self-relative baseline. The
-         resulting speedup is just par_async(T=1)/par_async(T) and
+      3. par_filter(T=1) — last-resort self-relative baseline. The
+         resulting speedup is just par_filter(T=1)/par_filter(T) and
          degenerates to 1.0 at T=1, but it still surfaces async's
          strong-scaling curve when no other algorithm was run.
 
     Plot lines:
-      * par_async(T) — solid, the algorithm we're evaluating.
+      * par_filter(T) — solid, the algorithm we're evaluating.
       * par_topo_iter(T) — dashed, plotted only when par_topo_iter
         rows are present; serves as a parallel-scaling reference.
 
-    Pick top-N files by par_async closure cost at T_max so we focus
+    Pick top-N files by par_filter closure cost at T_max so we focus
     on workloads with enough work for parallelism to matter.
     """
     threads = sorted({t for (_, t, _) in med})
@@ -555,11 +555,11 @@ def main():
     any_csv = False
 
     # Each phase below produces one figure per par_algo in
-    # PAR_ALGOS_TO_PLOT. par_close plots are skipped automatically when
-    # the CSV lacks par_close rows — the plot_* fns short-circuit early.
+    # PAR_ALGOS_TO_PLOT. par_parents plots are skipped automatically when
+    # the CSV lacks par_parents rows — the plot_* fns short-circuit early.
     def _par_algos_for(med: dict) -> list[str]:
         return [pa for pa in PAR_ALGOS_TO_PLOT
-                if pa == "par_async" or _algo_present(med, pa)]
+                if pa == "par_filter" or _algo_present(med, pa)]
 
     synth_csv = run_dir / "synthetic.csv"
     if synth_csv.exists():
@@ -640,7 +640,7 @@ def main():
         med = _collect_gates(_read_csv(gates_csv))
         if med:
             for pa in _par_algos_for(med):
-                suffix = ("async_speedup" if pa == "par_async"
+                suffix = ("async_speedup" if pa == "par_filter"
                           else f"{pa}_speedup")
                 plot_gates(med, figs / f"gates_{suffix}.png",
                            args.top_n, par_algo=pa)

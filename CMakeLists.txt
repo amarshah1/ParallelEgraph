@@ -38,7 +38,7 @@ FetchContent_MakeAvailable(unordered_dense)
 
 # ---- allocator: jemalloc ----
 # Replaces glibc malloc. Removes per-arena lock contention that throttles
-# parallel_close on wide-shallow workloads (≈1.76× faster on synthetic_bench
+# parallel_parents on wide-shallow workloads (≈1.76× faster on synthetic_bench
 # quintic n=23 at T=192, ~1.20× on closure_compare_bench 16xl-d3 at T=192).
 option(USE_JEMALLOC "Link binaries against jemalloc" ON)
 if(USE_JEMALLOC)
@@ -52,26 +52,13 @@ if(USE_JEMALLOC)
 endif()
 
 # ---- semisort group-by variant ----
-# Default: secondary-hash equality. parlay::group_by_key (open-addressing
-# hash table) keyed on the 64-bit primary signature hash, with equality
-# verified by a 32-bit secondary hash carried in CanonEntry. Combined
-# 96-bit entropy makes collisions effectively impossible (~10⁻¹⁴ across
-# a 64M-element batch); we accept that probabilistic guarantee.
-# Set PE_SEMISORT_SOUND=ON to verify equality structurally via sigs_equal
-# (the children-walk comparison resolved through the UF). Slower but
-# correct under any hash function. CanonEntry stays at 16 bytes either
-# way (trailing 4 bytes are secondary_hash by default, class_id when SOUND).
-option(PE_SEMISORT_SOUND "Verify semisort equality with sigs_equal instead of secondary hash" OFF)
-
 # ---- core library ----
-# Two interchangeable `merge_and_collect_semisort` impls live as headers
-# (include/parallel_egraph/semisort_{secondary,sound}.hpp). The dispatcher
-# src/semisort.cpp #include's one based on PE_SEMISORT_SOUND; CMake just
-# compiles that single TU.
+# Semisort equality is verified structurally via sigs_equal (children-walk
+# comparison resolved through the UF) — sound under any hash function.
 add_library(parallel_egraph_core STATIC
   src/unionfind.cpp
   src/egraph.cpp
-  src/egraph_async.cpp
+  src/egraph_filter.cpp
   src/smtlib.cpp
   src/semisort.cpp
 )
@@ -79,9 +66,6 @@ target_include_directories(parallel_egraph_core
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 target_link_libraries(parallel_egraph_core PUBLIC parlay unordered_dense::unordered_dense ${JEMALLOC_LIB})
-if(PE_SEMISORT_SOUND)
-  target_compile_definitions(parallel_egraph_core PUBLIC PE_SEMISORT_SOUND)
-endif()
 
 # ---- CLI: egraph-cc <file.smt2> -> sat / unsat ----
 add_executable(egraph-cc src/main.cpp)

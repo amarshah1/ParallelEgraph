@@ -5,7 +5,7 @@
     Larger d → shallower g-tree → frontier shrinks by a factor of d per round.
   * k (cube parameter) ∈ {5, 55, 105, 155} (default; tweakable via --ks)
 
-For each (d, k) we time both nelson_seq and par_close at every thread count
+For each (d, k) we time both nelson_seq and par_parents at every thread count
 (default 1, 2, 4, 8). Output goes to a timestamped folder under runs/:
 
   runs/<ts>/
@@ -129,7 +129,7 @@ def main():
     print()
 
     # Loop order: (d, k) outermost, threads innermost. For each (d, k) we
-    # run nelson once on the first thread count, then par_close at every
+    # run nelson once on the first thread count, then par_parents at every
     # thread count. Lets us track "this workload's full thread curve" and
     # avoids re-running the thread-independent sequential baseline.
     first = True

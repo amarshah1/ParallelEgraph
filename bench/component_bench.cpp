@@ -154,12 +154,7 @@ PhaseTimes run_trial(const Workload& w) {
     // `idx` is a frontier element — under sparse `nodes_` storage it
     // is the class id of a parent node and the index into `nodes_`.
     const auto& node = nodes[idx];
-#ifdef PE_SEMISORT_SOUND
     return detail::CanonEntry{sig_hash(node, uf), uf.find_root(idx), idx};
-#else
-    auto [hash, secondary_hash] = sig_hashes(node, uf);
-    return detail::CanonEntry{hash, uf.find_root(idx), secondary_hash};
-#endif
   });
 
   auto t1 = clk::now();

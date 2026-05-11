@@ -1,4 +1,4 @@
-// SMT-LIB bench: runs parallel_close (and optionally sequential_close_nelson)
+// SMT-LIB bench: runs parallel_parents (and optionally sequential_close_nelson)
 // on each .smt2 file under one or more paths. Filename convention follows
 // gen_bench.py: <family>_n<N>_(sat|unsat).smt2.
 //
@@ -65,7 +65,7 @@ struct Built {
 // `Tag` selects the EGraph ctor flavor. The default-constructed value
 // of pe::Script::Tag isn't a thing — Tag is meant to be one of:
 //   * std::monostate-like sentinel (default ctor: parents_)
-//   * pe::async_t (last_marked_)
+//   * pe::filter_t (last_marked_)
 //   * pe::topo_t  (depth_buckets_)
 //   * pe::naive_t (UF only)
 template <typename UF, typename Tag = std::monostate>
@@ -202,43 +202,49 @@ int main(int argc, char** argv) {
     run_one<pe::SequentialUnionFind>(script, stem, family, n, trials,
         warmup, par_threads, "nelson_simple", std::monostate{},
         [](auto& eg, auto& eqs) { eg.sequential_close_simple(eqs); });
+    run_one<pe::SequentialUnionFind>(script, stem, family, n, trials,
+        warmup, par_threads, "nelson_simple_hash", std::monostate{},
+        [](auto& eg, auto& eqs) { eg.sequential_close_simple_hash(eqs); });
+    run_one<pe::SequentialUnionFind>(script, stem, family, n, trials,
+        warmup, par_threads, "nelson_simple_arity", std::monostate{},
+        [](auto& eg, auto& eqs) { eg.sequential_close_simple_arity(eqs); });
     run_one<pe::ConcurrentUnionFind>(script, stem, family, n, trials,
-        warmup, par_threads, "par_close", std::monostate{},
-        [](auto& eg, auto& eqs) { eg.parallel_close(std::move(eqs)); });
+        warmup, par_threads, "par_parents", std::monostate{},
+        [](auto& eg, auto& eqs) { eg.parallel_parents(std::move(eqs)); });
     run_one<pe::ConcurrentUnionFind>(script, stem, family, n, trials,
         warmup, par_threads, "par_topo_iter", pe::topo,
         [](auto& eg, auto& eqs) {
-          eg.parallel_close_topo_iter(std::move(eqs));
+          eg.parallel_topo_iter(std::move(eqs));
         });
     run_one<pe::ConcurrentUnionFind>(script, stem, family, n, trials,
-        warmup, par_threads, "par_async", pe::async,
+        warmup, par_threads, "par_filter", pe::filter,
         [](auto& eg, auto& eqs) {
-          eg.parallel_close_async_rounds(std::move(eqs));
+          eg.parallel_filter(std::move(eqs));
         });
     run_one<pe::ConcurrentUnionFind>(script, stem, family, n, trials,
-        warmup, par_threads, "par_async_min_id", pe::async,
+        warmup, par_threads, "par_filter_min_id", pe::filter,
         [](auto& eg, auto& eqs) {
-          eg.parallel_close_async_rounds_min_id(std::move(eqs));
+          eg.parallel_filter_min_id(std::move(eqs));
         });
     run_one<pe::ConcurrentUnionFind>(script, stem, family, n, trials,
         warmup, par_threads, "par_naive", pe::naive,
         [](auto& eg, auto& eqs) {
-          eg.parallel_close_naive_rounds(std::move(eqs));
+          eg.parallel_naive_rounds(std::move(eqs));
         });
     run_one<pe::ConcurrentUnionFind>(script, stem, family, n, trials,
-        warmup, par_threads, "par_async_cont", pe::async,
+        warmup, par_threads, "par_filter_cont", pe::filter,
         [](auto& eg, auto& eqs) {
-          eg.parallel_close_async_continuous(std::move(eqs));
+          eg.parallel_filter_continuous(std::move(eqs));
         });
     run_one<pe::ConcurrentUnionFind>(script, stem, family, n, trials,
-        warmup, par_threads, "par_async_gbk", pe::async,
+        warmup, par_threads, "par_filter_gbk", pe::filter,
         [](auto& eg, auto& eqs) {
-          eg.parallel_close_async_rounds_groupby(std::move(eqs));
+          eg.parallel_filter_groupby(std::move(eqs));
         });
     run_one<pe::ConcurrentUnionFind>(script, stem, family, n, trials,
-        warmup, par_threads, "par_async_hybrid", pe::hybrid,
+        warmup, par_threads, "par_filter_hybrid", pe::hybrid,
         [](auto& eg, auto& eqs) {
-          eg.parallel_close_async_hybrid(std::move(eqs));
+          eg.parallel_filter_hybrid(std::move(eqs));
         });
   }
   return 0;

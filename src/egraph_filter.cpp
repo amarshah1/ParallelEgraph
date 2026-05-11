@@ -79,7 +79,7 @@ namespace {
 //       R," so no thread is concurrently writing R-1 vs R to the same
 //       slot.
 //   (b) the dirty filter's single-clause check `m == R - 1` (see step
-//       2 of parallel_close_async_rounds): relies on "no fresh writes
+//       2 of parallel_filter): relies on "no fresh writes
 //       to last_marked_ can happen after R was bumped and before the
 //       filter runs," so observing a value of `R` is impossible. In
 //       barrier-free async, both clauses (`m == R - 1 || m == R`) are
@@ -108,18 +108,18 @@ inline void mark_round_cas_max(std::atomic<std::uint64_t>& slot,
 
 // ---- group_by_key baseline ---------------------------------------------
 //
-// `parallel_close_async_rounds_groupby` is the original implementation
+// `parallel_filter_groupby` is the original implementation
 // kept for A/B comparison against the integer-sort variant. It uses
 // `parlay::group_by_key`, which builds a hash table over the canon
 // entries' primary hashes and materializes a `sequence<sequence<
 // CanonEntry>>` (one inner buffer per bucket). The integer-sort path
-// in `parallel_close_async_rounds` replaces this with one in-place
+// in `parallel_filter` replaces this with one in-place
 // 64-bit radix sort + tabulate + pack_index, eliminating the per-
 // bucket allocation. Use this method only when you want to measure
 // the cost of that swap.
 
 template <>
-void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds_groupby(
+void EGraph<ConcurrentUnionFind>::parallel_filter_groupby(
     parlay::sequence<std::pair<Id, Id>> initial_unions) {
   const bool trace = std::getenv("PE_TRACE") != nullptr;
   using clk = std::chrono::steady_clock;
@@ -169,13 +169,8 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds_groupby(
 
     auto t_semisort = clk::now();
     auto canon_entries = parlay::map(dirty, [&](std::uint32_t i) {
-#ifdef PE_SEMISORT_SOUND
       return detail::CanonEntry{sig_hash(nodes_[i], uf_), uf_.find_root(i),
                                 static_cast<Id>(i)};
-#else
-      auto [h1, h2] = sig_hashes(nodes_[i], uf_);
-      return detail::CanonEntry{h1, uf_.find_root(i), h2};
-#endif
     });
 
     auto keyed = parlay::map(canon_entries, [](const detail::CanonEntry& e) {
@@ -184,18 +179,11 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds_groupby(
     auto hash_fn = [](const detail::CanonEntry& e) -> std::size_t {
       return e.hash;
     };
-#ifdef PE_SEMISORT_SOUND
     auto equal_fn = [&](const detail::CanonEntry& a,
                         const detail::CanonEntry& b) {
       return a.hash == b.hash &&
              sigs_equal(a.class_id, b.class_id, uf_, nodes_);
     };
-#else
-    auto equal_fn = [](const detail::CanonEntry& a,
-                       const detail::CanonEntry& b) {
-      return a.hash == b.hash && a.secondary_hash == b.secondary_hash;
-    };
-#endif
     auto groups = parlay::group_by_key(keyed, hash_fn, equal_fn);
 
     parlay::parallel_for(0, groups.size(), [&](std::size_t g) {
@@ -222,7 +210,7 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds_groupby(
 }
 
 template <>
-void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds(
+void EGraph<ConcurrentUnionFind>::parallel_filter(
     parlay::sequence<std::pair<Id, Id>> initial_unions) {
   const bool trace = std::getenv("PE_TRACE") != nullptr;
   using clk = std::chrono::steady_clock;
@@ -288,27 +276,15 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds(
     // ---- step 3: semisort dirty by current canonical sig -----------
     auto t_semisort = clk::now();
     auto canon_entries = parlay::map(dirty, [&](std::uint32_t i) {
-#ifdef PE_SEMISORT_SOUND
       return detail::CanonEntry{sig_hash(nodes_[i], uf_), uf_.find_root(i),
                                 static_cast<Id>(i)};
-#else
-      auto [h1, h2] = sig_hashes(nodes_[i], uf_);
-      return detail::CanonEntry{h1, uf_.find_root(i), h2};
-#endif
     });
 
-#ifdef PE_SEMISORT_SOUND
     auto equal_fn = [&](const detail::CanonEntry& a,
                         const detail::CanonEntry& b) {
       return a.hash == b.hash &&
              sigs_equal(a.class_id, b.class_id, uf_, nodes_);
     };
-#else
-    auto equal_fn = [](const detail::CanonEntry& a,
-                       const detail::CanonEntry& b) {
-      return a.hash == b.hash && a.secondary_hash == b.secondary_hash;
-    };
-#endif
 
     // Integer-sort + run-walk, in place. Replaces an earlier
     // group_by_key implementation that built a hash table and
@@ -410,20 +386,20 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds(
 
 // ---- hybrid filter / parents-walk variant -------------------------------
 //
-// Same shape as `parallel_close_async_rounds` while merge activity is
+// Same shape as `parallel_filter` while merge activity is
 // wide — the round-level last_marked_ filter scans non_leaf and finds a
 // big dirty set cheaply relative to its absolute size — but drops to a
-// par_close-style parents-walk once activity dies down, so tail rounds
+// par_parents-style parents-walk once activity dies down, so tail rounds
 // don't keep paying the O(non_leaves) filter cost for a 6-element
 // dirty set.
 //
 // Why the switch matters
 // ----------------------
-// On `6s104-xits-opt.gates`, par_async runs 432 rounds and pays ~14 ms
+// On `6s104-xits-opt.gates`, par_filter runs 432 rounds and pays ~14 ms
 // of filter time per round regardless of the dirty set size — the tail
 // rounds find dirty=6..100 but still scan all 3.9M non_leaves. Total
-// filter cost ~6 s, ~8× slower than par_close on the same input. The
-// trace shows par_close's per-round cost is O(parents-of-just-marked-
+// filter cost ~6 s, ~8× slower than par_parents on the same input. The
+// trace shows par_parents's per-round cost is O(parents-of-just-marked-
 // roots), which on the same workload is sub-ms in tail rounds because
 // only a handful of classes were marked.
 //
@@ -437,7 +413,7 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds(
 // State maintained in filter mode
 // -------------------------------
 // While in filter mode the algorithm does NOT mutate parents_ — that
-// would pay the par_close consolidate cost on every round, defeating
+// would pay the par_parents consolidate cost on every round, defeating
 // the point of the async variant. Instead, every round appends the
 // round's losers (the per-bucket non-survivors emitted by dnc_union)
 // to a `pending_losers` accumulator. At switch time, one bulk
@@ -445,18 +421,18 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds(
 // brings parents_ current — moving every stranded loser's parents
 // slot into its current root's slot in a single pass. After the
 // switch, each round incrementally consolidates its own losers,
-// matching par_close's cadence.
+// matching par_parents's cadence.
 //
 // Correctness sketch
 // ------------------
-// Filter mode is exactly `parallel_close_async_rounds` — the
+// Filter mode is exactly `parallel_filter` — the
 // last_marked_-driven dirty filter — modulo the loser-list bookkeeping,
 // which doesn't affect the algorithm's decisions. Parents-walk mode is
-// exactly `parallel_close`'s frontier walk on a parents_ that's been
+// exactly `parallel_parents`'s frontier walk on a parents_ that's been
 // brought current via the bulk consolidate (so every loser's
 // pre-merger parents are reachable via its current root). The
 // transition is correct because the bulk consolidate restores the
-// invariant par_close maintains incrementally — `parents_[r]` holds
+// invariant par_parents maintains incrementally — `parents_[r]` holds
 // every node id with r in its child-roots — before the first parents-
 // walk round.
 //
@@ -468,7 +444,7 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds(
 // genuinely fast). Higher → switch earlier (helps deep cascades).
 
 template <>
-void EGraph<ConcurrentUnionFind>::parallel_close_async_hybrid(
+void EGraph<ConcurrentUnionFind>::parallel_filter_hybrid(
     parlay::sequence<std::pair<Id, Id>> initial_unions) {
   const bool trace = std::getenv("PE_TRACE") != nullptr;
   using clk = std::chrono::steady_clock;
@@ -569,27 +545,15 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_hybrid(
     // ---- semisort + dnc_union per bucket; emit losers + stamp ---------
     auto t_semisort = clk::now();
     auto canon_entries = parlay::map(dirty, [&](std::uint32_t i) {
-#ifdef PE_SEMISORT_SOUND
       return detail::CanonEntry{sig_hash(nodes_[i], uf_), uf_.find_root(i),
                                 static_cast<Id>(i)};
-#else
-      auto [h1, h2] = sig_hashes(nodes_[i], uf_);
-      return detail::CanonEntry{h1, uf_.find_root(i), h2};
-#endif
     });
 
-#ifdef PE_SEMISORT_SOUND
     auto equal_fn = [&](const detail::CanonEntry& a,
                         const detail::CanonEntry& b) {
       return a.hash == b.hash &&
              sigs_equal(a.class_id, b.class_id, uf_, nodes_);
     };
-#else
-    auto equal_fn = [](const detail::CanonEntry& a,
-                       const detail::CanonEntry& b) {
-      return a.hash == b.hash && a.secondary_hash == b.secondary_hash;
-    };
-#endif
 
     parlay::integer_sort_inplace(
         parlay::make_slice(canon_entries),
@@ -739,7 +703,7 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_hybrid(
 //     Net regression of ~5ms.
 
 template <>
-void EGraph<ConcurrentUnionFind>::parallel_close_async_continuous(
+void EGraph<ConcurrentUnionFind>::parallel_filter_continuous(
     parlay::sequence<std::pair<Id, Id>> initial_unions) {
   const bool trace = std::getenv("PE_TRACE") != nullptr;
   using clk = std::chrono::steady_clock;
@@ -792,20 +756,13 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_continuous(
 
   // Equality function for splitting same-primary-hash runs. Used by
   // the unioner when walking the integer-sorted canon. Hoisted to
-  // function scope so both teams can see the same definition (only
-  // matters for PE_SEMISORT_SOUND, which captures `nodes_`).
-#ifdef PE_SEMISORT_SOUND
+  // function scope so both teams can see the same definition (captures
+  // `nodes_` for the structural sigs_equal).
   auto equal_fn = [&](const detail::CanonEntry& a,
                       const detail::CanonEntry& b) {
     return a.hash == b.hash &&
            sigs_equal(a.class_id, b.class_id, uf_, nodes_);
   };
-#else
-  auto equal_fn = [](const detail::CanonEntry& a,
-                     const detail::CanonEntry& b) {
-    return a.hash == b.hash && a.secondary_hash == b.secondary_hash;
-  };
-#endif
 
   // Coordination state. Each gets its own cache line (see comment on R)
   // to keep unrelated atomics off the same MESI traffic.
@@ -862,13 +819,8 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_continuous(
 
       // Build CanonEntries.
       auto canon_entries = parlay::map(dirty, [&](std::uint32_t i) {
-#ifdef PE_SEMISORT_SOUND
         return detail::CanonEntry{sig_hash(nodes_[i], uf_), uf_.find_root(i),
                                   static_cast<Id>(i)};
-#else
-        auto [h1, h2] = sig_hashes(nodes_[i], uf_);
-        return detail::CanonEntry{h1, uf_.find_root(i), h2};
-#endif
       });
 
       // Integer-sort canon in place by primary hash, compute run
@@ -1008,7 +960,7 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_continuous(
 // reroot from the previous round.
 
 template <>
-void EGraph<ConcurrentUnionFind>::parallel_close_naive_rounds(
+void EGraph<ConcurrentUnionFind>::parallel_naive_rounds(
     parlay::sequence<std::pair<Id, Id>> initial_unions) {
   const bool trace = std::getenv("PE_TRACE") != nullptr;
   using clk = std::chrono::steady_clock;
@@ -1038,13 +990,8 @@ void EGraph<ConcurrentUnionFind>::parallel_close_naive_rounds(
 
     // ---- step 2: canonical sigs for *every* non-leaf --------------------
     auto canon_entries = parlay::map(non_leaf, [&](std::uint32_t i) {
-#ifdef PE_SEMISORT_SOUND
       return detail::CanonEntry{sig_hash(nodes_[i], uf_), uf_.find_root(i),
                                 static_cast<Id>(i)};
-#else
-      auto [h1, h2] = sig_hashes(nodes_[i], uf_);
-      return detail::CanonEntry{h1, uf_.find_root(i), h2};
-#endif
     });
 
     auto keyed = parlay::map(canon_entries, [](const detail::CanonEntry& e) {
@@ -1053,18 +1000,11 @@ void EGraph<ConcurrentUnionFind>::parallel_close_naive_rounds(
     auto hash_fn = [](const detail::CanonEntry& e) -> std::size_t {
       return e.hash;
     };
-#ifdef PE_SEMISORT_SOUND
     auto equal_fn = [&](const detail::CanonEntry& a,
                         const detail::CanonEntry& b) {
       return a.hash == b.hash &&
              sigs_equal(a.class_id, b.class_id, uf_, nodes_);
     };
-#else
-    auto equal_fn = [](const detail::CanonEntry& a,
-                       const detail::CanonEntry& b) {
-      return a.hash == b.hash && a.secondary_hash == b.secondary_hash;
-    };
-#endif
     auto groups = parlay::group_by_key(keyed, hash_fn, equal_fn);
 
     // ---- step 3: union per bucket; flag if anything changed -------------
@@ -1096,7 +1036,7 @@ void EGraph<ConcurrentUnionFind>::parallel_close_naive_rounds(
 
 // ---- MIN_ID variant -----------------------------------------------------
 //
-// Same algorithm as `parallel_close_async_rounds`; every union (initial
+// Same algorithm as `parallel_filter`; every union (initial
 // unions and dnc_union) goes through `ConcurrentUnionFind::union_min_id`
 // so the lower-id root always survives. This preserves the
 // canonical-id-stable invariant on DAG-ordered inputs: lookups and
@@ -1105,7 +1045,7 @@ void EGraph<ConcurrentUnionFind>::parallel_close_naive_rounds(
 // instead of one round per level.
 
 template <>
-void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds_min_id(
+void EGraph<ConcurrentUnionFind>::parallel_filter_min_id(
     parlay::sequence<std::pair<Id, Id>> initial_unions) {
   const bool trace = std::getenv("PE_TRACE") != nullptr;
   using clk = std::chrono::steady_clock;
@@ -1162,30 +1102,18 @@ void EGraph<ConcurrentUnionFind>::parallel_close_async_rounds_min_id(
 
     auto t_semisort = clk::now();
     auto canon_entries = parlay::map(dirty, [&](std::uint32_t i) {
-#ifdef PE_SEMISORT_SOUND
       return detail::CanonEntry{sig_hash(nodes_[i], uf_), uf_.find_root(i),
                                 static_cast<Id>(i)};
-#else
-      auto [h1, h2] = sig_hashes(nodes_[i], uf_);
-      return detail::CanonEntry{h1, uf_.find_root(i), h2};
-#endif
     });
 
-#ifdef PE_SEMISORT_SOUND
     auto equal_fn = [&](const detail::CanonEntry& a,
                         const detail::CanonEntry& b) {
       return a.hash == b.hash &&
              sigs_equal(a.class_id, b.class_id, uf_, nodes_);
     };
-#else
-    auto equal_fn = [](const detail::CanonEntry& a,
-                       const detail::CanonEntry& b) {
-      return a.hash == b.hash && a.secondary_hash == b.secondary_hash;
-    };
-#endif
 
     // Same integer-sort + run-walk swap as the by-rank variant; see
-    // commentary on parallel_close_async_rounds for the rationale.
+    // commentary on parallel_filter for the rationale.
     parlay::integer_sort_inplace(
         parlay::make_slice(canon_entries),
         [](const detail::CanonEntry& e) -> std::uint64_t { return e.hash; });

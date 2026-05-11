@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""All-phase driver for the par_topo_iter vs par_async comparison.
+"""All-phase driver for the par_topo_iter vs par_filter comparison.
 
 Phases:
   random       — closure_compare_bench (6 baked-in workloads)
@@ -74,32 +74,32 @@ GATES_DEFAULT_SUITES = ["iwls22_with_not", "hwmcc12_with_not"]
 #   nelson_topo       — sequential topo (sometimes unsound on cross-depth
 #                        initial unions; kept as historical baseline)
 #   nelson_topo_iter  — sequential topo_iter (sound, rounds-based)
-#   par_close         — BSP parallel CC (parents_-frontier)
+#   par_parents         — BSP parallel CC (parents_-frontier)
 #   par_topo_iter     — parallel topo_iter (rounds-based, sound)
-#   par_async         — async-rounds CC, integer-sort + run-walk
+#   par_filter         — async-rounds CC, integer-sort + run-walk
 #                        semisort (production)
-#   par_async_gbk     — same as par_async but using parlay::group_by_key
+#   par_filter_gbk     — same as par_filter but using parlay::group_by_key
 #                        (hash table + per-bucket sequence allocation);
 #                        kept as A/B baseline for the integer-sort swap
-#   par_async_cont    — truly-async CC (semisorter + unioner via
+#   par_filter_cont    — truly-async CC (semisorter + unioner via
 #                        parlay::par_do, deque mailbox, drain-gated
 #                        BSP-with-overlap; same dirty-filter as
-#                        par_async but pipelined within each round)
+#                        par_filter but pipelined within each round)
 #   par_naive         — naive rounds CC (semisort all non-leaves every
 #                        round; no dirty filter; the "ablation" against
-#                        par_async that quantifies what filtering buys)
+#                        par_filter that quantifies what filtering buys)
 # Default algo set: sequential baseline (nelson_simple) plus the two
-# parallel headlines (par_async, par_topo_iter). Other algos are still
-# recognized via --algos but are off by default. Add "par_async_gbk",
+# parallel headlines (par_filter, par_topo_iter). Other algos are still
+# recognized via --algos but are off by default. Add "par_filter_gbk",
 # "nelson_seq", etc. via --algos when comparing more thoroughly.
 ALGOS_OF_INTEREST = [
     "nelson_simple",
-    "par_async",
+    "par_filter",
     "par_topo_iter",
 ]
 ALGO_HEADERS = {
     "nelson_simple":  "nl_simple",
-    "par_async":      "par_async",
+    "par_filter":      "par_filter",
     "par_topo_iter":  "par_topo_it",
 }
 
@@ -121,7 +121,7 @@ def cmake_build(targets: list[str]):
     )
 
 
-# par_async_cont uses parlay::par_do(semisorter, unioner) and deadlocks
+# par_filter_cont uses parlay::par_do(semisorter, unioner) and deadlocks
 # under PARLAY_NUM_THREADS=1 (the two logical threads serialize, and
 # the semisorter's drain-gate waits forever for the unioner that never
 # runs). All four phases skip it at T=1.
@@ -138,7 +138,7 @@ def cmake_build(targets: list[str]):
 def _filter_algos_for_t(algos: "list[str] | None", t: int) -> "list[str] | None":
     if algos is None or t != 1:
         return algos
-    return [a for a in algos if a != "par_async_cont"]
+    return [a for a in algos if a != "par_filter_cont"]
 
 
 def _numactl_prefix(no_numactl: bool) -> list[str]:
@@ -246,7 +246,7 @@ def run_random_xl(out_dir: Path, thread_counts: list[int],
                 _filtered = _filter_algos_for_t(algos, t)
                 if _filtered == []:  # all algos stripped at T=1; skip cell
                     print(f"    [random-xl] T={t} all algos filtered "
-                          f"(par_async_cont unsafe at T=1); skip",
+                          f"(par_filter_cont unsafe at T=1); skip",
                           flush=True)
                     continue
                 if _filtered is not None:
@@ -293,7 +293,7 @@ def run_random(out_dir: Path, thread_counts: list[int],
             _filtered = _filter_algos_for_t(algos, t)
             if _filtered == []:
                 print(f"    [random] T={t} all algos filtered "
-                      f"(par_async_cont unsafe at T=1); skip", flush=True)
+                      f"(par_filter_cont unsafe at T=1); skip", flush=True)
                 continue
             if _filtered is not None:
                 env["PE_BENCH_ALGOS"] = ",".join(_filtered)
@@ -430,13 +430,15 @@ EGG_ALGOS: list[tuple[str, str | None, str | None]] = [
     ("nelson_topo_iter", "topo_iter",  None),
     ("nelson_dst",       "dst",        None),
     ("nelson_simple",    "simple",     None),
-    ("par_close",        None,         None),
+    ("nelson_simple_hash", "simple_hash", None),
+    ("nelson_simple_arity", "simple_arity", None),
+    ("par_parents",        None,         None),
     ("par_topo_iter",    None,         "PE_USE_TOPO"),
-    ("par_async",        None,         "PE_USE_ASYNC"),
-    ("par_async_gbk",    None,         "PE_USE_ASYNC_GBK"),
-    ("par_async_cont",   None,         "PE_USE_ASYNC_CONT"),
-    ("par_async_hybrid", None,         "PE_USE_ASYNC_HYBRID"),
-    ("par_async_min_id", None,         "PE_USE_ASYNC_MIN_ID"),
+    ("par_filter",        None,         "PE_USE_ASYNC"),
+    ("par_filter_gbk",    None,         "PE_USE_ASYNC_GBK"),
+    ("par_filter_cont",   None,         "PE_USE_ASYNC_CONT"),
+    ("par_filter_hybrid", None,         "PE_USE_ASYNC_HYBRID"),
+    ("par_filter_min_id", None,         "PE_USE_ASYNC_MIN_ID"),
     ("par_naive",        None,         "PE_USE_NAIVE"),
 ]
 
@@ -538,12 +540,12 @@ def run_egg(out_dir: Path, thread_counts: list[int],
                   "ignoring.", flush=True)
 
     # (algo, T) cells: skip sequential algos when T>1; skip
-    # par_async_cont at T=1 (deadlocks under PARLAY_NUM_THREADS=1, see
+    # par_filter_cont at T=1 (deadlocks under PARLAY_NUM_THREADS=1, see
     # _filter_algos_for_t).
     cells: list[tuple[str, str | None, str | None, int]] = []
     for t in thread_counts:
         for algo, seq_arg, env_var in egg_algos:
-            if algo == "par_async_cont" and t == 1:
+            if algo == "par_filter_cont" and t == 1:
                 continue
             if seq_arg is not None and t != 1:
                 continue
@@ -645,7 +647,7 @@ def run_gates(out_dir: Path, thread_counts: list[int],
               numactl_prefix: list[str]):
     """gates_bench across all matched .gates files at every thread
     count. By default runs all three algorithms (nelson_topo_iter,
-    par_topo_iter, par_async); --algos restricts via PE_BENCH_ALGOS.
+    par_topo_iter, par_filter); --algos restricts via PE_BENCH_ALGOS.
     nelson_topo_iter is sequential — its time doesn't depend on
     PARLAY_NUM_THREADS, but we re-run it at every T anyway because
     the per-(file, threads) cell is the unit of measurement here and
@@ -724,8 +726,9 @@ def run_gates(out_dir: Path, thread_counts: list[int],
     traces_dir.mkdir(parents=True, exist_ok=True)
 
     # Algo names gates_bench currently understands.
-    GATES_OK = ("nelson_simple", "nelson_topo_iter",
-                "par_close", "par_topo_iter", "par_async", "par_async_cont")
+    GATES_OK = ("nelson_simple", "nelson_simple_hash", "nelson_simple_arity",
+                "nelson_topo_iter",
+                "par_parents", "par_topo_iter", "par_filter", "par_filter_cont")
 
     first = True
     with open(csv_path, "w") as out:
@@ -750,7 +753,7 @@ def run_gates(out_dir: Path, thread_counts: list[int],
                 _filtered = _filter_algos_for_t(algos, t)
                 if _filtered == []:
                     print(f"    [gates] T={t} {fname} all algos filtered "
-                          f"(par_async_cont unsafe at T=1); skip",
+                          f"(par_filter_cont unsafe at T=1); skip",
                           flush=True)
                     continue
                 if _filtered is not None:
@@ -795,7 +798,7 @@ def _geomean(vs: list[float]) -> float | None:
 
 def summarize_gates(csv_path: Path):
     """Custom summary for the gates phase: pairs par_topo_iter vs
-    par_async per (file, threads), prints both geomeans + ratio + each
+    par_filter per (file, threads), prints both geomeans + ratio + each
     algorithm's strong-scaling speedup against its own T=1.
     """
     rows = list(csvmod.DictReader(open(csv_path)))
@@ -826,18 +829,18 @@ def summarize_gates(csv_path: Path):
     for f in files:
         gates, total = file_meta.get(f, (0, 0))
         topo_t1 = geomeans.get((f, threads[0], "par_topo_iter"))
-        async_t1 = geomeans.get((f, threads[0], "par_async"))
+        filter_t1 = geomeans.get((f, threads[0], "par_filter"))
         for t in threads:
             tm = geomeans.get((f, t, "par_topo_iter"))
-            am = geomeans.get((f, t, "par_async"))
+            am = geomeans.get((f, t, "par_filter"))
             tm_s = f"{tm:>10.2f}" if tm is not None else f"{'-':>10}"
             am_s = f"{am:>10.2f}" if am is not None else f"{'-':>10}"
             ratio = (f"{tm/am:>9.2f}x"
                      if (tm is not None and am and am > 0) else f"{'-':>10}")
             t_spd = (f"{topo_t1/tm:>9.2f}x"
                      if (tm and topo_t1) else f"{'-':>10}")
-            a_spd = (f"{async_t1/am:>10.2f}x"
-                     if (am and async_t1) else f"{'-':>11}")
+            a_spd = (f"{filter_t1/am:>10.2f}x"
+                     if (am and filter_t1) else f"{'-':>11}")
             short = f.replace(".gates", "")
             print(f"{short:<32} {t:>4} | {tm_s} {am_s} | "
                   f"{ratio} {t_spd} {a_spd} | {gates:>10} {total:>10}")
@@ -909,11 +912,11 @@ def summarize(csv_path: Path, group_keys: list[str]):
                 cells.append(f"{v:>{col_w[a]}.2f}" if v is not None
                              else f"{'-':>{col_w[a]}}")
             # Headline ratios:
-            #   simple/async   = sequential baseline / par_async (parallel
+            #   simple/async   = sequential baseline / par_filter (parallel
             #                    speedup over single-threaded simple).
-            #   topo_it/async  = par_topo_iter / par_async (relative cost
+            #   topo_it/async  = par_topo_iter / par_filter (relative cost
             #                    of the depth-stratified parallel path).
-            pa = vals.get("par_async")
+            pa = vals.get("par_filter")
             ns = vals.get("nelson_simple")
             pt = vals.get("par_topo_iter")
             ratio_simple_async = (f"{ns/pa:>11.2f}x"
@@ -953,14 +956,14 @@ def main():
                              "gates", "custom_smt"],
                     help="skip a phase; repeatable")
     ap.add_argument("--algos",
-                    default="par_async,par_topo_iter,nelson_simple",
+                    default="par_filter,par_topo_iter,nelson_simple",
                     help="comma-separated algorithm whitelist. Default: "
-                         "par_async,par_topo_iter,nelson_simple (the two "
+                         "par_filter,par_topo_iter,nelson_simple (the two "
                          "parallel headlines plus the sequential "
                          "baseline). Other valid names: nelson_seq, "
                          "nelson_topo, nelson_topo_iter, nelson_dst, "
-                         "par_close, par_async_gbk, par_async_cont, "
-                         "par_async_min_id, par_naive. Pass 'all' to run "
+                         "par_parents, par_filter_gbk, par_filter_cont, "
+                         "par_filter_min_id, par_naive. Pass 'all' to run "
                          "every recognized algo. Sets PE_BENCH_ALGOS for "
                          "the C++ binaries and filters the egg dispatch "
                          "loop, so unwanted algos are never run.")

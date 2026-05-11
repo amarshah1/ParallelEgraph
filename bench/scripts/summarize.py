@@ -27,7 +27,7 @@ def strong_scaling(results: Path) -> None:
     if not csv.exists():
         return
     ss = pd.read_csv(csv)
-    par = ss[ss.algorithm == "par_close"]
+    par = ss[ss.algorithm == "par_parents"]
     med = (
         par.groupby(["workload", "parlay_threads"])["wallclock_ms"]
         .median()
@@ -37,7 +37,7 @@ def strong_scaling(results: Path) -> None:
         med.pivot(index="workload", columns="parlay_threads", values="wallclock_ms")
         .sort_index(axis=1)
     )
-    _section("par_close median ms (workload × T)")
+    _section("par_parents median ms (workload × T)")
     print(wide.to_string())
     _section("speedup vs T=min")
     print(wide.rdiv(wide.iloc[:, 0], axis=0).to_string())
@@ -119,7 +119,7 @@ def smt(results: Path) -> None:
         return
     sm = pd.read_csv(csv)
     sm = sm[sm["family"].notna() & (sm["family"] != "")]
-    par = sm[sm.algorithm == "par_close"]
+    par = sm[sm.algorithm == "par_parents"]
     if par.empty:
         return
     sm_w = (
@@ -129,7 +129,7 @@ def smt(results: Path) -> None:
         .pivot(index="family", columns="n", values="wallclock_ms")
         .sort_index(axis=1)
     )
-    _section("smt par_close median ms (family × n)")
+    _section("smt par_parents median ms (family × n)")
     print(sm_w.to_string())
 
 
@@ -138,7 +138,7 @@ def workload_sweep(results: Path) -> None:
     if not csv.exists():
         return
     df = pd.read_csv(csv)
-    par = df[df.algorithm == "par_close"].copy()
+    par = df[df.algorithm == "par_parents"].copy()
     if par.empty:
         return
     par["merge_frac"] = par["merges"] / par["leaves"]
@@ -149,7 +149,7 @@ def workload_sweep(results: Path) -> None:
         .pivot(index="depth", columns="merge_frac", values="wallclock_ms")
         .sort_index(axis=1)
     )
-    _section("workload_sweep par_close median ms (depth × merge_frac)")
+    _section("workload_sweep par_parents median ms (depth × merge_frac)")
     print(med.to_string())
 
 
@@ -158,7 +158,7 @@ def width_grid(results: Path) -> None:
     if not csv.exists():
         return
     df = pd.read_csv(csv)
-    par = df[df.algorithm == "par_close"].copy()
+    par = df[df.algorithm == "par_parents"].copy()
     if par.empty:
         return
 
@@ -175,7 +175,7 @@ def width_grid(results: Path) -> None:
         .reindex(workload_order)
         .sort_index(axis=1)
     )
-    _section("width grid: par_close median ms (workload × T)")
+    _section("width grid: par_parents median ms (workload × T)")
     print(pivot.to_string())
 
     nel = df[df.algorithm == "nelson_seq"]
@@ -213,12 +213,12 @@ def merge_density(results: Path) -> None:
     if not csv.exists():
         return
     df = pd.read_csv(csv)
-    par = df[df.algorithm == "par_close"].copy()
+    par = df[df.algorithm == "par_parents"].copy()
     if par.empty:
         return
     par["merge_frac"] = par["merges"] / par["leaves"]
     med = par.groupby("merge_frac")["wallclock_ms"].median()
-    _section("merge_density: par_close median ms by merge_frac")
+    _section("merge_density: par_parents median ms by merge_frac")
     print(med.to_string())
 
 
@@ -227,11 +227,11 @@ def nfns_sweep(results: Path) -> None:
     if not csv.exists():
         return
     df = pd.read_csv(csv)
-    par = df[df.algorithm == "par_close"].copy()
+    par = df[df.algorithm == "par_parents"].copy()
     if par.empty:
         return
     med = par.groupby("fns")["wallclock_ms"].median()
-    _section("nfns_sweep: par_close median ms by n_fns")
+    _section("nfns_sweep: par_parents median ms by n_fns")
     print(med.to_string())
 
 

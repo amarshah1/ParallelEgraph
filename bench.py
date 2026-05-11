@@ -241,7 +241,7 @@ def main():
                              "no-op on macOS / single-socket boxes).")
     parser.add_argument("--sequential", action="store_true",
                         help="run sequential_close_nelson alongside "
-                             "parallel_close. Adds one row per file with "
+                             "parallel_parents. Adds one row per file with "
                              "algorithm=sequential.")
     args = parser.parse_args()
     extra = list(args.solver_arg)

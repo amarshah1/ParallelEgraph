@@ -55,7 +55,7 @@ class ConcurrentUnionFind {
 
   // MIN_ID variant: lower class id always wins (becomes root). Drops
   // by-rank balancing — path compression keeps chains short in practice.
-  // Used by the `parallel_close_async_rounds_min_id` variant; preserves
+  // Used by the `parallel_filter_min_id` variant; preserves
   // the canonical-id-stable invariant that lets DAG-ordered cascades
   // collapse in one BSP round on regular workloads (Family C).
   //
@@ -63,7 +63,7 @@ class ConcurrentUnionFind {
   // (always min(u_root, v_root)); did_merge is true iff the call
   // actually merged two distinct classes (false if u and v were
   // already in the same class). Callers that need fixpoint detection
-  // (e.g., `parallel_close_topo_iter`) capture did_merge.
+  // (e.g., `parallel_topo_iter`) capture did_merge.
   std::pair<Id, bool> union_min_id(Id u, Id v);
 
   bool same_set(Id u, Id v);

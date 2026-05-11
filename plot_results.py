@@ -9,7 +9,7 @@ For each category present (random, synthetic, cube_decomp, egg):
 
   (B) log-log speedup-vs-cores plot.
         random / synthetic / cube_decomp: speedup = nelson_seq_T1 /
-          par_close_T (so both per_close_T1 and per_close_T_max get
+          par_parents_T (so both per_close_T1 and per_close_T_max get
           plotted on the same scale, both relative to the sequential
           baseline). Median across trials.
         egg: no nelson baseline available — falls back to self-relative
@@ -173,14 +173,14 @@ def _median_ms(rows: list[dict[str, str]],
 
 
 def plot_speedup_random(csv_path: Path, out_dir: Path,
-                         par_algo: str = "par_close",
+                         par_algo: str = "par_parents",
                          seq_algo: str = "nelson_topo",
                          out_name: str | None = None):
     """X=threads, Y=seq_T1/par_T, color=workload name.
 
     `par_algo` selects which parallel algorithm column to use as the
-    numerator in the speedup ratio: "par_close" (BSP, default) or
-    "par_close_async" (async-rounds). `seq_algo` selects the
+    numerator in the speedup ratio: "par_parents" (BSP, default) or
+    "par_filter" (async-rounds). `seq_algo` selects the
     sequential baseline: "nelson_topo" (default — usually faster, more
     representative of "what a real sequential solver runs") or
     "nelson_seq" (the classic Nelson worklist baseline). Output
@@ -189,7 +189,7 @@ def plot_speedup_random(csv_path: Path, out_dir: Path,
     if not csv_path.exists():
         return
     if out_name is None:
-        out_name = ("random_speedup.png" if par_algo == "par_close"
+        out_name = ("random_speedup.png" if par_algo == "par_parents"
                     else f"random_speedup_{par_algo}.png")
     out_path = out_dir / out_name
     if _should_skip(out_path):
@@ -263,14 +263,14 @@ def plot_speedup_random(csv_path: Path, out_dir: Path,
 
 def _plot_synth_like_speedup(csv_path: Path, out_dir: Path,
                               fig_name: str, title: str,
-                              par_algo: str = "par_close",
+                              par_algo: str = "par_parents",
                               seq_algo: str = "nelson_topo"):
     """Common (synthetic / cube_decomp) speedup plot.
 
     color = (family, n) and linestyle/marker = d. The chosen sequential
     algorithm is run at one thread count per (family, n, d) — we use
-    that as the baseline. `par_algo` selects "par_close" (BSP, default)
-    or "par_close_async". `seq_algo` selects the sequential baseline
+    that as the baseline. `par_algo` selects "par_parents" (BSP, default)
+    or "par_filter". `seq_algo` selects the sequential baseline
     ("nelson_topo" default, "nelson_seq" alternative).
     """
     if not csv_path.exists():
@@ -357,9 +357,9 @@ def _plot_synth_like_speedup(csv_path: Path, out_dir: Path,
 
 
 def plot_speedup_synthetic(csv_path: Path, out_dir: Path,
-                            par_algo: str = "par_close",
+                            par_algo: str = "par_parents",
                             seq_algo: str = "nelson_topo"):
-    suffix = "" if par_algo == "par_close" else f"_{par_algo}"
+    suffix = "" if par_algo == "par_parents" else f"_{par_algo}"
     _plot_synth_like_speedup(csv_path, out_dir,
         fig_name=f"synthetic_speedup{suffix}.png",
         title=f"synthetic — speedup vs {seq_algo}, {par_algo} "
@@ -368,9 +368,9 @@ def plot_speedup_synthetic(csv_path: Path, out_dir: Path,
 
 
 def plot_speedup_cube_decomp(csv_path: Path, out_dir: Path,
-                              par_algo: str = "par_close",
+                              par_algo: str = "par_parents",
                               seq_algo: str = "nelson_topo"):
-    suffix = "" if par_algo == "par_close" else f"_{par_algo}"
+    suffix = "" if par_algo == "par_parents" else f"_{par_algo}"
     _plot_synth_like_speedup(csv_path, out_dir,
         fig_name=f"cube_decomp_speedup{suffix}.png",
         title=f"cube_decomp — speedup vs {seq_algo}, {par_algo} "
@@ -379,18 +379,18 @@ def plot_speedup_cube_decomp(csv_path: Path, out_dir: Path,
 
 
 def plot_speedup_egg(csv_path: Path, out_dir: Path, top_n: int,
-                      par_algo: str = "par_close"):
+                      par_algo: str = "par_parents"):
     """Egg has no nelson baseline → use self-relative (T1/T) on top-N
     longest-close files. `par_algo` selects which algorithm's rows to
-    use (par_close = BSP, par_close_async = async).
+    use (par_parents = BSP, par_filter = async).
 
     egg.csv before --also-async had no `algorithm` column; this function
     handles both schemas: if no `algorithm` column is present, every
-    row is treated as par_close.
+    row is treated as par_parents.
     """
     if not csv_path.exists():
         return
-    suffix = "" if par_algo == "par_close" else f"_{par_algo}"
+    suffix = "" if par_algo == "par_parents" else f"_{par_algo}"
     out_path = out_dir / f"egg_speedup{suffix}.png"
     if _should_skip(out_path):
         return
@@ -400,7 +400,7 @@ def plot_speedup_egg(csv_path: Path, out_dir: Path, top_n: int,
 
     buckets: dict[tuple[str, int], list[float]] = defaultdict(list)
     for r in rows:
-        if has_algo_col and r.get("algorithm", "par_close") != par_algo:
+        if has_algo_col and r.get("algorithm", "par_parents") != par_algo:
             continue
         try:
             f = r["file"]; t = int(r["threads"])
@@ -678,7 +678,7 @@ def main():
         if not csv.exists():
             return False
         try:
-            return any(r.get("algorithm") == "par_close_async"
+            return any(r.get("algorithm") == "par_filter"
                        for r in _read_csv(csv))
         except Exception:
             return False
@@ -691,13 +691,13 @@ def main():
         csv = run_dir / csv_name
         plot_fn(csv, figs)  # BSP
         if _has_async(csv):
-            plot_fn(csv, figs, par_algo="par_close_async")
+            plot_fn(csv, figs, par_algo="par_filter")
 
     egg_csv = run_dir / "egg.csv"
     plot_speedup_egg(egg_csv, figs, args.top_n)
     if _has_async(egg_csv):
         plot_speedup_egg(egg_csv, figs, args.top_n,
-                         par_algo="par_close_async")
+                         par_algo="par_filter")
 
     # (C) per-round time
     print("[C] per-round time lines")

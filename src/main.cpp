@@ -1,7 +1,7 @@
 // egraph-cc — congruence closure on a QF_UF SMT-LIB 2 input.
 //
 // Parses the script, builds the e-graph (parser-side hashcons + bulk ctor)
-// from the asserted equalities, runs parallel_close on the equality list,
+// from the asserted equalities, runs parallel_parents on the equality list,
 // and reports sat / unsat: unsat iff any asserted disequality (a != b)
 // collapses (find_root(a) == find_root(b)) after closure.
 //
@@ -39,14 +39,20 @@ int usage(const char* prog) {
       "  --sequential=topo_iter  run sequential_close_topo_iter\n"
       "  --sequential=dst        run sequential_close_dst\n"
       "  --sequential=simple     run sequential_close_simple (worklist + hashcons)\n"
+      "  --sequential=simple_hash run sequential_close_simple_hash (hash-only)\n"
+      "  --sequential=simple_arity run sequential_close_simple_arity (arity-specialized)\n"
+      "  --sequential=simple_bump run sequential_close_simple_bump (bump-allocator)\n"
+      "  --sequential=simple_arity_bump run sequential_close_simple_arity_bump (Sig2 + bump)\n"
+      "  --sequential=simple_inline run sequential_close_simple_inline (SigK<1..4> + bump)\n"
       "Without --sequential, the parallel path is used; selector via env:\n"
-      "  PE_USE_ASYNC=1       parallel_close_async_rounds (integer-sort)\n"
-      "  PE_USE_ASYNC_GBK=1   parallel_close_async_rounds_groupby (group_by_key)\n"
-      "  PE_USE_ASYNC_CONT=1  parallel_close_async_continuous (par_do)\n"
-      "  PE_USE_ASYNC_HYBRID=1 parallel_close_async_hybrid (filter→parents)\n"
-      "  PE_USE_NAIVE=1       parallel_close_naive_rounds (no dirty filter)\n"
-      "  PE_USE_TOPO=1        parallel_close_topo\n"
-      "  (none)               parallel_close (BSP)\n", prog);
+      "  PE_USE_ASYNC=1       parallel_filter (integer-sort)\n"
+      "  PE_USE_ASYNC_GBK=1   parallel_filter_groupby (group_by_key)\n"
+      "  PE_USE_ASYNC_CONT=1  parallel_filter_continuous (par_do)\n"
+      "  PE_USE_ASYNC_HYBRID=1 parallel_filter_hybrid (filter→parents)\n"
+      "  PE_USE_PAR_CLOSE_GBK=1 parallel_parents_groupby_sigk (sound group_by_key)\n"
+      "  PE_USE_NAIVE=1       parallel_naive_rounds (no dirty filter)\n"
+      "  PE_USE_TOPO=1        parallel_topo\n"
+      "  (none)               parallel_parents (BSP)\n", prog);
   return 2;
 }
 
@@ -70,7 +76,7 @@ int main(int argc, char** argv) {
   const char* path = nullptr;
   // --sequential family: None=parallel (default), or one of the
   // sequential algorithms.
-  enum class SeqAlgo { None, Nelson, Topo, TopoIter, Dst, Simple };
+  enum class SeqAlgo { None, Nelson, Topo, TopoIter, Dst, Simple, SimpleHash, SimpleArity, SimpleBump, SimpleArityBump, SimpleInline };
   SeqAlgo seq_algo = SeqAlgo::None;
   for (int i = 1; i < argc; ++i) {
     const char* a = argv[i];
@@ -87,6 +93,16 @@ int main(int argc, char** argv) {
       seq_algo = SeqAlgo::Dst;
     } else if (std::strcmp(a, "--sequential=simple") == 0) {
       seq_algo = SeqAlgo::Simple;
+    } else if (std::strcmp(a, "--sequential=simple_hash") == 0) {
+      seq_algo = SeqAlgo::SimpleHash;
+    } else if (std::strcmp(a, "--sequential=simple_arity") == 0) {
+      seq_algo = SeqAlgo::SimpleArity;
+    } else if (std::strcmp(a, "--sequential=simple_bump") == 0) {
+      seq_algo = SeqAlgo::SimpleBump;
+    } else if (std::strcmp(a, "--sequential=simple_arity_bump") == 0) {
+      seq_algo = SeqAlgo::SimpleArityBump;
+    } else if (std::strcmp(a, "--sequential=simple_inline") == 0) {
+      seq_algo = SeqAlgo::SimpleInline;
     } else if (path == nullptr) {
       path = a;
     } else {
@@ -173,25 +189,27 @@ int main(int argc, char** argv) {
   // Closure-algorithm selector.
   //   --sequential[=nelson|topo] → sequential path (single-threaded;
   //                                independent of PARLAY_NUM_THREADS).
-  //   PE_USE_ASYNC=1      → parallel_close_async_rounds (mark-based
+  //   PE_USE_ASYNC=1      → parallel_filter (mark-based
   //                         dirty filter, no parents_).
-  //   PE_USE_ASYNC_CONT=1 → parallel_close_async_continuous (semisorter
+  //   PE_USE_ASYNC_CONT=1 → parallel_filter_continuous (semisorter
   //                         + unioner via parlay::par_do, deque mailbox,
   //                         drain-gated BSP-with-overlap).
-  //   PE_USE_NAIVE=1      → parallel_close_naive_rounds (semisort all
+  //   PE_USE_NAIVE=1      → parallel_naive_rounds (semisort all
   //                         non-leaves every round; no dirty filter).
-  //   PE_USE_TOPO=1       → parallel_close_topo (topological-sort-based;
+  //   PE_USE_TOPO=1       → parallel_topo (topological-sort-based;
   //                         matches what closure_compare_bench /
   //                         synthetic_bench / smt_bench tag as `par_topo`).
-  // Default: parallel_close (BSP, parents_-driven).
+  // Default: parallel_parents (BSP, parents_-driven).
   const bool use_async        = std::getenv("PE_USE_ASYNC")        != nullptr;
   const bool use_async_gbk    = std::getenv("PE_USE_ASYNC_GBK")    != nullptr;
   const bool use_async_cont   = std::getenv("PE_USE_ASYNC_CONT")   != nullptr;
   const bool use_async_hybrid = std::getenv("PE_USE_ASYNC_HYBRID") != nullptr;
+  const bool use_par_parents_gbk = std::getenv("PE_USE_PAR_CLOSE_GBK") != nullptr;
   const bool use_naive        = std::getenv("PE_USE_NAIVE")        != nullptr;
   const bool use_topo         = std::getenv("PE_USE_TOPO")         != nullptr;
   if (int(use_async) + int(use_async_gbk) + int(use_async_cont) +
-      int(use_async_hybrid) + int(use_naive) + int(use_topo) > 1) {
+      int(use_async_hybrid) + int(use_par_parents_gbk) +
+      int(use_naive) + int(use_topo) > 1) {
     std::fprintf(stderr,
                  "PE_USE_ASYNC, PE_USE_ASYNC_GBK, PE_USE_ASYNC_CONT, "
                  "PE_USE_ASYNC_HYBRID, PE_USE_NAIVE, and PE_USE_TOPO are "
@@ -225,6 +243,16 @@ int main(int argc, char** argv) {
       eg->sequential_close_dst(equalities);
     } else if (seq_algo == SeqAlgo::Simple) {
       eg->sequential_close_simple(equalities);
+    } else if (seq_algo == SeqAlgo::SimpleHash) {
+      eg->sequential_close_simple_hash(equalities);
+    } else if (seq_algo == SeqAlgo::SimpleArity) {
+      eg->sequential_close_simple_arity(equalities);
+    } else if (seq_algo == SeqAlgo::SimpleBump) {
+      eg->sequential_close_simple_bump(equalities);
+    } else if (seq_algo == SeqAlgo::SimpleArityBump) {
+      eg->sequential_close_simple_arity_bump(equalities);
+    } else if (seq_algo == SeqAlgo::SimpleInline) {
+      eg->sequential_close_simple_inline(equalities);
     } else {
       eg->sequential_close_nelson(equalities);
     }
@@ -241,7 +269,7 @@ int main(int argc, char** argv) {
     std::unique_ptr<pe::ConcurrentEGraph> eg;
     if (use_async || use_async_gbk || use_async_cont) {
       // All async-family variants share the async-flavor ctor.
-      eg = std::make_unique<pe::ConcurrentEGraph>(std::move(nodes), pe::async);
+      eg = std::make_unique<pe::ConcurrentEGraph>(std::move(nodes), pe::filter);
     } else if (use_async_hybrid) {
       eg = std::make_unique<pe::ConcurrentEGraph>(std::move(nodes), pe::hybrid);
     } else if (use_naive) {
@@ -254,19 +282,21 @@ int main(int argc, char** argv) {
     t_build = clk::now();
 
     if (use_async) {
-      eg->parallel_close_async_rounds(std::move(equalities));
+      eg->parallel_filter(std::move(equalities));
     } else if (use_async_gbk) {
-      eg->parallel_close_async_rounds_groupby(std::move(equalities));
+      eg->parallel_filter_groupby(std::move(equalities));
     } else if (use_async_cont) {
-      eg->parallel_close_async_continuous(std::move(equalities));
+      eg->parallel_filter_continuous(std::move(equalities));
     } else if (use_async_hybrid) {
-      eg->parallel_close_async_hybrid(std::move(equalities));
+      eg->parallel_filter_hybrid(std::move(equalities));
+    } else if (use_par_parents_gbk) {
+      eg->parallel_parents_groupby_sigk(std::move(equalities));
     } else if (use_naive) {
-      eg->parallel_close_naive_rounds(std::move(equalities));
+      eg->parallel_naive_rounds(std::move(equalities));
     } else if (use_topo) {
-      eg->parallel_close_topo(std::move(equalities));
+      eg->parallel_topo(std::move(equalities));
     } else {
-      eg->parallel_close(std::move(equalities));
+      eg->parallel_parents(std::move(equalities));
     }
     t_close = clk::now();
 

@@ -3,7 +3,7 @@
 
 In-process port of the gen_bench.py families: builds DAGs directly into an
 EGraph via bulk_init and times only sequential_close_nelson vs
-parallel_close — no parse / build / dtor overhead. Use this when you want
+parallel_parents — no parse / build / dtor overhead. Use this when you want
 clean closure-only numbers; use bench.py against synthetic_benchmarks/
 when you want full end-to-end solver time.
 
@@ -114,7 +114,7 @@ def print_summary(csv_text: str, has_header: bool):
     """Parse synthetic_bench's CSV stdout and print a per-config summary.
 
     One line per (family, n, algorithm) with the median wallclock_ms across
-    trials. When both nelson_seq and par_close are present we also print
+    trials. When both nelson_seq and par_parents are present we also print
     the speedup. Skipped when the bench produced no rows.
     """
     reader = csvmod.reader(io.StringIO(csv_text))
@@ -150,7 +150,7 @@ def print_summary(csv_text: str, has_header: bool):
 
     # nelson_seq is sequential and thread-count-independent — we only run
     # it on the first thread count in a sweep. Carry that single median
-    # across all thread rows in the summary so every par_close row shows
+    # across all thread rows in the summary so every par_parents row shows
     # a real speedup instead of '-'.
     nelson_per_workload: dict[tuple[str, int], float] = {}
     for key, algos in medians.items():
@@ -173,7 +173,7 @@ def print_summary(csv_text: str, has_header: bool):
         family, n, threads_str = key
         algos = medians[key]
         nel = algos.get("nelson_seq") or nelson_per_workload.get((family, n))
-        par = algos.get("par_close")
+        par = algos.get("par_parents")
         nel_s = f"{nel:>10.3f}" if nel is not None else f"{'-':>10}"
         par_s = f"{par:>11.3f}" if par is not None else f"{'-':>11}"
         if nel is not None and par is not None and par > 0:
@@ -282,7 +282,7 @@ def main():
     #
     # nelson_seq is sequential and thread-count-independent, so we only
     # run it on the first thread count of each workload. Subsequent thread
-    # counts skip nelson (par_close only) — saves ~half the work on a
+    # counts skip nelson (par_parents only) — saves ~half the work on a
     # multi-thread sweep.
     total_rows = 0
     with open(args.csv_file, "a", buffering=1) as out:

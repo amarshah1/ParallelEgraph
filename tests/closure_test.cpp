@@ -1,5 +1,5 @@
 // Closure correctness test: builds small e-graphs by hand, runs both
-// parallel_close and sequential_close_nelson on the same input, and
+// parallel_parents and sequential_close_nelson on the same input, and
 // verifies they agree on equivalence relations. Replaces the SMT-LIB
 // regression test (which was deleted along with the CLI).
 
@@ -47,7 +47,7 @@ bool test_basic_congruence() {
   auto eg = std::make_unique<ConcurrentEGraph>(std::move(nodes));
   parlay::sequence<std::pair<Id, Id>> eqs;
   eqs.push_back({0, 1});  // a = b
-  eg->parallel_close(std::move(eqs));
+  eg->parallel_parents(std::move(eqs));
 
   EXPECT(eg->equiv(0, 1));   // a ≡ b
   EXPECT(eg->equiv(2, 3));   // f(a) ≡ f(b)  (the cascade)
@@ -69,7 +69,7 @@ bool test_two_level_cascade() {
   auto eg = std::make_unique<ConcurrentEGraph>(std::move(nodes));
   parlay::sequence<std::pair<Id, Id>> eqs;
   eqs.push_back({0, 1});
-  eg->parallel_close(std::move(eqs));
+  eg->parallel_parents(std::move(eqs));
 
   EXPECT(eg->equiv(0, 1));
   EXPECT(eg->equiv(2, 3));
@@ -92,7 +92,7 @@ bool test_no_spurious_merges() {
   auto eg = std::make_unique<ConcurrentEGraph>(std::move(nodes));
   parlay::sequence<std::pair<Id, Id>> eqs;
   eqs.push_back({0, 1});  // only a = b
-  eg->parallel_close(std::move(eqs));
+  eg->parallel_parents(std::move(eqs));
 
   EXPECT(eg->equiv(0, 1));
   EXPECT(eg->equiv(3, 4));    // f(a) ≡ f(b)
@@ -122,7 +122,7 @@ bool test_mixed_arity() {
   eqs.push_back({3, 4});
   // Also: a = c → f1(a) ≡ f1(c) via congruence.
   eqs.push_back({0, 2});
-  eg->parallel_close(std::move(eqs));
+  eg->parallel_parents(std::move(eqs));
 
   EXPECT(eg->equiv(3, 4));    // initial union held
   EXPECT(eg->equiv(0, 2));    // initial union held
@@ -132,7 +132,7 @@ bool test_mixed_arity() {
 }
 
 // ---------------------------------------------------------------------------
-// par_close and sequential_close_nelson agree on a randomly-shaped input.
+// par_parents and sequential_close_nelson agree on a randomly-shaped input.
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // sequential_close_topo agrees with Nelson on the synthetic benchmark
@@ -187,7 +187,7 @@ bool test_topo_agrees_with_nelson() {
 }
 
 // ---------------------------------------------------------------------------
-// parallel_close_topo (depth-stratified BSP) agrees with Nelson on the
+// parallel_topo (depth-stratified BSP) agrees with Nelson on the
 // same hand-built input as par_vs_seq_agree.
 // ---------------------------------------------------------------------------
 bool test_par_topo_agrees_with_nelson() {
@@ -219,7 +219,7 @@ bool test_par_topo_agrees_with_nelson() {
   eg_nel->sequential_close_nelson(unions());
 
   auto eg_pt = std::make_unique<ConcurrentEGraph>(build_nodes(), pe::topo);
-  eg_pt->parallel_close_topo(unions());
+  eg_pt->parallel_topo(unions());
 
   for (Id i = 0; i < 12; ++i) {
     for (Id j = i + 1; j < 12; ++j) {
@@ -281,29 +281,29 @@ bool test_par_topo_cross_depth_init() {
     return eqs;
   };
 
-  // parallel_close uses the BSP frontier (`parents_`) and re-processes
+  // parallel_parents uses the BSP frontier (`parents_`) and re-processes
   // affected classes after each round of unions, so it reaches the
   // mathematical closure on this input. We use it as the oracle.
   auto eg_par = std::make_unique<ConcurrentEGraph>(build_nodes());
-  eg_par->parallel_close(unions());
+  eg_par->parallel_parents(unions());
   if (!eg_par->equiv(7, 8)) {
     std::fprintf(stderr,
-                 "FAIL: parallel_close didn't derive g(ta1,t) ≡ g(ta2,t) "
+                 "FAIL: parallel_parents didn't derive g(ta1,t) ≡ g(ta2,t) "
                  "(test setup issue — closure should give 7 ≡ 8)\n");
     return false;
   }
 
   auto eg_pt = std::make_unique<ConcurrentEGraph>(build_nodes(), pe::topo);
-  eg_pt->parallel_close_topo(unions());
+  eg_pt->parallel_topo(unions());
 
-  // Compare every equivalence class against the parallel_close oracle.
+  // Compare every equivalence class against the parallel_parents oracle.
   for (Id i = 0; i < 9; ++i) {
     for (Id j = i + 1; j < 9; ++j) {
       bool oracle = eg_par->equiv(i, j);
       bool pt = eg_pt->equiv(i, j);
       if (oracle != pt) {
         std::fprintf(stderr,
-                     "FAIL par_topo vs parallel_close on (%u, %u): "
+                     "FAIL par_topo vs parallel_parents on (%u, %u): "
                      "oracle=%d pt=%d\n",
                      i, j, int(oracle), int(pt));
         return false;
@@ -349,10 +349,10 @@ bool test_seq_topo_adversarial_order() {
   };
 
   auto eg_par = std::make_unique<ConcurrentEGraph>(build_nodes());
-  eg_par->parallel_close(unions());
+  eg_par->parallel_parents(unions());
   if (!eg_par->equiv(5, 6)) {
     std::fprintf(stderr,
-                 "FAIL: parallel_close didn't derive g(ta1,t) ≡ g(ta2,t) "
+                 "FAIL: parallel_parents didn't derive g(ta1,t) ≡ g(ta2,t) "
                  "(test setup issue)\n");
     return false;
   }
@@ -366,7 +366,7 @@ bool test_seq_topo_adversarial_order() {
       bool st = eg_st->equiv(i, j);
       if (oracle != st) {
         std::fprintf(stderr,
-                     "FAIL seq_topo vs parallel_close on (%u, %u): "
+                     "FAIL seq_topo vs parallel_parents on (%u, %u): "
                      "oracle=%d seq_topo=%d\n",
                      i, j, int(oracle), int(st));
         return false;
@@ -398,7 +398,7 @@ bool test_seq_dst_cross_depth() {
   };
 
   auto eg_par = std::make_unique<ConcurrentEGraph>(build_nodes());
-  eg_par->parallel_close(unions());
+  eg_par->parallel_parents(unions());
 
   auto eg_dst = std::make_unique<SequentialEGraph>(build_nodes());
   eg_dst->sequential_close_dst(unions());
@@ -407,7 +407,7 @@ bool test_seq_dst_cross_depth() {
     for (Id j = i + 1; j < 9; ++j) {
       if (eg_par->equiv(i, j) != eg_dst->equiv(i, j)) {
         std::fprintf(stderr,
-                     "FAIL seq_dst vs parallel_close on (%u, %u): "
+                     "FAIL seq_dst vs parallel_parents on (%u, %u): "
                      "oracle=%d dst=%d\n",
                      i, j, int(eg_par->equiv(i, j)), int(eg_dst->equiv(i, j)));
         return false;
@@ -417,7 +417,7 @@ bool test_seq_dst_cross_depth() {
   return true;
 }
 
-// `sequential_close_simple` should match `parallel_close` on the same
+// `sequential_close_simple` should match `parallel_parents` on the same
 // cross-depth input — confirms the worklist + hashcons baseline handles
 // arbitrary initial-union shapes.
 bool test_seq_simple_cross_depth() {
@@ -438,7 +438,7 @@ bool test_seq_simple_cross_depth() {
   };
 
   auto eg_par = std::make_unique<ConcurrentEGraph>(build_nodes());
-  eg_par->parallel_close(unions());
+  eg_par->parallel_parents(unions());
 
   auto eg_simple = std::make_unique<SequentialEGraph>(build_nodes());
   eg_simple->sequential_close_simple(unions());
@@ -447,7 +447,7 @@ bool test_seq_simple_cross_depth() {
     for (Id j = i + 1; j < 9; ++j) {
       if (eg_par->equiv(i, j) != eg_simple->equiv(i, j)) {
         std::fprintf(stderr,
-                     "FAIL seq_simple vs parallel_close on (%u, %u): "
+                     "FAIL seq_simple vs parallel_parents on (%u, %u): "
                      "oracle=%d simple=%d\n",
                      i, j, int(eg_par->equiv(i, j)),
                      int(eg_simple->equiv(i, j)));
@@ -458,9 +458,96 @@ bool test_seq_simple_cross_depth() {
   return true;
 }
 
+// Same shape as test_seq_simple_cross_depth, but exercises the hash-only
+// variant `sequential_close_simple_hash`. Lets us assert that the hash-
+// equality model (96-bit signature, no structural recheck) produces the
+// same closure as the structural variant on this small input. Larger-
+// scale guarantee remains probabilistic (probability ≤ N²/2⁹⁷ of a
+// spurious merge across a single closure run).
+bool test_seq_simple_hash_cross_depth() {
+  auto build_nodes = []() {
+    return make_nodes({
+        ENode{"a",  {}}, ENode{"b",  {}},
+        ENode{"ta1", {}}, ENode{"ta2", {}}, ENode{"t",  {}},
+        ENode{"f", {0}}, ENode{"f", {1}},
+        ENode{"g", {2, 4}}, ENode{"g", {3, 4}},
+    });
+  };
+  auto unions = []() {
+    parlay::sequence<std::pair<Id, Id>> eqs;
+    eqs.push_back({0, 1});
+    eqs.push_back({2, 5});
+    eqs.push_back({3, 6});
+    return eqs;
+  };
+
+  auto eg_par = std::make_unique<ConcurrentEGraph>(build_nodes());
+  eg_par->parallel_parents(unions());
+
+  auto eg_h = std::make_unique<SequentialEGraph>(build_nodes());
+  eg_h->sequential_close_simple_hash(unions());
+
+  for (Id i = 0; i < 9; ++i) {
+    for (Id j = i + 1; j < 9; ++j) {
+      if (eg_par->equiv(i, j) != eg_h->equiv(i, j)) {
+        std::fprintf(stderr,
+                     "FAIL seq_simple_hash vs parallel_parents on (%u, %u): "
+                     "oracle=%d hash=%d\n",
+                     i, j, int(eg_par->equiv(i, j)),
+                     int(eg_h->equiv(i, j)));
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+// Same cross-depth input as test_seq_simple_cross_depth, exercising
+// `sequential_close_simple_arity` — the arity-specialized variant that
+// uses an inline `Sig2` hashtable for the arity-≤2 fast path and a
+// `Signature` fallback for arity > 2. This test mixes arities (f is
+// unary, g is binary), so both internal tables get hit.
+bool test_seq_simple_arity_cross_depth() {
+  auto build_nodes = []() {
+    return make_nodes({
+        ENode{"a",  {}}, ENode{"b",  {}},
+        ENode{"ta1", {}}, ENode{"ta2", {}}, ENode{"t",  {}},
+        ENode{"f", {0}}, ENode{"f", {1}},
+        ENode{"g", {2, 4}}, ENode{"g", {3, 4}},
+    });
+  };
+  auto unions = []() {
+    parlay::sequence<std::pair<Id, Id>> eqs;
+    eqs.push_back({0, 1});
+    eqs.push_back({2, 5});
+    eqs.push_back({3, 6});
+    return eqs;
+  };
+
+  auto eg_par = std::make_unique<ConcurrentEGraph>(build_nodes());
+  eg_par->parallel_parents(unions());
+
+  auto eg_a = std::make_unique<SequentialEGraph>(build_nodes());
+  eg_a->sequential_close_simple_arity(unions());
+
+  for (Id i = 0; i < 9; ++i) {
+    for (Id j = i + 1; j < 9; ++j) {
+      if (eg_par->equiv(i, j) != eg_a->equiv(i, j)) {
+        std::fprintf(stderr,
+                     "FAIL seq_simple_arity vs parallel_parents on (%u, %u): "
+                     "oracle=%d arity=%d\n",
+                     i, j, int(eg_par->equiv(i, j)),
+                     int(eg_a->equiv(i, j)));
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 // Same input shape but with the g's reordered before the f's — the
 // adversarial ordering that defeats sequential_close_topo. The dst path
-// is order-independent and should still match parallel_close.
+// is order-independent and should still match parallel_parents.
 bool test_seq_dst_adversarial_order() {
   auto build_nodes = []() {
     return make_nodes({
@@ -481,7 +568,7 @@ bool test_seq_dst_adversarial_order() {
   };
 
   auto eg_par = std::make_unique<ConcurrentEGraph>(build_nodes());
-  eg_par->parallel_close(unions());
+  eg_par->parallel_parents(unions());
 
   auto eg_dst = std::make_unique<SequentialEGraph>(build_nodes());
   eg_dst->sequential_close_dst(unions());
@@ -490,7 +577,7 @@ bool test_seq_dst_adversarial_order() {
     for (Id j = i + 1; j < 9; ++j) {
       if (eg_par->equiv(i, j) != eg_dst->equiv(i, j)) {
         std::fprintf(stderr,
-                     "FAIL seq_dst (adversarial) vs parallel_close on "
+                     "FAIL seq_dst (adversarial) vs parallel_parents on "
                      "(%u, %u): oracle=%d dst=%d\n",
                      i, j, int(eg_par->equiv(i, j)), int(eg_dst->equiv(i, j)));
         return false;
@@ -524,7 +611,7 @@ bool test_seq_topo_iter_adversarial_order() {
   };
 
   auto eg_par = std::make_unique<ConcurrentEGraph>(build_nodes());
-  eg_par->parallel_close(unions());
+  eg_par->parallel_parents(unions());
 
   auto eg_iter = std::make_unique<SequentialEGraph>(build_nodes());
   eg_iter->sequential_close_topo_iter(unions());
@@ -533,7 +620,7 @@ bool test_seq_topo_iter_adversarial_order() {
     for (Id j = i + 1; j < 9; ++j) {
       if (eg_par->equiv(i, j) != eg_iter->equiv(i, j)) {
         std::fprintf(stderr,
-                     "FAIL seq_topo_iter vs parallel_close on (%u, %u): "
+                     "FAIL seq_topo_iter vs parallel_parents on (%u, %u): "
                      "oracle=%d iter=%d\n",
                      i, j, int(eg_par->equiv(i, j)),
                      int(eg_iter->equiv(i, j)));
@@ -545,11 +632,11 @@ bool test_seq_topo_iter_adversarial_order() {
 }
 
 // ---------------------------------------------------------------------------
-// `parallel_close_async_rounds` should match `parallel_close` on the
+// `parallel_filter` should match `parallel_parents` on the
 // cross-depth init scenario — confirms the async-rounds variant doesn't
-// inherit the same depth-stratification bug as `parallel_close_topo`.
+// inherit the same depth-stratification bug as `parallel_topo`.
 // ---------------------------------------------------------------------------
-bool test_par_async_cross_depth() {
+bool test_par_filter_cross_depth() {
   auto build_nodes = []() {
     return make_nodes({
         ENode{"a",  {}}, ENode{"b",  {}},
@@ -567,16 +654,16 @@ bool test_par_async_cross_depth() {
   };
 
   auto eg_par = std::make_unique<ConcurrentEGraph>(build_nodes());
-  eg_par->parallel_close(unions());
+  eg_par->parallel_parents(unions());
 
-  auto eg_async = std::make_unique<ConcurrentEGraph>(build_nodes(), pe::async);
-  eg_async->parallel_close_async_rounds(unions());
+  auto eg_async = std::make_unique<ConcurrentEGraph>(build_nodes(), pe::filter);
+  eg_async->parallel_filter(unions());
 
   for (Id i = 0; i < 9; ++i) {
     for (Id j = i + 1; j < 9; ++j) {
       if (eg_par->equiv(i, j) != eg_async->equiv(i, j)) {
         std::fprintf(stderr,
-                     "FAIL par_async vs parallel_close on (%u, %u): "
+                     "FAIL par_filter vs parallel_parents on (%u, %u): "
                      "oracle=%d async=%d\n",
                      i, j, int(eg_par->equiv(i, j)),
                      int(eg_async->equiv(i, j)));
@@ -588,11 +675,11 @@ bool test_par_async_cross_depth() {
 }
 
 // ---------------------------------------------------------------------------
-// `parallel_close_async_continuous` should match `parallel_close` on the
+// `parallel_filter_continuous` should match `parallel_parents` on the
 // cross-depth init scenario — confirms the truly-async pipelined variant
 // converges to the same closure as the rounded async path.
 // ---------------------------------------------------------------------------
-bool test_par_async_cont_cross_depth() {
+bool test_par_filter_cont_cross_depth() {
   auto build_nodes = []() {
     return make_nodes({
         ENode{"a",  {}}, ENode{"b",  {}},
@@ -610,16 +697,16 @@ bool test_par_async_cont_cross_depth() {
   };
 
   auto eg_par = std::make_unique<ConcurrentEGraph>(build_nodes());
-  eg_par->parallel_close(unions());
+  eg_par->parallel_parents(unions());
 
-  auto eg_cont = std::make_unique<ConcurrentEGraph>(build_nodes(), pe::async);
-  eg_cont->parallel_close_async_continuous(unions());
+  auto eg_cont = std::make_unique<ConcurrentEGraph>(build_nodes(), pe::filter);
+  eg_cont->parallel_filter_continuous(unions());
 
   for (Id i = 0; i < 9; ++i) {
     for (Id j = i + 1; j < 9; ++j) {
       if (eg_par->equiv(i, j) != eg_cont->equiv(i, j)) {
         std::fprintf(stderr,
-                     "FAIL par_async_cont vs parallel_close on (%u, %u): "
+                     "FAIL par_filter_cont vs parallel_parents on (%u, %u): "
                      "oracle=%d cont=%d\n",
                      i, j, int(eg_par->equiv(i, j)),
                      int(eg_cont->equiv(i, j)));
@@ -631,7 +718,7 @@ bool test_par_async_cont_cross_depth() {
 }
 
 // ---------------------------------------------------------------------------
-// `parallel_close_naive_rounds` should match `parallel_close` on the
+// `parallel_naive_rounds` should match `parallel_parents` on the
 // cross-depth init scenario — confirms the no-filter naive baseline
 // converges to the same closure as the dirty-filter async variant.
 // ---------------------------------------------------------------------------
@@ -653,16 +740,16 @@ bool test_par_naive_cross_depth() {
   };
 
   auto eg_par = std::make_unique<ConcurrentEGraph>(build_nodes());
-  eg_par->parallel_close(unions());
+  eg_par->parallel_parents(unions());
 
   auto eg_naive = std::make_unique<ConcurrentEGraph>(build_nodes(), pe::naive);
-  eg_naive->parallel_close_naive_rounds(unions());
+  eg_naive->parallel_naive_rounds(unions());
 
   for (Id i = 0; i < 9; ++i) {
     for (Id j = i + 1; j < 9; ++j) {
       if (eg_par->equiv(i, j) != eg_naive->equiv(i, j)) {
         std::fprintf(stderr,
-                     "FAIL par_naive vs parallel_close on (%u, %u): "
+                     "FAIL par_naive vs parallel_parents on (%u, %u): "
                      "oracle=%d naive=%d\n",
                      i, j, int(eg_par->equiv(i, j)),
                      int(eg_naive->equiv(i, j)));
@@ -674,11 +761,11 @@ bool test_par_naive_cross_depth() {
 }
 
 // ---------------------------------------------------------------------------
-// `parallel_close_async_rounds_min_id` should match `parallel_close` on
+// `parallel_filter_min_id` should match `parallel_parents` on
 // the cross-depth init scenario — confirms the MIN_ID variant doesn't
 // regress correctness when classes get merged across depth boundaries.
 // ---------------------------------------------------------------------------
-bool test_par_async_min_cross_depth() {
+bool test_par_filter_min_cross_depth() {
   auto build_nodes = []() {
     return make_nodes({
         ENode{"a",  {}}, ENode{"b",  {}},
@@ -696,16 +783,16 @@ bool test_par_async_min_cross_depth() {
   };
 
   auto eg_par = std::make_unique<ConcurrentEGraph>(build_nodes());
-  eg_par->parallel_close(unions());
+  eg_par->parallel_parents(unions());
 
-  auto eg_min = std::make_unique<ConcurrentEGraph>(build_nodes(), pe::async);
-  eg_min->parallel_close_async_rounds_min_id(unions());
+  auto eg_min = std::make_unique<ConcurrentEGraph>(build_nodes(), pe::filter);
+  eg_min->parallel_filter_min_id(unions());
 
   for (Id i = 0; i < 9; ++i) {
     for (Id j = i + 1; j < 9; ++j) {
       if (eg_par->equiv(i, j) != eg_min->equiv(i, j)) {
         std::fprintf(stderr,
-                     "FAIL par_async_min vs parallel_close on (%u, %u): "
+                     "FAIL par_filter_min vs parallel_parents on (%u, %u): "
                      "oracle=%d min=%d\n",
                      i, j, int(eg_par->equiv(i, j)),
                      int(eg_min->equiv(i, j)));
@@ -717,8 +804,8 @@ bool test_par_async_min_cross_depth() {
 }
 
 // ---------------------------------------------------------------------------
-// `parallel_close_topo_iter` is the iterated MIN_ID variant of the
-// previously-unsound `parallel_close_topo`. Should match `parallel_close`
+// `parallel_topo_iter` is the iterated MIN_ID variant of the
+// previously-unsound `parallel_topo`. Should match `parallel_parents`
 // on the cross-depth scenario thanks to the fixpoint loop.
 // ---------------------------------------------------------------------------
 bool test_par_topo_iter_cross_depth() {
@@ -739,16 +826,16 @@ bool test_par_topo_iter_cross_depth() {
   };
 
   auto eg_par = std::make_unique<ConcurrentEGraph>(build_nodes());
-  eg_par->parallel_close(unions());
+  eg_par->parallel_parents(unions());
 
   auto eg_pti = std::make_unique<ConcurrentEGraph>(build_nodes(), pe::topo);
-  eg_pti->parallel_close_topo_iter(unions());
+  eg_pti->parallel_topo_iter(unions());
 
   for (Id i = 0; i < 9; ++i) {
     for (Id j = i + 1; j < 9; ++j) {
       if (eg_par->equiv(i, j) != eg_pti->equiv(i, j)) {
         std::fprintf(stderr,
-                     "FAIL par_topo_iter vs parallel_close on (%u, %u): "
+                     "FAIL par_topo_iter vs parallel_parents on (%u, %u): "
                      "oracle=%d pti=%d\n",
                      i, j, int(eg_par->equiv(i, j)),
                      int(eg_pti->equiv(i, j)));
@@ -786,7 +873,7 @@ bool test_par_vs_seq_agree() {
   };
 
   auto eg_par = std::make_unique<ConcurrentEGraph>(build_nodes());
-  eg_par->parallel_close(unions());
+  eg_par->parallel_parents(unions());
 
   auto eg_seq = std::make_unique<SequentialEGraph>(build_nodes());
   eg_seq->sequential_close_nelson(unions());
@@ -832,7 +919,7 @@ bool test_self_merge_no_loop() {
   parlay::sequence<std::pair<Id, Id>> eqs;
   eqs.push_back({0, 1});  // a = b
   eqs.push_back({2, 0});  // f(a, b) = a  — collapses parent into children
-  eg->parallel_close(std::move(eqs));  // must not loop
+  eg->parallel_parents(std::move(eqs));  // must not loop
 
   EXPECT(eg->equiv(0, 1));
   EXPECT(eg->equiv(0, 2));
@@ -857,10 +944,12 @@ int main() {
       {"seq_dst_cross_depth", test_seq_dst_cross_depth},
       {"seq_dst_adversarial", test_seq_dst_adversarial_order},
       {"seq_simple_cross_depth", test_seq_simple_cross_depth},
+      {"seq_simple_hash_cross_depth", test_seq_simple_hash_cross_depth},
+      {"seq_simple_arity_cross_depth", test_seq_simple_arity_cross_depth},
       {"seq_topo_iter_adversarial", test_seq_topo_iter_adversarial_order},
-      {"par_async_cross_depth", test_par_async_cross_depth},
-      {"par_async_min_cross_depth", test_par_async_min_cross_depth},
-      {"par_async_cont_cross_depth", test_par_async_cont_cross_depth},
+      {"par_filter_cross_depth", test_par_filter_cross_depth},
+      {"par_filter_min_cross_depth", test_par_filter_min_cross_depth},
+      {"par_filter_cont_cross_depth", test_par_filter_cont_cross_depth},
       {"par_naive_cross_depth", test_par_naive_cross_depth},
       {"par_topo_iter_cross_depth", test_par_topo_iter_cross_depth},
       {"self_merge_no_loop", test_self_merge_no_loop},

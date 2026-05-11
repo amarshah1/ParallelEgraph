@@ -1,5 +1,5 @@
 #pragma once
-// Internal phase helpers from parallel_close, exposed only for the
+// Internal phase helpers from parallel_parents, exposed only for the
 // component microbench. Not part of the stable public API.
 
 #include <cstdint>
@@ -13,20 +13,12 @@
 namespace pe::detail {
 
 // `hash` is the 64-bit primary signature hash, used as the group_by key.
-// The trailing 4-byte slot is either `secondary_hash` (default; verifies
-// equality with a 32-bit compare) or `class_id` (sound path; the e-class
-// id of the node, also the index into `nodes_`, used by sigs_equal to
-// recover the ENode for a structural compare). Selected at build time
-// via the PE_SEMISORT_SOUND compile-time switch. The struct is 16 bytes
-// either way.
+// `class_id` is the e-class id (also the index into `nodes_`), used by
+// sigs_equal to recover the ENode for a structural compare. 16 bytes.
 struct CanonEntry {
   std::uint64_t hash;
   Id root;
-#ifdef PE_SEMISORT_SOUND
   Id class_id;
-#else
-  std::uint32_t secondary_hash;
-#endif
 };
 
 // Optional sub-phase wallclock attribution for merge_and_collect_semisort.
@@ -49,7 +41,7 @@ parlay::sequence<Id> merge_and_collect_semisort(
     SemisortTimings* timings = nullptr);
 
 // Lean variant: semisort by signature, dnc_union each non-singleton
-// bucket, return nothing. Used by `parallel_close_topo`, which has no
+// bucket, return nothing. Used by `parallel_topo`, which has no
 // next-round frontier to build.
 void apply_congruence_semisort(
     parlay::sequence<CanonEntry> canon,

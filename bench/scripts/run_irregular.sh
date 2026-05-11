@@ -39,7 +39,7 @@ import pandas as pd
 import statistics
 df = pd.read_csv("bench/results/irregular.csv")
 nel = df[df.algorithm == "nelson_seq"]["wallclock_ms"].median()
-par = df[df.algorithm == "par_close"]["wallclock_ms"].median()
+par = df[df.algorithm == "par_parents"]["wallclock_ms"].median()
 n_leaves = int(df.iloc[0]["leaves"])
 n_nodes = int(df.iloc[0]["nodes"])
 n_merges = int(df.iloc[0]["merges"])
@@ -48,6 +48,6 @@ print()
 print(f"=== irregular workload (leaves={n_leaves} nodes={n_nodes} "
       f"merges={n_merges} T={T}) ===")
 print(f"  nelson_seq median: {nel:8.2f} ms")
-print(f"  par_close  median: {par:8.2f} ms")
+print(f"  par_parents  median: {par:8.2f} ms")
 print(f"  speedup:           {nel/par:8.2f}x")
 PY

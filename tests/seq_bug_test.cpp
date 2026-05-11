@@ -24,7 +24,7 @@
 // All of {6, 7, 8} should be in one class, and that class should equal
 // {1, 4, 5}.
 //
-// Compare against parallel_close which is independently correct.
+// Compare against parallel_parents which is independently correct.
 
 #include <cstdio>
 #include "parallel_egraph/egraph.hpp"
@@ -55,13 +55,13 @@ static parlay::sequence<std::pair<Id, Id>> unions() {
 int main() {
   // BSP path is independently correct; use it as the oracle.
   auto eg_par = std::make_unique<ConcurrentEGraph>(nodes());
-  eg_par->parallel_close(unions());
+  eg_par->parallel_parents(unions());
 
   // Sequential path under test.
   auto eg_seq = std::make_unique<SequentialEGraph>(nodes());
   eg_seq->sequential_close_nelson(unions());
 
-  std::puts("=== par_close (oracle) classes ===");
+  std::puts("=== par_parents (oracle) classes ===");
   for (Id i = 0; i < 9; ++i) {
     if (i == 3) continue;
     std::printf("  %u → root %u\n", i, eg_par->uf().find_root(i));
@@ -81,7 +81,7 @@ int main() {
   std::printf("seq: 6≡7≡8? %s\n", seq_678_one_class ? "YES" : "NO");
 
   if (par_678_one_class && !seq_678_one_class) {
-    std::puts("\nBUG CONFIRMED: par_close says 6≡7≡8, but "
+    std::puts("\nBUG CONFIRMED: par_parents says 6≡7≡8, but "
               "sequential_close_nelson does not.");
     return 1;
   }
@@ -89,6 +89,6 @@ int main() {
     std::puts("\nNo bug observed. Both say 6≡7≡8.");
     return 0;
   }
-  std::puts("\nUnexpected: par_close itself says 6 NOT≡ 7≡8. Test setup wrong.");
+  std::puts("\nUnexpected: par_parents itself says 6 NOT≡ 7≡8. Test setup wrong.");
   return 2;
 }

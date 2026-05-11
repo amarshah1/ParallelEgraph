@@ -1,6 +1,6 @@
 // In-process port of gen_bench.py's synthetic families. Builds the same
 // DAGs directly into an EGraph via its bulk ctor (skipping the SMT-LIB
-// parse/build path) and times sequential_close_nelson vs parallel_close on
+// parse/build path) and times sequential_close_nelson vs parallel_parents on
 // the resulting equality batch. Only closure time is measured — graph
 // construction is amortized out of the hot loop the same way
 // closure_compare.cpp does it.
@@ -332,7 +332,7 @@ BuiltGraph<UF> build_async(Family f, std::size_t n, std::size_t g_arity) {
   auto w = gen_workload(f, n, g_arity);
   const std::size_t total = w.nodes.size();
   const std::size_t n_eqs = w.eqs.size();
-  auto eg = std::make_unique<EGraph<UF>>(std::move(w.nodes), pe::async);
+  auto eg = std::make_unique<EGraph<UF>>(std::move(w.nodes), pe::filter);
   return {std::move(eg), std::move(w.eqs), total, n_eqs};
 }
 
@@ -349,7 +349,7 @@ BuiltGraph<UF> build_topo(Family f, std::size_t n, std::size_t g_arity) {
 
 // Naive-flavor build: workload generation identical, EGraph via the
 // naive-tagged ctor (UF only — no auxiliary state). Used by
-// bench_parallel_close_naive.
+// bench_parallel_naive.
 template <typename UF>
 BuiltGraph<UF> build_naive(Family f, std::size_t n, std::size_t g_arity) {
   auto w = gen_workload(f, n, g_arity);
@@ -491,125 +491,143 @@ std::vector<double> bench_nelson_simple(Family f, std::size_t n,
   return times;
 }
 
-std::vector<double> bench_parallel_close(Family f, std::size_t n,
+std::vector<double> bench_nelson_simple_hash(Family f, std::size_t n,
+                                              std::size_t g_arity,
+                                              int warmup, int trials) {
+  for (int i = 0; i < warmup; ++i) {
+    auto g = build<SequentialUnionFind>(f, n, g_arity);
+    g.eg->sequential_close_simple_hash(g.eqs);
+  }
+  std::vector<double> times;
+  times.reserve(trials);
+  for (int i = 0; i < trials; ++i) {
+    auto g = build<SequentialUnionFind>(f, n, g_arity);
+    auto t0 = clk::now();
+    g.eg->sequential_close_simple_hash(g.eqs);
+    times.push_back(elapsed_ms(t0));
+  }
+  return times;
+}
+
+std::vector<double> bench_parallel_parents(Family f, std::size_t n,
                                           std::size_t g_arity,
                                           int warmup, int trials) {
   for (int i = 0; i < warmup; ++i) {
     auto g = build<ConcurrentUnionFind>(f, n, g_arity);
-    g.eg->parallel_close(std::move(g.eqs));
+    g.eg->parallel_parents(std::move(g.eqs));
   }
   std::vector<double> times;
   times.reserve(trials);
   for (int i = 0; i < trials; ++i) {
     auto g = build<ConcurrentUnionFind>(f, n, g_arity);
     auto t0 = clk::now();
-    g.eg->parallel_close(std::move(g.eqs));
+    g.eg->parallel_parents(std::move(g.eqs));
     times.push_back(elapsed_ms(t0));
   }
   return times;
 }
 
-std::vector<double> bench_parallel_close_async_groupby(
+std::vector<double> bench_parallel_filter_groupby(
     Family f, std::size_t n, std::size_t g_arity, int warmup, int trials) {
   for (int i = 0; i < warmup; ++i) {
     auto g = build_async<ConcurrentUnionFind>(f, n, g_arity);
-    g.eg->parallel_close_async_rounds_groupby(std::move(g.eqs));
+    g.eg->parallel_filter_groupby(std::move(g.eqs));
   }
   std::vector<double> times;
   times.reserve(trials);
   for (int i = 0; i < trials; ++i) {
     auto g = build_async<ConcurrentUnionFind>(f, n, g_arity);
     auto t0 = clk::now();
-    g.eg->parallel_close_async_rounds_groupby(std::move(g.eqs));
+    g.eg->parallel_filter_groupby(std::move(g.eqs));
     times.push_back(elapsed_ms(t0));
   }
   return times;
 }
 
-std::vector<double> bench_parallel_close_async(Family f, std::size_t n,
+std::vector<double> bench_parallel_filter(Family f, std::size_t n,
                                                  std::size_t g_arity,
                                                  int warmup, int trials) {
   for (int i = 0; i < warmup; ++i) {
     auto g = build_async<ConcurrentUnionFind>(f, n, g_arity);
-    g.eg->parallel_close_async_rounds(std::move(g.eqs));
+    g.eg->parallel_filter(std::move(g.eqs));
   }
   std::vector<double> times;
   times.reserve(trials);
   for (int i = 0; i < trials; ++i) {
     auto g = build_async<ConcurrentUnionFind>(f, n, g_arity);
     auto t0 = clk::now();
-    g.eg->parallel_close_async_rounds(std::move(g.eqs));
+    g.eg->parallel_filter(std::move(g.eqs));
     times.push_back(elapsed_ms(t0));
   }
   return times;
 }
 
-std::vector<double> bench_parallel_close_async_continuous(
+std::vector<double> bench_parallel_filter_continuous(
     Family f, std::size_t n, std::size_t g_arity, int warmup, int trials) {
   for (int i = 0; i < warmup; ++i) {
     auto g = build_async<ConcurrentUnionFind>(f, n, g_arity);
-    g.eg->parallel_close_async_continuous(std::move(g.eqs));
+    g.eg->parallel_filter_continuous(std::move(g.eqs));
   }
   std::vector<double> times;
   times.reserve(trials);
   for (int i = 0; i < trials; ++i) {
     auto g = build_async<ConcurrentUnionFind>(f, n, g_arity);
     auto t0 = clk::now();
-    g.eg->parallel_close_async_continuous(std::move(g.eqs));
+    g.eg->parallel_filter_continuous(std::move(g.eqs));
     times.push_back(elapsed_ms(t0));
   }
   return times;
 }
 
-std::vector<double> bench_parallel_close_async_min(Family f, std::size_t n,
+std::vector<double> bench_parallel_filter_min(Family f, std::size_t n,
                                                      std::size_t g_arity,
                                                      int warmup, int trials) {
   for (int i = 0; i < warmup; ++i) {
     auto g = build_async<ConcurrentUnionFind>(f, n, g_arity);
-    g.eg->parallel_close_async_rounds_min_id(std::move(g.eqs));
+    g.eg->parallel_filter_min_id(std::move(g.eqs));
   }
   std::vector<double> times;
   times.reserve(trials);
   for (int i = 0; i < trials; ++i) {
     auto g = build_async<ConcurrentUnionFind>(f, n, g_arity);
     auto t0 = clk::now();
-    g.eg->parallel_close_async_rounds_min_id(std::move(g.eqs));
+    g.eg->parallel_filter_min_id(std::move(g.eqs));
     times.push_back(elapsed_ms(t0));
   }
   return times;
 }
 
-std::vector<double> bench_parallel_close_naive(Family f, std::size_t n,
+std::vector<double> bench_parallel_naive(Family f, std::size_t n,
                                                  std::size_t g_arity,
                                                  int warmup, int trials) {
   for (int i = 0; i < warmup; ++i) {
     auto g = build_naive<ConcurrentUnionFind>(f, n, g_arity);
-    g.eg->parallel_close_naive_rounds(std::move(g.eqs));
+    g.eg->parallel_naive_rounds(std::move(g.eqs));
   }
   std::vector<double> times;
   times.reserve(trials);
   for (int i = 0; i < trials; ++i) {
     auto g = build_naive<ConcurrentUnionFind>(f, n, g_arity);
     auto t0 = clk::now();
-    g.eg->parallel_close_naive_rounds(std::move(g.eqs));
+    g.eg->parallel_naive_rounds(std::move(g.eqs));
     times.push_back(elapsed_ms(t0));
   }
   return times;
 }
 
-std::vector<double> bench_parallel_close_topo_iter(Family f, std::size_t n,
+std::vector<double> bench_parallel_topo_iter(Family f, std::size_t n,
                                                      std::size_t g_arity,
                                                      int warmup, int trials) {
   for (int i = 0; i < warmup; ++i) {
     auto g = build_topo<ConcurrentUnionFind>(f, n, g_arity);
-    g.eg->parallel_close_topo_iter(std::move(g.eqs));
+    g.eg->parallel_topo_iter(std::move(g.eqs));
   }
   std::vector<double> times;
   times.reserve(trials);
   for (int i = 0; i < trials; ++i) {
     auto g = build_topo<ConcurrentUnionFind>(f, n, g_arity);
     auto t0 = clk::now();
-    g.eg->parallel_close_topo_iter(std::move(g.eqs));
+    g.eg->parallel_topo_iter(std::move(g.eqs));
     times.push_back(elapsed_ms(t0));
   }
   return times;
@@ -745,11 +763,11 @@ int main() {
   if (!csv) {
     std::printf("synthetic_bench  trials=%d  warmup=%d  par_threads=%zu\n",
                 trials, warmup, par_threads);
-    std::printf("(* = unsound on cross-depth inits; par_spd = par_close vs topo_iter)\n");
+    std::printf("(* = unsound on cross-depth inits; par_spd = par_parents vs topo_iter)\n");
     std::printf("%-8s %5s %10s %9s | %11s %11s %11s %11s | %11s %11s %11s %11s %7s\n",
                 "family", "n", "classes", "merges",
                 "nelson_seq", "nelson_topo*", "topo_iter", "nelson_dst",
-                "par_close", "par_topo_it", "par_async", "par_async_m", "par_spd");
+                "par_parents", "par_topo_it", "par_filter", "par_filter_m", "par_spd");
   } else if (csv_header) {
     std::printf("family,n,d,classes,merges,algorithm,trial,"
                 "parlay_threads,dnc_cutoff,wallclock_ms\n");
@@ -804,33 +822,37 @@ int main() {
       if (!par_only && algo_enabled("nelson_simple")) {
         nsim = bench_nelson_simple(f, n, g_arity, warmup, trials);
       }
+      std::vector<double> nsimh;
+      if (!par_only && algo_enabled("nelson_simple_hash")) {
+        nsimh = bench_nelson_simple_hash(f, n, g_arity, warmup, trials);
+      }
       std::vector<double> par, pti, pa, pam, pnv, pac, pagbk;
       double mp = 0.0, mpti = 0.0, mpa = 0.0, mpam = 0.0;
-      if (algo_enabled("par_close")) {
-        par = bench_parallel_close(f, n, g_arity, warmup, trials);
+      if (algo_enabled("par_parents")) {
+        par = bench_parallel_parents(f, n, g_arity, warmup, trials);
         mp  = median(par);
       }
       if (algo_enabled("par_topo_iter")) {
-        pti  = bench_parallel_close_topo_iter(f, n, g_arity, warmup, trials);
+        pti  = bench_parallel_topo_iter(f, n, g_arity, warmup, trials);
         mpti = median(pti);
       }
-      if (algo_enabled("par_async")) {
-        pa  = bench_parallel_close_async(f, n, g_arity, warmup, trials);
+      if (algo_enabled("par_filter")) {
+        pa  = bench_parallel_filter(f, n, g_arity, warmup, trials);
         mpa = median(pa);
       }
-      if (algo_enabled("par_async_min_id")) {
-        pam  = bench_parallel_close_async_min(f, n, g_arity, warmup, trials);
+      if (algo_enabled("par_filter_min_id")) {
+        pam  = bench_parallel_filter_min(f, n, g_arity, warmup, trials);
         mpam = median(pam);
       }
       if (algo_enabled("par_naive")) {
-        pnv = bench_parallel_close_naive(f, n, g_arity, warmup, trials);
+        pnv = bench_parallel_naive(f, n, g_arity, warmup, trials);
       }
-      if (algo_enabled("par_async_cont")) {
-        pac = bench_parallel_close_async_continuous(f, n, g_arity,
+      if (algo_enabled("par_filter_cont")) {
+        pac = bench_parallel_filter_continuous(f, n, g_arity,
                                                      warmup, trials);
       }
-      if (algo_enabled("par_async_gbk")) {
-        pagbk = bench_parallel_close_async_groupby(f, n, g_arity,
+      if (algo_enabled("par_filter_gbk")) {
+        pagbk = bench_parallel_filter_groupby(f, n, g_arity,
                                                     warmup, trials);
       }
 
@@ -846,21 +868,23 @@ int main() {
             emit_csv(f, n, classes, merges, "nelson_dst", dst);
           if (algo_enabled("nelson_simple"))
             emit_csv(f, n, classes, merges, "nelson_simple", nsim);
+          if (algo_enabled("nelson_simple_hash"))
+            emit_csv(f, n, classes, merges, "nelson_simple_hash", nsimh);
         }
-        if (algo_enabled("par_close"))
-          emit_csv(f, n, classes, merges, "par_close", par);
+        if (algo_enabled("par_parents"))
+          emit_csv(f, n, classes, merges, "par_parents", par);
         if (algo_enabled("par_topo_iter"))
           emit_csv(f, n, classes, merges, "par_topo_iter", pti);
-        if (algo_enabled("par_async"))
-          emit_csv(f, n, classes, merges, "par_async", pa);
-        if (algo_enabled("par_async_min_id"))
-          emit_csv(f, n, classes, merges, "par_async_min_id", pam);
+        if (algo_enabled("par_filter"))
+          emit_csv(f, n, classes, merges, "par_filter", pa);
+        if (algo_enabled("par_filter_min_id"))
+          emit_csv(f, n, classes, merges, "par_filter_min_id", pam);
         if (algo_enabled("par_naive"))
           emit_csv(f, n, classes, merges, "par_naive", pnv);
-        if (algo_enabled("par_async_cont"))
-          emit_csv(f, n, classes, merges, "par_async_cont", pac);
-        if (algo_enabled("par_async_gbk"))
-          emit_csv(f, n, classes, merges, "par_async_gbk", pagbk);
+        if (algo_enabled("par_filter_cont"))
+          emit_csv(f, n, classes, merges, "par_filter_cont", pac);
+        if (algo_enabled("par_filter_gbk"))
+          emit_csv(f, n, classes, merges, "par_filter_gbk", pagbk);
       } else if (skip_nelson) {
         std::printf("%-8s %5zu %10zu %9zu |   skipped   %9.2fms %9.2fms %9.2fms | %9.2fms %9.2fms %9.2fms %9.2fms %6.2fx\n",
                     family_name(f), n, classes, merges, mt, mi, md, mp, mpti, mpa, mpam, mi / mp);

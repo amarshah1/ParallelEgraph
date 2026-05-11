@@ -206,7 +206,7 @@ BuiltGraph<UF> build_topo(const Workload& w) {
 
 // Async-flavor build: same workload generation, EGraph constructed via
 // the async-tagged ctor (populates last_marked_, skips parents_/
-// depth_buckets_). Used by bench_parallel_close_async.
+// depth_buckets_). Used by bench_parallel_filter.
 template <typename UF>
 BuiltGraph<UF> build_async(const Workload& w) {
   const std::size_t depth = std::max<std::size_t>(w.depth, 1);
@@ -244,7 +244,7 @@ BuiltGraph<UF> build_async(const Workload& w) {
     return n;
   });
 
-  auto eg = std::make_unique<EGraph<UF>>(std::move(all_nodes), pe::async);
+  auto eg = std::make_unique<EGraph<UF>>(std::move(all_nodes), pe::filter);
 
   const std::size_t n_x_merges = w.n_merges / 2;
   auto eq_seq = parlay::tabulate(w.n_merges, [&](std::size_t i) {
@@ -263,7 +263,7 @@ BuiltGraph<UF> build_async(const Workload& w) {
 
 // Naive-flavor build: workload generation identical, EGraph via the
 // naive-tagged ctor (UF only — no parents_/last_marked_/depth_buckets_).
-// Used by bench_parallel_close_naive.
+// Used by bench_parallel_naive.
 template <typename UF>
 BuiltGraph<UF> build_naive(const Workload& w) {
   const std::size_t depth = std::max<std::size_t>(w.depth, 1);
@@ -392,6 +392,22 @@ std::vector<double> bench_nelson_simple(const Workload& w) {
   return times;
 }
 
+std::vector<double> bench_nelson_simple_hash(const Workload& w) {
+  for (int i = 0; i < WARMUP; ++i) {
+    auto g = build<SequentialUnionFind>(w);
+    g.eg->sequential_close_simple_hash(g.eqs);
+  }
+  std::vector<double> times;
+  times.reserve(TRIALS);
+  for (int i = 0; i < TRIALS; ++i) {
+    auto g = build<SequentialUnionFind>(w);
+    auto t0 = clk::now();
+    g.eg->sequential_close_simple_hash(g.eqs);
+    times.push_back(elapsed_ms(t0));
+  }
+  return times;
+}
+
 std::vector<double> bench_nelson_topo_iter(const Workload& w) {
   for (int i = 0; i < WARMUP; ++i) {
     auto g = build<SequentialUnionFind>(w);
@@ -408,113 +424,113 @@ std::vector<double> bench_nelson_topo_iter(const Workload& w) {
   return times;
 }
 
-std::vector<double> bench_parallel_close(const Workload& w) {
+std::vector<double> bench_parallel_parents(const Workload& w) {
   for (int i = 0; i < WARMUP; ++i) {
     auto g = build<ConcurrentUnionFind>(w);
-    g.eg->parallel_close(std::move(g.eqs));
+    g.eg->parallel_parents(std::move(g.eqs));
   }
   std::vector<double> times;
   times.reserve(TRIALS);
   for (int i = 0; i < TRIALS; ++i) {
     auto g = build<ConcurrentUnionFind>(w);
     auto t0 = clk::now();
-    g.eg->parallel_close(std::move(g.eqs));
+    g.eg->parallel_parents(std::move(g.eqs));
     times.push_back(elapsed_ms(t0));
   }
   return times;
 }
 
-std::vector<double> bench_parallel_close_async_continuous(const Workload& w) {
+std::vector<double> bench_parallel_filter_continuous(const Workload& w) {
   for (int i = 0; i < WARMUP; ++i) {
     auto g = build_async<ConcurrentUnionFind>(w);
-    g.eg->parallel_close_async_continuous(std::move(g.eqs));
+    g.eg->parallel_filter_continuous(std::move(g.eqs));
   }
   std::vector<double> times;
   times.reserve(TRIALS);
   for (int i = 0; i < TRIALS; ++i) {
     auto g = build_async<ConcurrentUnionFind>(w);
     auto t0 = clk::now();
-    g.eg->parallel_close_async_continuous(std::move(g.eqs));
+    g.eg->parallel_filter_continuous(std::move(g.eqs));
     times.push_back(elapsed_ms(t0));
   }
   return times;
 }
 
-std::vector<double> bench_parallel_close_async_groupby(const Workload& w) {
+std::vector<double> bench_parallel_filter_groupby(const Workload& w) {
   for (int i = 0; i < WARMUP; ++i) {
     auto g = build_async<ConcurrentUnionFind>(w);
-    g.eg->parallel_close_async_rounds_groupby(std::move(g.eqs));
+    g.eg->parallel_filter_groupby(std::move(g.eqs));
   }
   std::vector<double> times;
   times.reserve(TRIALS);
   for (int i = 0; i < TRIALS; ++i) {
     auto g = build_async<ConcurrentUnionFind>(w);
     auto t0 = clk::now();
-    g.eg->parallel_close_async_rounds_groupby(std::move(g.eqs));
+    g.eg->parallel_filter_groupby(std::move(g.eqs));
     times.push_back(elapsed_ms(t0));
   }
   return times;
 }
 
-std::vector<double> bench_parallel_close_async(const Workload& w) {
+std::vector<double> bench_parallel_filter(const Workload& w) {
   for (int i = 0; i < WARMUP; ++i) {
     auto g = build_async<ConcurrentUnionFind>(w);
-    g.eg->parallel_close_async_rounds(std::move(g.eqs));
+    g.eg->parallel_filter(std::move(g.eqs));
   }
   std::vector<double> times;
   times.reserve(TRIALS);
   for (int i = 0; i < TRIALS; ++i) {
     auto g = build_async<ConcurrentUnionFind>(w);
     auto t0 = clk::now();
-    g.eg->parallel_close_async_rounds(std::move(g.eqs));
+    g.eg->parallel_filter(std::move(g.eqs));
     times.push_back(elapsed_ms(t0));
   }
   return times;
 }
 
-std::vector<double> bench_parallel_close_async_min(const Workload& w) {
+std::vector<double> bench_parallel_filter_min(const Workload& w) {
   for (int i = 0; i < WARMUP; ++i) {
     auto g = build_async<ConcurrentUnionFind>(w);
-    g.eg->parallel_close_async_rounds_min_id(std::move(g.eqs));
+    g.eg->parallel_filter_min_id(std::move(g.eqs));
   }
   std::vector<double> times;
   times.reserve(TRIALS);
   for (int i = 0; i < TRIALS; ++i) {
     auto g = build_async<ConcurrentUnionFind>(w);
     auto t0 = clk::now();
-    g.eg->parallel_close_async_rounds_min_id(std::move(g.eqs));
+    g.eg->parallel_filter_min_id(std::move(g.eqs));
     times.push_back(elapsed_ms(t0));
   }
   return times;
 }
 
-std::vector<double> bench_parallel_close_naive(const Workload& w) {
+std::vector<double> bench_parallel_naive(const Workload& w) {
   for (int i = 0; i < WARMUP; ++i) {
     auto g = build_naive<ConcurrentUnionFind>(w);
-    g.eg->parallel_close_naive_rounds(std::move(g.eqs));
+    g.eg->parallel_naive_rounds(std::move(g.eqs));
   }
   std::vector<double> times;
   times.reserve(TRIALS);
   for (int i = 0; i < TRIALS; ++i) {
     auto g = build_naive<ConcurrentUnionFind>(w);
     auto t0 = clk::now();
-    g.eg->parallel_close_naive_rounds(std::move(g.eqs));
+    g.eg->parallel_naive_rounds(std::move(g.eqs));
     times.push_back(elapsed_ms(t0));
   }
   return times;
 }
 
-std::vector<double> bench_parallel_close_topo_iter(const Workload& w) {
+std::vector<double> bench_parallel_topo_iter(const Workload& w) {
   for (int i = 0; i < WARMUP; ++i) {
     auto g = build_topo<ConcurrentUnionFind>(w);
-    g.eg->parallel_close_topo_iter(std::move(g.eqs));
+    g.eg->parallel_topo_iter(std::move(g.eqs));
   }
   std::vector<double> times;
   times.reserve(TRIALS);
   for (int i = 0; i < TRIALS; ++i) {
     auto g = build_topo<ConcurrentUnionFind>(w);
     auto t0 = clk::now();
-    g.eg->parallel_close_topo_iter(std::move(g.eqs));
+    g.eg->parallel_topo_iter(std::move(g.eqs));
     times.push_back(elapsed_ms(t0));
   }
   return times;
@@ -565,8 +581,8 @@ int main() {
 
   // PE_BENCH_ALGOS=algo1,algo2,... restricts which algorithms run+emit.
   // Names must match CSV `algorithm` tags: nelson_seq, nelson_topo,
-  // nelson_topo_iter, nelson_dst, par_close, par_topo_iter, par_async,
-  // par_async_min_id, par_naive. Empty/unset = run all (subject to
+  // nelson_topo_iter, nelson_dst, par_parents, par_topo_iter, par_filter,
+  // par_filter_min_id, par_naive. Empty/unset = run all (subject to
   // par_only and skip_nelson). Combining narrows further.
   std::set<std::string> algo_filter;
   if (const char* algos_env = std::getenv("PE_BENCH_ALGOS")) {
@@ -618,11 +634,11 @@ int main() {
                 TRIALS, WARMUP, par_threads);
     std::printf("(* = unsound on cross-depth inits; topo_iter is the "
                 "iterated-to-fixpoint sound version. par_spd is "
-                "par_close vs topo_iter.)\n");
+                "par_parents vs topo_iter.)\n");
     std::printf("%-8s %8s %10s %9s | %11s %11s %11s %11s | %11s %11s %11s %11s %7s\n",
                 "name", "leaves", "nodes", "merges",
                 "nelson_seq", "nelson_topo*", "topo_iter", "nelson_dst",
-                "par_close", "par_topo_it", "par_async", "par_async_m", "par_spd");
+                "par_parents", "par_topo_it", "par_filter", "par_filter_m", "par_spd");
   } else if (csv_header) {
     std::printf("workload,leaves,fns,nodes,merges,depth,algorithm,trial,"
                 "parlay_threads,dnc_cutoff,wallclock_ms\n");
@@ -666,34 +682,38 @@ int main() {
     if (!par_only && algo_enabled("nelson_simple")) {
       nsim = bench_nelson_simple(w);
     }
+    std::vector<double> nsimh;
+    if (!par_only && algo_enabled("nelson_simple_hash")) {
+      nsimh = bench_nelson_simple_hash(w);
+    }
     std::vector<double> par, pti, pa, pam, pnv;
     double mp = 0.0, mpti = 0.0, mpa = 0.0, mpam = 0.0;
-    if (algo_enabled("par_close")) {
-      par = bench_parallel_close(w);
+    if (algo_enabled("par_parents")) {
+      par = bench_parallel_parents(w);
       mp  = median(par);
     }
     if (algo_enabled("par_topo_iter")) {
-      pti  = bench_parallel_close_topo_iter(w);
+      pti  = bench_parallel_topo_iter(w);
       mpti = median(pti);
     }
-    if (algo_enabled("par_async")) {
-      pa  = bench_parallel_close_async(w);
+    if (algo_enabled("par_filter")) {
+      pa  = bench_parallel_filter(w);
       mpa = median(pa);
     }
-    if (algo_enabled("par_async_min_id")) {
-      pam  = bench_parallel_close_async_min(w);
+    if (algo_enabled("par_filter_min_id")) {
+      pam  = bench_parallel_filter_min(w);
       mpam = median(pam);
     }
     if (algo_enabled("par_naive")) {
-      pnv = bench_parallel_close_naive(w);
+      pnv = bench_parallel_naive(w);
     }
     std::vector<double> pac;
-    if (algo_enabled("par_async_cont")) {
-      pac = bench_parallel_close_async_continuous(w);
+    if (algo_enabled("par_filter_cont")) {
+      pac = bench_parallel_filter_continuous(w);
     }
     std::vector<double> pagbk;
-    if (algo_enabled("par_async_gbk")) {
-      pagbk = bench_parallel_close_async_groupby(w);
+    if (algo_enabled("par_filter_gbk")) {
+      pagbk = bench_parallel_filter_groupby(w);
     }
 
     if (csv) {
@@ -704,14 +724,15 @@ int main() {
         if (algo_enabled("nelson_topo_iter")) emit_csv(w, "nelson_topo_iter", iter);
         if (algo_enabled("nelson_dst"))       emit_csv(w, "nelson_dst", dst);
         if (algo_enabled("nelson_simple"))    emit_csv(w, "nelson_simple", nsim);
+        if (algo_enabled("nelson_simple_hash")) emit_csv(w, "nelson_simple_hash", nsimh);
       }
-      if (algo_enabled("par_close"))        emit_csv(w, "par_close", par);
+      if (algo_enabled("par_parents"))        emit_csv(w, "par_parents", par);
       if (algo_enabled("par_topo_iter"))    emit_csv(w, "par_topo_iter", pti);
-      if (algo_enabled("par_async"))        emit_csv(w, "par_async", pa);
-      if (algo_enabled("par_async_min_id")) emit_csv(w, "par_async_min_id", pam);
+      if (algo_enabled("par_filter"))        emit_csv(w, "par_filter", pa);
+      if (algo_enabled("par_filter_min_id")) emit_csv(w, "par_filter_min_id", pam);
       if (algo_enabled("par_naive"))        emit_csv(w, "par_naive", pnv);
-      if (algo_enabled("par_async_cont"))   emit_csv(w, "par_async_cont", pac);
-      if (algo_enabled("par_async_gbk"))    emit_csv(w, "par_async_gbk", pagbk);
+      if (algo_enabled("par_filter_cont"))   emit_csv(w, "par_filter_cont", pac);
+      if (algo_enabled("par_filter_gbk"))    emit_csv(w, "par_filter_gbk", pagbk);
     } else if (skip_nelson) {
       std::printf("%-8s %8zu %10zu %9zu |   skipped   %9.2fms %9.2fms %9.2fms | %9.2fms %9.2fms %9.2fms %9.2fms %6.2fx\n",
                   w.name, w.n_leaves, w.n_nodes, w.n_merges, mt, mi, md, mp, mpti, mpa, mpam, mi / mp);

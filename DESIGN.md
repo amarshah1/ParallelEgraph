@@ -1,7 +1,7 @@
 # ParallelEgraph (C++/parlay) — design and correctness
 
 A parallel e-graph: lock-free concurrent union-find + several closure
-algorithms (BSP-frontier, depth-stratified BSP, async-rounds with
+algorithms (BSP-frontier, depth-stratified BSP, filter-based rounds with
 round-stamp tracking) plus three sequential baselines for correctness
 checking. Originally a Rust prototype; now C++ with parallel primitives
 from [parlaylib](https://github.com/cmuparlay/parlaylib) and
@@ -27,29 +27,24 @@ include/parallel_egraph/
   smtlib.hpp                              — QF_UF SMT-LIB 2 parser
   smt_to_egraph.hpp                       — SMT-LIB -> e-graph builder
   egraph.hpp                              — EGraph + ENode + sig helpers
-                                            + ctor tags (default / async / topo)
+                                            + ctor tags (default / filter / topo)
   detail.hpp                              — CanonEntry, SemisortTimings,
                                             internal helper signatures
   dnc_union.hpp                           — divide-and-conquer per-bucket union
                                             (templated on Bucket and
                                             optionally on the union method)
-  semisort_common.hpp                     — semisort body shared by both
-                                            equality variants
-  semisort_secondary.hpp                  — default: 32-bit secondary-hash
-                                            equality
-  semisort_sound.hpp                      — sound: structural sigs_equal
+  semisort_common.hpp                     — semisort body
+  semisort_sound.hpp                      — structural sigs_equal probe
 src/
   unionfind.cpp                           — Concurrent / Sequential UF impl
                                             (incl. union_min_id, union_into)
   smtlib.cpp                              — recursive-descent parser
   egraph.cpp                              — sequential closures + parallel
                                             BSP + parallel topo + topo_iter
-  egraph_async.cpp                        — parallel async-rounds (by-rank
+  egraph_filter.cpp                        — parallel filter-based closure (by-rank
                                             and MIN_ID variants)
   semisort.cpp                            — TU dispatcher: includes
-                                            semisort_secondary.hpp by default
-                                            or semisort_sound.hpp when
-                                            PE_SEMISORT_SOUND is defined
+                                            semisort_sound.hpp
   main.cpp                                — egraph-cc CLI
 bench/
   closure_compare.cpp                     — random uniform DAGs (small/medium/
@@ -112,26 +107,26 @@ EGraph<UF>            templated on the union-find type so the
                       Inverted child→parent index; populated only by the
                       default ctor (BSP flavor). parents_[c] = list of
                       class ids whose ENode has c among its children.
-                      Used by parallel_close (BSP frontier walk),
+                      Used by parallel_parents (BSP frontier walk),
                       sequential_close_nelson (worklist), and
                       sequential_close_dst (smaller-into-larger).
   last_marked_        parlay::sequence<std::atomic<u64>>
-                      Populated only by the async-tagged ctor. Per-class
-                      round-stamps used by parallel_close_async_rounds
+                      Populated only by the filter-tagged ctor. Per-class
+                      round-stamps used by parallel_filter
                       to filter "dirty" terms each round.
   depth_buckets_      parlay::sequence<parlay::sequence<Id>>
                       Populated only by the topo-tagged ctor. Class ids
                       grouped by static node depth (longest path from any
                       leaf to the node in the input DAG; child < parent
-                      ordering is required). Used by parallel_close_topo
-                      and parallel_close_topo_iter.
+                      ordering is required). Used by parallel_topo
+                      and parallel_topo_iter.
 ```
 
 Three ctor flavors select which auxiliary state gets populated:
 
 ```cpp
 EGraph<UF>(nodes)               // default: parents_
-EGraph<UF>(nodes, pe::async)    // async-rounds: last_marked_
+EGraph<UF>(nodes, pe::filter)   // filter-based: last_marked_
 EGraph<UF>(nodes, pe::topo)     // depth-stratified: depth_buckets_
 ```
 
@@ -141,7 +136,7 @@ A/B compare without paying for the wrong-flavor setup.
 ## Closure algorithms
 
 Nine algorithms, summarized in [src/egraph.cpp](src/egraph.cpp) and
-[src/egraph_async.cpp](src/egraph_async.cpp). The table below is the
+[src/egraph_filter.cpp](src/egraph_filter.cpp). The table below is the
 quickest way to navigate which one to use.
 
 | algorithm | seq/par | sound? | notes |
@@ -150,11 +145,11 @@ quickest way to navigate which one to use.
 | `sequential_close_topo` | seq | **unsound** | Single forward pass over `nodes_` in DAG order. Per-class signature → hashmap; collisions trigger union. Order-dependent: only correct when input ordering puts canonical (lowest-id) members structurally first. Even with MIN_ID linking, fails on adversarial DAG orderings. Documented as failing test `seq_topo_adversarial`. |
 | `sequential_close_topo_iter` | seq | sound | Wraps `sequential_close_topo` in a fixpoint loop with MIN_ID linking. Re-walks `nodes_` until a full pass yields no new unions. On Family C polynomial cascades converges in 2 passes (1 work + 1 verification); on irregular inputs needs more passes. |
 | `sequential_close_dst` | seq | sound | Nelson-Oppen-style worklist + structural hashcons + smaller-into-larger merging (`union_into`). Seeds the hashcons with every node up front; each merge re-pends `parents_` of the dying class. Stale hashcons entries are tolerated (still semantically valid by congruence monotonicity). Correct on arbitrary inputs; expensive seed sweep on workloads with deep-cascade structure (`O(N log N)` due to parents migration). |
-| `parallel_close` | par | sound | BSP-frontier algorithm. Each round: parallel-apply pending unions, parallel-consolidate `parents_` from dead-roots into surviving-roots, semisort frontier by 96-bit signature hash, dnc_union per bucket, emit next-round work. Loops until frontier is empty. The reference for cross-depth correctness. |
-| `parallel_close_topo` | par | **unsound** | Depth-stratified BSP: round d processes every class at depth d in parallel. Same intra-batch staleness bug as `sequential_close_topo` — in-round unions can change find_root of children referenced by other depth-d sigs that were already computed. Documented as failing test `par_topo_cross_depth`. Kept in the codebase as a reference/baseline; **not wired into any bench driver**. |
-| `parallel_close_topo_iter` | par | sound | Sound iterated variant of `parallel_close_topo`. Same depth-stratified structure, but every union is MIN_ID and the entire depth walk is wrapped in a fixpoint loop. On Family C cascades converges in 2 rounds (1 work + 1 verification); the depth-stratified scheduling batches the entire cascade into one big parallel pass per depth, which beats async on regular cascades. |
-| `parallel_close_async_rounds` | par | sound | Round-stamp dirty-filter algorithm using `last_marked_`. Each round: filter terms with at least one child whose root was recently rerooted (mark in {R-1, R}), semisort dirty by sig, dnc_union per bucket, stamp surviving roots with R. Loops until dirty is empty. By-rank linking. |
-| `parallel_close_async_rounds_min_id` | par | sound | Same as async-rounds but every union uses `union_min_id`. Modest 5–15% improvement on regular cascades from the canonical-id-stable invariant; essentially neutral on irregular inputs. |
+| `parallel_parents` | par | sound | BSP-frontier algorithm. Each round: parallel-apply pending unions, parallel-consolidate `parents_` from dead-roots into surviving-roots, semisort frontier by 96-bit signature hash, dnc_union per bucket, emit next-round work. Loops until frontier is empty. The reference for cross-depth correctness. |
+| `parallel_topo` | par | **unsound** | Depth-stratified BSP: round d processes every class at depth d in parallel. Same intra-batch staleness bug as `sequential_close_topo` — in-round unions can change find_root of children referenced by other depth-d sigs that were already computed. Documented as failing test `par_topo_cross_depth`. Kept in the codebase as a reference/baseline; **not wired into any bench driver**. |
+| `parallel_topo_iter` | par | sound | Sound iterated variant of `parallel_topo`. Same depth-stratified structure, but every union is MIN_ID and the entire depth walk is wrapped in a fixpoint loop. On Family C cascades converges in 2 rounds (1 work + 1 verification); the depth-stratified scheduling batches the entire cascade into one big parallel pass per depth, which beats the filter path on regular cascades. |
+| `parallel_filter` | par | sound | Round-stamp dirty-filter algorithm using `last_marked_`. Each round: filter terms with at least one child whose root was recently rerooted (mark in {R-1, R}), semisort dirty by sig, dnc_union per bucket, stamp surviving roots with R. Loops until dirty is empty. By-rank linking. |
+| `parallel_filter_min_id` | par | sound | Same as parallel_filter but every union uses `union_min_id`. Modest 5–15% improvement on regular cascades from the canonical-id-stable invariant; essentially neutral on irregular inputs. |
 
 ## Soundness story: cross-depth initial unions
 
@@ -172,7 +167,7 @@ by congruence on `t`.
 
 **Why single-pass topo misses it.** Forward-walk processes `f(a)` and
 `f(b)` first; they match and union into one class. But the g's were
-processed earlier (or in parallel for `parallel_close_topo`) with sigs
+processed earlier (or in parallel for `parallel_topo`) with sigs
 referencing distinct find_roots for `ta1` and `ta2`. After the f-union,
 those find_roots become equal — but the g sigs were already inserted
 into the hashmap with stale values. No re-check fires.
@@ -189,19 +184,19 @@ DAG-ordered inputs where the structurally-canonical sub-DAG is emitted
 first (Family C, by construction), single-pass topo is correct.
 
 **Combined**: `sequential_close_topo_iter` and
-`parallel_close_topo_iter` use both — MIN_ID linking + fixpoint loop —
+`parallel_topo_iter` use both — MIN_ID linking + fixpoint loop —
 so they are correct on arbitrary inputs (the loop catches anything MIN_ID
 misses) and fast on regular cascades (MIN_ID makes 1 work pass suffice).
 
 Empirical impact: on synthetic quintic-n=20 (12.8M classes, g-tree
 depth 22), pre-MIN_ID `topo_iter` needed 18 rounds and ~107 s (one full
 N-walk per cascade level). Post-MIN_ID: 2 rounds, ~3 s. Same workload at
-144 cores with `parallel_close_topo_iter`: ~500 ms in 2 rounds.
+144 cores with `parallel_topo_iter`: ~500 ms in 2 rounds.
 
 ## §1 `parallel_consolidate` ([src/egraph.cpp](src/egraph.cpp))
 
-Used only by `parallel_close` (the BSP-frontier path). The other
-parallel algorithms either don't use `parents_` at all (topo, async) or
+Used only by `parallel_parents` (the BSP-frontier path). The other
+parallel algorithms either don't use `parents_` at all (topo, filter) or
 use it differently (dst's smaller-into-larger).
 
 ### Why it exists
@@ -258,32 +253,20 @@ sig_hash(node)` and `root = find_root(class_of_node)`), it merges every
 set of class roots whose entries share a signature and returns the set
 of touched class ids for the next round.
 
-### Two equality variants, build-time selectable
+### Equality
 
-| build                       | algorithm                                         | correctness                                        |
-|-----------------------------|---------------------------------------------------|----------------------------------------------------|
-| default                     | semisort by primary hash + 32-bit secondary check | hash-quality argument (96-bit combined entropy)    |
-| `-DPE_SEMISORT_SOUND=ON`    | semisort by primary hash + structural `sigs_equal`| deterministic under any hash function              |
-
-The default uses a 32-bit secondary FxHash (different seed) computed in
-the same children-roots pass as the primary — no extra UF lookups,
-costs effectively zero. Combined entropy across the two hashes is 96
-bits; expected number of distinct signatures sharing both hashes in a
-64M-element batch is ≈ 10⁻¹⁴, much smaller than any other failure mode
-in the system.
-
-The sound variant calls `sigs_equal` (the children-walk comparison
-resolved through the UF) at every equality probe. Slower but provably
-correct under any hash function. `CanonEntry` stays at 16 bytes either
-way; the trailing 4-byte slot is `secondary_hash` by default,
-`class_id` when sound.
+Semisort groups by the 64-bit primary hash; within a same-hash run we
+verify equality structurally with `sigs_equal` — the children-walk
+comparison resolved through the UF. Sound under any hash function.
+`CanonEntry` is 16 bytes: primary hash, root, and `class_id` (the index
+into `nodes_` used to recover the ENode for the structural compare).
 
 ### Two output flavors
 
 | function                       | output                                     | used by |
 |--------------------------------|--------------------------------------------|---------|
-| `merge_and_collect_semisort`   | returns next-round work (touched roots)    | `parallel_close`, `parallel_close_async_rounds*` |
-| `apply_congruence_semisort`    | unions only; no return                     | `parallel_close_topo`, `parallel_close_topo_iter` |
+| `merge_and_collect_semisort`   | returns next-round work (touched roots)    | `parallel_parents`, `parallel_filter*` |
+| `apply_congruence_semisort`    | unions only; no return                     | `parallel_topo`, `parallel_topo_iter` |
 
 The lean variant skips the per-group `parlay::map(values, .root)` and
 the outer `parlay::flatten` — the topo path drives rounds from
@@ -321,13 +304,13 @@ void dnc_union(Bucket& bucket, std::size_t lo, std::size_t hi,
 
 `dnc_union_with` is a templated variant that takes a caller-supplied
 union method (lambda). Used by the MIN_ID-linking variants
-(`parallel_close_async_rounds_min_id`, `parallel_close_topo_iter`) to
+(`parallel_filter_min_id`, `parallel_topo_iter`) to
 substitute `union_min_id` for `union_` without duplicating the dnc
 structure.
 
 ## Correctness invariants
 
-For `parallel_close` (BSP-frontier):
+For `parallel_parents` (BSP-frontier):
 
 1. **`parents_[c]` always reflects "nodes whose direct child was `c` at
    add time."** Never overwritten in a way that loses entries; only
@@ -340,7 +323,7 @@ For `parallel_close` (BSP-frontier):
    `.root` of every same-sig group entry — both endpoints of every
    union it issued. Lock-free union also covers transitive merges.
 
-For `parallel_close_topo_iter` (depth-stratified iterated):
+For `parallel_topo_iter` (depth-stratified iterated):
 
 3. **Within each round of the depth walk, sigs are computed against a
    snapshot of the UF state.** `parlay::map` join-barrier separates the
@@ -390,7 +373,7 @@ cd build && ctest --output-on-failure
 Two suites:
 - `unionfind_test` — lock-free concurrent UF (basic ops, transitive
   chain, parallel_for stress).
-- `closure_test` — algorithm correctness against `parallel_close` as
+- `closure_test` — algorithm correctness against `parallel_parents` as
   oracle. **14 of 16 tests pass; two are intentional regression markers
   documenting known unsound algorithms** (`par_topo_cross_depth` and
   `seq_topo_adversarial`). Those two cases stay failing on purpose; the
@@ -404,7 +387,7 @@ Two suites:
 ```
 
 Reads a QF_UF SMT-LIB 2 instance, builds the e-graph from the asserted
-equalities and disequalities, runs `parallel_close` on the equality
+equalities and disequalities, runs `parallel_parents` on the equality
 list, and prints `sat` or `unsat`.
 
 ### Generating synthetic inputs
@@ -444,7 +427,7 @@ results on this corpus.
 
 Output columns:
 ```
-nelson_seq | nelson_topo* | topo_iter | nelson_dst | par_close | par_topo_iter | par_async | par_async_min
+nelson_seq | nelson_topo* | topo_iter | nelson_dst | par_parents | par_topo_iter | par_filter | par_filter_min
 ```
 (`*` = unsound; kept for reference)
 
@@ -489,7 +472,7 @@ the eggcc corpus at `cc-benchmarks/smt-grounded`.
 | `PE_SMT_TRIALS`           | `1, …`            | smt_bench: trials per file (default 11).                     |
 | `PE_SMT_WARMUP`           | `0, …`            | smt_bench: warmup per file (default 3).                      |
 | `PE_DNC_CUTOFF`           | `16` (default)    | sequential cutoff inside `dnc_union`.                        |
-| `PE_TRACE`                | `1`               | per-round timing trace from `parallel_close*` to stderr.      |
+| `PE_TRACE`                | `1`               | per-round timing trace from `parallel_parents*` to stderr.      |
 | `PE_TRACE_ITER`           | `1`               | per-pass union counts for `*_topo_iter` to stderr.           |
 
 ## The 144-core benchmark script
@@ -537,10 +520,10 @@ The eggcc summary surfaces:
 - Σ wallclock per algorithm.
 - Speedup ratios for each parallel algorithm vs the best correct
   sequential (`nelson_topo_iter` vs `nelson_dst`).
-- Per-file win rates (par_async vs nelson_topo_iter, par_topo_iter vs
-  par_async, par_async_min_id vs par_async, etc.).
+- Per-file win rates (par_filter vs nelson_topo_iter, par_topo_iter vs
+  par_filter, par_filter_min_id vs par_filter, etc.).
 - Per-class-bucket table (<1K, 1-10K, 10-100K, ≥100K classes) showing
-  par_async_min_id ratio against the better of the two correct
+  par_filter_min_id ratio against the better of the two correct
   sequentials per file.
 
 ## Practical recommendations (current state)
@@ -548,14 +531,14 @@ The eggcc summary surfaces:
 | input shape | recommended sound algorithm |
 |---|---|
 | <10K classes, any structure | `nelson_topo_iter` (with MIN_ID) — sequential overhead-free. |
-| 10K–500K, regular cascade (Family C, leaf-only inits) | `par_topo_iter` — depth-stratified scheduling beats async on regular shapes. |
-| 10K–500K, irregular (eggcc) | `par_async_min_id` — async dirty-filter handles imbalanced fanout. |
+| 10K–500K, regular cascade (Family C, leaf-only inits) | `par_topo_iter` — depth-stratified scheduling beats filter on regular shapes. |
+| 10K–500K, irregular (eggcc) | `par_filter_min_id` — dirty-filter handles imbalanced fanout. |
 | ≥500K, regular | `par_topo_iter` decisively (`5–10×` over best sequential). |
-| ≥500K, irregular | `par_async` or `par_async_min_id` (~5% spread between them). |
+| ≥500K, irregular | `par_filter` or `par_filter_min_id` (~5% spread between them). |
 | arbitrary correctness with no parallel infrastructure | `nelson_dst` — sound, correct on any input, `O(N log N)` per merge with smaller-into-larger. Slower on Family C (deep cascade) than `topo_iter` but avoids the `O(N × depth)` worst case. |
 
 The crossover for parallel-vs-sequential at 144 cores sits around
 **30K–100K classes** depending on workload shape. Below that, sequential
 wins on overhead alone; above, parallel scales but framework cost is
-non-trivial and the choice between async and depth-stratified depends
+non-trivial and the choice between filter and depth-stratified depends
 on cascade regularity.

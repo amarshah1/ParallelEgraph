@@ -2,11 +2,11 @@
 
 Subcommands:
   strong-scaling  — speedup vs threads, one line per workload
-  wallclock       — par_close ms vs threads, log-log
+  wallclock       — par_parents ms vs threads, log-log
   trace-rounds    — per-round time breakdown (consolidate/frontier/semisort)
   components      — phase wallclock vs threads
-  workload-sweep  — par_close ms vs depth and vs merge_frac
-  smt             — par_close ms vs n, one line per family
+  workload-sweep  — par_parents ms vs depth and vs merge_frac
+  smt             — par_parents ms vs n, one line per family
   all             — every plot in turn
 
 Each subcommand reads its CSV from bench/results/ and writes a PNG there.
@@ -46,7 +46,7 @@ def _read(csv: Path) -> pd.DataFrame:
 
 def plot_strong_scaling(_args):
     df = _read(RESULTS / "strong_scaling.csv")
-    par = df[df["algorithm"] == "par_close"].copy()
+    par = df[df["algorithm"] == "par_parents"].copy()
     med = (
         par.groupby(["workload", "parlay_threads"])["wallclock_ms"]
         .median()
@@ -90,7 +90,7 @@ def plot_strong_scaling(_args):
     ax.set_yscale("log", base=2)
     ax.set_xlabel("parlay threads")
     ax.set_ylabel("speedup vs T=min")
-    ax.set_title("parallel_close strong scaling")
+    ax.set_title("parallel_parents strong scaling")
     ax.legend(loc="upper left")
     ax.grid(True, which="both", alpha=0.25)
     _save(fig, "fig_strong_scaling.png")
@@ -98,7 +98,7 @@ def plot_strong_scaling(_args):
 
 def plot_wallclock(_args):
     df = _read(RESULTS / "strong_scaling.csv")
-    par = df[df["algorithm"] == "par_close"].copy()
+    par = df[df["algorithm"] == "par_parents"].copy()
     med = (
         par.groupby(["workload", "parlay_threads"])["wallclock_ms"]
         .median()
@@ -111,8 +111,8 @@ def plot_wallclock(_args):
     ax.set_xscale("log", base=2)
     ax.set_yscale("log")
     ax.set_xlabel("parlay threads")
-    ax.set_ylabel("par_close wallclock (ms)")
-    ax.set_title("parallel_close wallclock vs threads")
+    ax.set_ylabel("par_parents wallclock (ms)")
+    ax.set_title("parallel_parents wallclock vs threads")
     ax.legend()
     ax.grid(True, which="both", alpha=0.3)
     _save(fig, "fig_wallclock.png")
@@ -206,7 +206,7 @@ def plot_components(_args):
 
 def plot_workload_sweep(_args):
     df = _read(RESULTS / "workload_sweep.csv")
-    par = df[df["algorithm"] == "par_close"].copy()
+    par = df[df["algorithm"] == "par_parents"].copy()
     par["merge_frac"] = par["merges"] / par["leaves"]
     med = (
         par.groupby(["depth", "merge_frac"])["wallclock_ms"]
@@ -221,8 +221,8 @@ def plot_workload_sweep(_args):
         ax.plot(sub["depth"], sub["wallclock_ms"], marker="o",
                 label=f"merge_frac={mf:.2f}")
     ax.set_xlabel("depth (function-node levels)")
-    ax.set_ylabel("par_close wallclock (ms)")
-    ax.set_title("workload sweep: par_close vs depth")
+    ax.set_ylabel("par_parents wallclock (ms)")
+    ax.set_title("workload sweep: par_parents vs depth")
     ax.legend()
     ax.grid(True, alpha=0.3)
     _save(fig, "fig_workload_depth.png")
@@ -234,8 +234,8 @@ def plot_workload_sweep(_args):
         ax.plot(sub["merge_frac"], sub["wallclock_ms"], marker="o",
                 label=f"depth={d}")
     ax.set_xlabel("merge_frac (merges / leaves)")
-    ax.set_ylabel("par_close wallclock (ms)")
-    ax.set_title("workload sweep: par_close vs merge_frac")
+    ax.set_ylabel("par_parents wallclock (ms)")
+    ax.set_title("workload sweep: par_parents vs merge_frac")
     ax.legend()
     ax.grid(True, alpha=0.3)
     _save(fig, "fig_workload_merge_frac.png")
@@ -246,7 +246,7 @@ def plot_workload_sweep(_args):
 
 def plot_width_grid(_args):
     df = _read(RESULTS / "width_grid.csv")
-    par = df[df.algorithm == "par_close"].copy()
+    par = df[df.algorithm == "par_parents"].copy()
     nel = df[df.algorithm == "nelson_seq"].copy()
     if par.empty:
         return
@@ -274,14 +274,14 @@ def plot_width_grid(_args):
         ax.set_xlabel(f"scale factor (1× = {workload_order[0]})")
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    ax.plot(scale.values, par_at_max_t.values, marker="o", label="par_close")
+    ax.plot(scale.values, par_at_max_t.values, marker="o", label="par_parents")
     for x, y, w in zip(scale.values, par_at_max_t.values, workload_order):
         ax.annotate(w, xy=(x, y), xytext=(0, 6),
                     textcoords="offset points", fontsize=8,
                     ha="center", color="gray")
     _format_axis(ax)
     ax.set_yscale("log")
-    ax.set_ylabel("par_close wallclock (ms)")
+    ax.set_ylabel("par_parents wallclock (ms)")
     ax.set_title("Width-axis scaling (T_max)")
     ax.grid(True, which="both", alpha=0.3)
     ax.legend()
@@ -332,7 +332,7 @@ def plot_depth_sweep(_args):
 
 def plot_merge_density(_args):
     df = _read(RESULTS / "merge_density.csv")
-    par = df[df.algorithm == "par_close"].copy()
+    par = df[df.algorithm == "par_parents"].copy()
     if par.empty:
         return
     par["merge_frac"] = par["merges"] / par["leaves"]
@@ -341,7 +341,7 @@ def plot_merge_density(_args):
     ax.plot(med["merge_frac"], med["wallclock_ms"], marker="o")
     ax.set_xscale("log")
     ax.set_xlabel("merge_frac (n_merges / n_leaves)")
-    ax.set_ylabel("par_close wallclock (ms)")
+    ax.set_ylabel("par_parents wallclock (ms)")
     ax.set_title("Merge-density sweep (xl-d3, T_max)")
     ax.grid(True, which="both", alpha=0.3)
     _save(fig, "fig_merge_density.png")
@@ -349,7 +349,7 @@ def plot_merge_density(_args):
 
 def plot_nfns_sweep(_args):
     df = _read(RESULTS / "nfns_sweep.csv")
-    par = df[df.algorithm == "par_close"].copy()
+    par = df[df.algorithm == "par_parents"].copy()
     if par.empty:
         return
     med = par.groupby("fns")["wallclock_ms"].median().reset_index()
@@ -357,7 +357,7 @@ def plot_nfns_sweep(_args):
     ax.plot(med["fns"], med["wallclock_ms"], marker="o")
     ax.set_xscale("log", base=2)
     ax.set_xlabel("n_fns (operators per level)")
-    ax.set_ylabel("par_close wallclock (ms)")
+    ax.set_ylabel("par_parents wallclock (ms)")
     ax.set_title("n_fns sweep (xl-d3, T_max)")
     ax.grid(True, which="both", alpha=0.3)
     _save(fig, "fig_nfns_sweep.png")
@@ -484,7 +484,7 @@ def plot_round_by_size(_args):
 def plot_smt(_args):
     df = _read(RESULTS / "smt.csv")
     df = df[df["family"] != ""]  # skip non-matching filenames (regression cases)
-    par = df[df["algorithm"] == "par_close"].copy()
+    par = df[df["algorithm"] == "par_parents"].copy()
     med = (
         par.groupby(["family", "n"])["wallclock_ms"]
         .median()
@@ -497,7 +497,7 @@ def plot_smt(_args):
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlabel("n (family parameter)")
-    ax.set_ylabel("par_close wallclock (ms)")
+    ax.set_ylabel("par_parents wallclock (ms)")
     ax.set_title("synthetic SMT-LIB families")
     ax.legend()
     ax.grid(True, which="both", alpha=0.3)

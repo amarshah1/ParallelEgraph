@@ -1,12 +1,12 @@
 #pragma once
 // E-graph trimmed to exactly what the closure benchmark needs: a single
-// ctor that takes a flat sequence of ENodes, then parallel_close /
+// ctor that takes a flat sequence of ENodes, then parallel_parents /
 // sequential_close_nelson on a list of equalities. No incremental add() —
 // all consumers go through the bulk ctor, so nodes_ is sparsely indexed
 // by class id (the array index *is* the class id).
 //
 // Templated on the union-find type. `EGraph<ConcurrentUnionFind>` carries
-// `parallel_close` and is used from the parallel BSP path;
+// `parallel_parents` and is used from the parallel BSP path;
 // `EGraph<SequentialUnionFind>` carries `sequential_close_nelson` and is
 // used from the sequential Nelson baseline. Each instance constructs only
 // the UF it needs — no bridging between them.
@@ -94,25 +94,25 @@ bool sigs_equal(std::uint32_t ia, std::uint32_t ib, UF& uf,
 
 // Tag type selecting the auxiliary state populated by the EGraph ctor.
 // The default (no tag) is the BSP layout — `parents_` populated, used by
-// `parallel_close`. The async layout populates `last_marked_` instead
+// `parallel_parents`. The filter layout populates `last_marked_` instead
 // (per-class round-stamp tracking when each class was most recently
-// rerooted) and is used by `parallel_close_async_rounds`. Each closure
+// rerooted) and is used by `parallel_filter`. Each closure
 // path uses only its own auxiliary state, so the bench can A/B compare
 // without paying for the wrong-flavor setup.
-struct async_t { explicit async_t() = default; };
-inline constexpr async_t async{};
+struct filter_t { explicit filter_t() = default; };
+inline constexpr filter_t filter{};
 
 // Tag selecting the depth-stratified parallel closure layout. The ctor
 // computes each class's depth (longest path from any leaf) and groups
 // class ids by depth into `depth_buckets_`. Used by
-// `parallel_close_topo`. Skips parents_ and last_marked_; calling
+// `parallel_topo`. Skips parents_ and last_marked_; calling
 // either of the other parallel closure variants on an instance built
 // this way is undefined.
 struct topo_t { explicit topo_t() = default; };
 inline constexpr topo_t topo{};
 
 // Tag selecting the bare-UF closure layout used by
-// `parallel_close_naive_rounds`. The ctor only initializes the union-find
+// `parallel_naive_rounds`. The ctor only initializes the union-find
 // and stores `nodes_`; it skips `parents_`, `last_marked_`, and
 // `depth_buckets_` so the naive variant doesn't pay for auxiliary state
 // it never reads. Calling any other closure variant on an instance built
@@ -121,12 +121,12 @@ struct naive_t { explicit naive_t() = default; };
 inline constexpr naive_t naive{};
 
 // Tag selecting the hybrid closure layout used by
-// `parallel_close_async_hybrid`. Builds BOTH `parents_` (used by the
-// par_close-style parents-walk path) AND `last_marked_` (used by the
-// par_async-style filter scan path). The algorithm starts in filter
+// `parallel_filter_hybrid`. Builds BOTH `parents_` (used by the
+// par_parents-style parents-walk path) AND `last_marked_` (used by the
+// par_filter-style filter scan path). The algorithm starts in filter
 // mode and switches to parents-walk mode once the dirty-set ratio
 // drops below a threshold — see PE_HYBRID_SWITCH_RATIO in
-// `parallel_close_async_hybrid`.
+// `parallel_filter_hybrid`.
 struct hybrid_t { explicit hybrid_t() = default; };
 inline constexpr hybrid_t hybrid{};
 
@@ -158,7 +158,7 @@ class EGraph {
  public:
   // BSP-flavor ctor: populate `parents_` (the inverted child→parent
   // index used by the BSP frontier walk). Leaves `last_marked_`
-  // empty; calling `parallel_close_async_rounds` on an instance
+  // empty; calling `parallel_filter` on an instance
   // built this way is undefined.
   //
   // Bulk-construct from a sequence of ENodes given in DAG order: the i-th
@@ -193,9 +193,9 @@ class EGraph {
   // into a new root r, last_marked_[r] is set to the current global
   // round R via a monotone CAS-max. A term `t` is dirty in round R iff
   // some child c of t has last_marked_[find_root(c)] ∈ {R-1, R}.
-  // Calling `parallel_close` on an instance built this way is
+  // Calling `parallel_parents` on an instance built this way is
   // undefined: `parents_` is empty.
-  EGraph(parlay::sequence<ENode> nodes, async_t) : uf_(nodes.size()) {
+  EGraph(parlay::sequence<ENode> nodes, filter_t) : uf_(nodes.size()) {
     const std::size_t n = nodes.size();
     uf_.bulk_init(n);
     nodes_ = std::move(nodes);
@@ -213,7 +213,7 @@ class EGraph {
 
   // Naive-flavor ctor: bulk-init the UF and stash nodes_; skip every
   // auxiliary index (`parents_`, `last_marked_`, `depth_buckets_`).
-  // Used only by `parallel_close_naive_rounds`, which semisorts every
+  // Used only by `parallel_naive_rounds`, which semisorts every
   // non-leaf term every round and so needs nothing beyond the UF and
   // the node list.
   EGraph(parlay::sequence<ENode> nodes, naive_t) : uf_(nodes.size()) {
@@ -225,7 +225,7 @@ class EGraph {
   // Hybrid-flavor ctor: build BOTH `parents_` (inverted child→parent
   // index, as in the BSP ctor) AND `last_marked_` (per-class round
   // stamps, as in the async ctor). Used by
-  // `parallel_close_async_hybrid`, which starts in async-style filter
+  // `parallel_filter_hybrid`, which starts in async-style filter
   // mode and switches to BSP-style parents-walk mode when the
   // dirty-set ratio falls below threshold.
   EGraph(parlay::sequence<ENode> nodes, hybrid_t) : uf_(nodes.size()) {
@@ -257,7 +257,7 @@ class EGraph {
   // sequential bottom-up sweep (cheap because nodes_ is already in DAG
   // order, so children are at indices < i). Then group class ids by depth
   // into `depth_buckets_`, used as the per-round frontier in
-  // `parallel_close_topo`. Skips parents_/last_marked_ entirely.
+  // `parallel_topo`. Skips parents_/last_marked_ entirely.
   EGraph(parlay::sequence<ENode> nodes, topo_t) : uf_(nodes.size()) {
     const std::size_t n = nodes.size();
     uf_.bulk_init(n);
@@ -292,7 +292,19 @@ class EGraph {
   // for the algorithm. Defined out-of-line in src/egraph.cpp only as an
   // explicit specialization on `ConcurrentUnionFind` — calling it on the
   // sequential flavor is a link error.
-  void parallel_close(parlay::sequence<std::pair<Id, Id>> initial_unions);
+  void parallel_parents(parlay::sequence<std::pair<Id, Id>> initial_unions);
+
+  // BSP closure that replaces the integer-sort+run-walk semisort with
+  // `parlay::group_by_key` over per-arity `SigK<K>` keys (K = 1..4)
+  // plus a vector-backed `Signature` fallback for arity > 4. Same
+  // `parents_`-driven round structure as `parallel_parents`; differs
+  // only in the per-round canonicalize+merge step. Structurally
+  // sound by construction — group equality uses the SigK<K>'s
+  // compile-time-unrolled `operator==`, no probabilistic hash
+  // fallback. Defined out-of-line as an explicit specialization on
+  // `ConcurrentUnionFind`.
+  void parallel_parents_groupby_sigk(
+      parlay::sequence<std::pair<Id, Id>> initial_unions);
 
   // Async-style closure (still rounds-based for now). Drops the
   // `parents_` machinery in favor of round-stamp tracking on each
@@ -313,20 +325,20 @@ class EGraph {
   //   (5) Loop until dirty is empty.
   // Defined out-of-line as an explicit specialization on
   // `ConcurrentUnionFind`.
-  void parallel_close_async_rounds(
+  void parallel_filter(
       parlay::sequence<std::pair<Id, Id>> initial_unions);
 
-  // Same algorithm as `parallel_close_async_rounds` but using
+  // Same algorithm as `parallel_filter` but using
   // `parlay::group_by_key` (hash table + per-bucket `sequence<
   // CanonEntry>` materialization) instead of in-place integer-sort.
   // Kept as an A/B baseline; the integer-sort variant is the
   // production path. Defined out-of-line as an explicit specialization
   // on `ConcurrentUnionFind`.
-  void parallel_close_async_rounds_groupby(
+  void parallel_filter_groupby(
       parlay::sequence<std::pair<Id, Id>> initial_unions);
 
   // Naive rounds-based closure: same skeleton as
-  // `parallel_close_async_rounds` but without dirty tracking or the
+  // `parallel_filter` but without dirty tracking or the
   // `last_marked_` filter. Every round semisorts *all* non-leaf terms
   // by their current canonical signature, dnc_unions every multi-root
   // bucket, and loops until a full pass produces no new union (detected
@@ -335,11 +347,11 @@ class EGraph {
   // it serves as the "no filter" baseline for measuring what
   // last_marked_-driven filtering buys. Defined out-of-line as an
   // explicit specialization on `ConcurrentUnionFind`.
-  void parallel_close_naive_rounds(
+  void parallel_naive_rounds(
       parlay::sequence<std::pair<Id, Id>> initial_unions);
 
   // Truly-async continuous closure. Same `last_marked_` dirty-tracking
-  // primitive as `parallel_close_async_rounds`, but the round structure
+  // primitive as `parallel_filter`, but the round structure
   // is dissolved: a single semisorter and a single unioner team run
   // concurrently via `parlay::par_do`, communicating through a
   // mutex-protected mailbox of CanonEntry groups.
@@ -356,26 +368,26 @@ class EGraph {
   // groups in-flight. When semisorter sees an empty dirty filter AND
   // outstanding == 0, it sets `done`. The unioner pool drains and
   // exits on `done`. Defined out-of-line as an explicit specialization
-  // on `ConcurrentUnionFind`. Uses the async-flavor ctor (`pe::async`).
-  void parallel_close_async_continuous(
+  // on `ConcurrentUnionFind`. Uses the async-flavor ctor (`pe::filter`).
+  void parallel_filter_continuous(
       parlay::sequence<std::pair<Id, Id>> initial_unions);
 
-  // Hybrid filter / parents-walk closure. Starts in `par_async`-style
+  // Hybrid filter / parents-walk closure. Starts in `par_filter`-style
   // filter mode: each round scans the non_leaf set checking
   // `last_marked_[find_root(child)] == R-1` to find dirty terms. Once
   // the dirty-set ratio falls below threshold (default 1% of
   // non_leaves, configurable via PE_HYBRID_SWITCH_RATIO), switches to
-  // `par_close`-style parents-walk mode: one bulk
+  // `par_parents`-style parents-walk mode: one bulk
   // `parallel_consolidate` of every loser collected so far, then each
   // subsequent round walks `parents_[find_root(losers_prev_round)]`
   // to form the dirty set. Closes the deep-cascade gap on workloads
   // where the filter scan's O(non_leaves) per-round overhead
   // dominates after the wide-merge phase ends. Requires the
   // hybrid-flavor ctor (`pe::hybrid`).
-  void parallel_close_async_hybrid(
+  void parallel_filter_hybrid(
       parlay::sequence<std::pair<Id, Id>> initial_unions);
 
-  // MIN_ID variant of `parallel_close_async_rounds`. Same algorithm —
+  // MIN_ID variant of `parallel_filter`. Same algorithm —
   // dirty filter via `last_marked_`, semisort by canonical sig, dnc_union
   // per multi-member bucket — but every union (initial unions and
   // dnc_union both) uses `union_min_id` instead of by-rank. On
@@ -385,7 +397,7 @@ class EGraph {
   // collapses the entire cascade for regular workloads, instead of one
   // round per cascade level. Defined out-of-line as an explicit
   // specialization on `ConcurrentUnionFind`.
-  void parallel_close_async_rounds_min_id(
+  void parallel_filter_min_id(
       parlay::sequence<std::pair<Id, Id>> initial_unions);
 
   // Depth-stratified parallel closure. Round d processes every class at
@@ -401,14 +413,14 @@ class EGraph {
   // state across threads. The actual safety property comes from the
   // phase-1 / phase-2 separation: phase 1 writes only path-compression
   // CAS, which is idempotent w.r.t. find_root return values.) Total
-  // rounds = max depth — strictly fewer than parallel_close's
+  // rounds = max depth — strictly fewer than parallel_parents's
   // frontier-driven BSP cadence on workloads with bounded depth.
   // Defined out-of-line as an explicit specialization on
   // `ConcurrentUnionFind`.
-  void parallel_close_topo(
+  void parallel_topo(
       parlay::sequence<std::pair<Id, Id>> initial_unions);
 
-  // Sound iterated variant of `parallel_close_topo`. Same depth-stratified
+  // Sound iterated variant of `parallel_topo`. Same depth-stratified
   // structure (parallel canon-build per depth, semisort + dnc_union per
   // bucket), but every union uses MIN_ID linking AND the entire
   // depth-walk is wrapped in a fixpoint loop that repeats until a full
@@ -417,7 +429,7 @@ class EGraph {
   // depth-walk usually suffice, so the verification pass is the only
   // overhead. Defined out-of-line as an explicit specialization on
   // `ConcurrentUnionFind`.
-  void parallel_close_topo_iter(
+  void parallel_topo_iter(
       parlay::sequence<std::pair<Id, Id>> initial_unions);
 
   // Sequential Nelson-style closure baseline. Defined out-of-line only as
@@ -436,6 +448,58 @@ class EGraph {
   // driven by pre-existing congruences in the hashcons. Defined out-
   // of-line as an explicit specialization on `SequentialUnionFind`.
   void sequential_close_simple(
+      const parlay::sequence<std::pair<Id, Id>>& initial_unions);
+
+  // Hash-only variant of `sequential_close_simple`. Identical control
+  // flow, but the hashcons is keyed by the same 96-bit canonical
+  // signature (`sig_hashes`) used in the parallel `CanonEntry`, and
+  // equality is decided by hash compare rather than structural
+  // recheck. Matches the parallel algorithms' probabilistic
+  // correctness model exactly (collision probability ≤ N²/2⁹⁷ per
+  // closure), enabling apples-to-apples speedup comparisons.
+  // Defined out-of-line as an explicit specialization on
+  // `SequentialUnionFind`.
+  void sequential_close_simple_hash(
+      const parlay::sequence<std::pair<Id, Id>>& initial_unions);
+
+  // Arity-specialized variant of `sequential_close_simple`. Same
+  // deterministic structural correctness, but splits the signature
+  // hashcons by arity: arity ≤ 2 uses an inline-only `Sig2` (no
+  // heap allocation per term), arity > 2 falls back to the
+  // vector-backed `Signature`. On workloads where most terms have
+  // arity ≤ 2 (boolean gates, NOTs, equalities), this eliminates
+  // the per-term `malloc` that dominates the baseline's cost while
+  // keeping the same correctness model. Defined out-of-line as an
+  // explicit specialization on `SequentialUnionFind`.
+  void sequential_close_simple_arity(
+      const parlay::sequence<std::pair<Id, Id>>& initial_unions);
+
+  // Variant of `sequential_close_simple` that pulls signature
+  // children out of a single chunked bump arena rather than a per-
+  // term `std::vector<Id>`. Same deterministic structural correctness;
+  // eliminates the per-term `malloc/free` pair without specializing
+  // on arity. Defined out-of-line as an explicit specialization on
+  // `SequentialUnionFind`.
+  void sequential_close_simple_bump(
+      const parlay::sequence<std::pair<Id, Id>>& initial_unions);
+
+  // Combined variant: arity ≤ 2 uses the inline `Sig2` hashtable (no
+  // allocation), arity > 2 uses the bump-allocated `SigBump`. Aims
+  // for the best of both — zero allocation on the arity-≤2 fast path
+  // and amortized-constant bump on the slow path. Defined out-of-line
+  // as an explicit specialization on `SequentialUnionFind`.
+  void sequential_close_simple_arity_bump(
+      const parlay::sequence<std::pair<Id, Id>>& initial_unions);
+
+  // Most general variant: one per-arity inline-storage hashtable
+  // (`SigK<K>`) for arities 1..K, plus a bump-allocated fallback for
+  // arity > K. Each per-arity hashtable's compare and hash loops are
+  // fully unrolled at compile time. Currently K = 4 (compile-time
+  // constant in the implementation; one new switch arm + table per
+  // additional arity). Same deterministic structural correctness as
+  // `sequential_close_simple`. Defined out-of-line as an explicit
+  // specialization on `SequentialUnionFind`.
+  void sequential_close_simple_inline(
       const parlay::sequence<std::pair<Id, Id>>& initial_unions);
 
   // Single-pass sequential closure: walks `nodes_` in reverse topological
@@ -492,7 +556,7 @@ class EGraph {
   // BSP-only state. Populated by the default ctor; left empty by the
   // async ctor.
   parlay::sequence<parlay::sequence<Id>> parents_;
-  // Async-only state. Populated by the `async_t`-tagged ctor; left
+  // Async-only state. Populated by the `filter_t`-tagged ctor; left
   // empty by the default ctor. last_marked_[r].v = highest round
   // number for which class r was unioned-into-as-the-new-root.
   // Updated via parlay::write_max (monotone CAS-max), so a tail

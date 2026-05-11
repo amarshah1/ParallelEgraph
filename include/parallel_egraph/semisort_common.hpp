@@ -1,11 +1,8 @@
 #pragma once
-// Shared body of `merge_and_collect_semisort` for both equality variants.
-// The two variants (semisort_secondary / semisort_sound) differ in just
-// the equality predicate; everything else — keying, group_by_key, the
-// per-group dnc_union, and the optional sub-phase timing — is identical.
-//
-// This header is included from exactly one TU per build (the variant
-// header that lives next to it).
+// Shared body of `merge_and_collect_semisort`. The equality predicate is
+// supplied by semisort_sound.hpp (structural sigs_equal); everything
+// else — keying, group_by_key, the per-group dnc_union, and the optional
+// sub-phase timing — lives here.
 
 #include "parallel_egraph/detail.hpp"
 #include "parallel_egraph/dnc_union.hpp"
@@ -22,7 +19,7 @@
 namespace pe::detail {
 
 // Stripped-down variant of `semisort_with_equality` for
-// `parallel_close_topo`: semisort by signature, dnc_union each
+// `parallel_topo`: semisort by signature, dnc_union each
 // non-singleton bucket, done. No next-round frontier, no
 // all_same_root short-circuit (that check existed only to keep BSP's
 // `parents_[root]`-self-reference from re-entering next_work; since
@@ -37,7 +34,7 @@ namespace pe::detail {
 //   * `apply_unions_integer_sort`    — sorts in-place by primary hash, walks
 //                                     runs in parallel. Avoids the keyed-pair
 //                                     map and the per-group sequence build.
-//                                     Used by `parallel_close_topo`.
+//                                     Used by `parallel_topo`.
 
 template <typename EqualFn>
 void apply_unions_semisort(

@@ -40,7 +40,7 @@ Parlay is fetched by CMake's `FetchContent`; C++20 required.
 ```
 
 The CLI parses a QF_UF SMT-LIB 2 file, builds the e-graph from the
-assertions, runs `parallel_close`, and prints `sat`/`unsat`.
+assertions, runs `parallel_parents`, and prints `sat`/`unsat`.
 
 ## Test
 
@@ -70,13 +70,13 @@ QF_UF inputs of varying complexity. Output goes to `examples/synthetic/`.
 ```
 
 Compares `EGraph::sequential_close_nelson` (Nelson-style sequential
-baseline) against `EGraph::parallel_close` (BSP parallel closure) on six
+baseline) against `EGraph::parallel_parents` (BSP parallel closure) on six
 synthetic workloads (`small`, `medium`, `large`, `deep-s`, `deep-m`,
 `deep-l`).
 
 Output:
 ```
-name    leaves    nodes    merges  | nelson_seq |  par_close   par_spd
+name    leaves    nodes    merges  | nelson_seq |  par_parents   par_spd
 ```
 
 See [DESIGN.md](DESIGN.md) for the algorithm, correctness invariants, env

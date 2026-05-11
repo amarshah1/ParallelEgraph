@@ -207,17 +207,17 @@ std::vector<double> bench_nelson(const Workload& w) {
   return times;
 }
 
-std::vector<double> bench_parallel_close(const Workload& w) {
+std::vector<double> bench_parallel_parents(const Workload& w) {
   for (int i = 0; i < WARMUP; ++i) {
     auto g = build<ConcurrentUnionFind>(w);
-    g.eg->parallel_close(std::move(g.eqs));
+    g.eg->parallel_parents(std::move(g.eqs));
   }
   std::vector<double> times;
   times.reserve(TRIALS);
   for (int i = 0; i < TRIALS; ++i) {
     auto g = build<ConcurrentUnionFind>(w);
     auto t0 = clk::now();
-    g.eg->parallel_close(std::move(g.eqs));
+    g.eg->parallel_parents(std::move(g.eqs));
     times.push_back(elapsed_ms(t0));
   }
   return times;
@@ -299,15 +299,15 @@ int main() {
     nel = bench_nelson(w);
     mn = median(nel);
   }
-  auto par = bench_parallel_close(w);
+  auto par = bench_parallel_parents(w);
   const double mp = median(par);
 
   if (csv) {
     if (!skip_nelson) emit_csv("nelson_seq", nel);
-    emit_csv("par_close", par);
+    emit_csv("par_parents", par);
   } else {
     if (!skip_nelson) std::printf("nelson_seq median: %9.2fms\n", mn);
-    std::printf("par_close median:  %9.2fms\n", mp);
+    std::printf("par_parents median:  %9.2fms\n", mp);
     if (!skip_nelson) std::printf("speedup:           %9.2fx\n", mn / mp);
   }
 
