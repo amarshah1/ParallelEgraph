@@ -997,6 +997,9 @@ def main():
                     help="output folder (default: runs/topo_vs_async_<ts>/)")
     ap.add_argument("--no-numactl", action="store_true",
                     help="don't prepend `numactl -i all`")
+    ap.add_argument("--shutdown-after", action="store_true",
+                    help="run `shutdown -h now` after all phases complete "
+                         "(for unattended overnight runs)")
     args = ap.parse_args()
 
     try:
@@ -1208,6 +1211,12 @@ def main():
 
     print()
     print(f"Done. CSVs under: {out_dir}")
+
+    if args.shutdown_after:
+        print("--shutdown-after set; running `shutdown -h now`", flush=True)
+        rc = subprocess.run(["sudo", "shutdown", "-h", "now"]).returncode
+        if rc != 0:
+            sys.exit(f"shutdown failed with exit code {rc}")
 
 
 if __name__ == "__main__":
