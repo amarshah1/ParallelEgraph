@@ -46,7 +46,7 @@ echo
 echo "[2/2] compare_topo_vs_async.py sweep"
 echo "  threads=$THREADS  trials=$TRIALS  warmup=$WARMUP"
 exec python3 compare_topo_vs_async.py \
-  --skip egg --skip synthetic \
+  --skip synthetic \
   --threads-sweep "$THREADS" \
   --random-modes xl,default \
   --warmup "$WARMUP" \

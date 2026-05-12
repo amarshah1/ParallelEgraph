@@ -63,17 +63,15 @@ all must pass on a clean build):
 | `bench/scripts/kick_the_tires.sh` | ~3-minute smoke test. |
 | `bench/scripts/run_artifact.sh` | Full reproduction wrapper around `compare_topo_vs_async.py`. |
 | `Dockerfile` | Reproducible build environment. |
-| `cc-benchmarks/`, `miter-cc-benchmarks/` | Git submodules (eggcc QF_UF corpus + miter-cc gates corpus). |
+| `miter-cc-benchmarks/` | Git submodule (miter-cc gates corpus for the gates phase). |
 
 ---
 
 ## Quickstart (no Docker)
 
 ```bash
-# 1. Fetch submodules (cc-benchmarks isn't exercised on this branch but is
-#    used on main; the gates submodule is auto-init'd by the python driver
-#    when its phase runs).
-git submodule update --init --recursive cc-benchmarks
+# 1. Fetch the miter-cc-benchmarks submodule (used by the gates phase).
+git submodule update --init --recursive miter-cc-benchmarks
 
 # 2. Build (~2 minutes).
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
@@ -107,7 +105,7 @@ docker run --rm -it -v "$PWD/results:/work/runs" parallel-egraph \
 
 ```bash
 python3 compare_topo_vs_async.py \
-  --skip egg --skip synthetic \
+  --skip synthetic \
   --threads-sweep 1,2,4,8,16,32,64,96,128,192 \
   --warmup 1 \
   --random-modes xl,default \

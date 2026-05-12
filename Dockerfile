@@ -29,12 +29,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /work
 COPY . /work
 
-# Initialize the cc-benchmarks submodule if not already populated.
-# When building from a `git archive` tarball the submodule won't be
-# present, so we fetch it explicitly. The build will still succeed
-# without it; eggcc-specific benches will skip.
-RUN if [ -d .git ] && [ -z "$(ls cc-benchmarks 2>/dev/null)" ]; then \
-      git submodule update --init --recursive cc-benchmarks || true; \
+# Initialize the miter-cc-benchmarks submodule (gates phase). When
+# building from a `git archive` tarball the submodule won't be present,
+# so we fetch it explicitly. The build still succeeds without it; the
+# gates phase will simply report no .gates files matched.
+RUN if [ -d .git ] && [ -z "$(ls miter-cc-benchmarks 2>/dev/null)" ]; then \
+      git submodule update --init --recursive miter-cc-benchmarks || true; \
     fi
 
 RUN cmake -B build -S . -DCMAKE_BUILD_TYPE=Release \
@@ -43,7 +43,7 @@ RUN cmake -B build -S . -DCMAKE_BUILD_TYPE=Release \
          unionfind_test \
          closure_compare_bench \
          synthetic_bench \
-         smt_bench
+         gates_bench
 
 # Default to an interactive shell so reviewers can poke around.
 CMD ["/bin/bash"]

@@ -1,34 +1,31 @@
 #!/usr/bin/env python3
-"""All-phase driver for the par_topo_iter vs par_filter comparison.
+"""FMCAD 2026 artifact driver — runs nelson_simple_inline, par_parents,
+par_filter across all relevant workload phases.
 
 Phases:
-  random       — closure_compare_bench (6 baked-in workloads)
+  random       — closure_compare_bench (6 baked-in workloads + XL ladder
+                 via PE_BENCH_CUSTOM, opt-in via --random-modes xl)
   synthetic    — synthetic_bench across (family, n, threads)
   cube_decomp  — synthetic_bench (cube only) across (d, k, threads)
-  egg          — egraph-cc on each .smt2 in cc-benchmarks/smt-grounded,
-                 dispatched per-algorithm via --sequential / PE_USE_*
   gates        — gates_bench on each .gates in
-                 miter-cc-benchmarks/{iwls22,hwmcc12}, runs both par
-                 algorithms only (no sequential); CSV schema is gates'
+                 miter-cc-benchmarks/{iwls22,hwmcc12}; CSV schema is gates'
                  native (file, suite, n_gates, ..., algorithm, ...)
 
 Each phase emits the same CSV schema the corresponding C++ binary already
-prints, so the existing plotters (`plot_results.py`, `plot_topo_vs_async.py`)
-can consume the output unchanged.
+prints, so the existing plotter (`plot_topo_vs_async.py`) can consume the
+output unchanged.
 
-Sequential algorithms (every algo in the C++ output not starting with
-`par_`) only depend on the workload, not on PARLAY_NUM_THREADS. Running
-them at every T duplicates measurements and inflates wall time. Solution:
-- random/synthetic/cube_decomp binaries honour PE_BENCH_PAR_ONLY=1 (set
-  on every T>1 invocation; T=1 runs the full set).
-- egg dispatches one egraph-cc invocation per (file, algo, T); the driver
-  simply skips sequential algos when T>1.
+Sequential algorithms only depend on the workload, not on
+PARLAY_NUM_THREADS. Running them at every T duplicates measurements and
+inflates wall time. The bench binaries honour PE_BENCH_PAR_ONLY=1 (set
+on every T>1 invocation; T=1 runs the full set).
 
-Usage:
-    python3 compare_topo_vs_async.py
-    python3 compare_topo_vs_async.py --threads-sweep 1,4,8
-    python3 compare_topo_vs_async.py --skip cube_decomp
-    python3 compare_topo_vs_async.py --warmup 1 --trials 5
+Usage (canonical FMCAD invocation):
+    python3 compare_topo_vs_async.py \\
+      --skip egg --skip synthetic \\
+      --threads-sweep 1,2,4,8,16,32,64,96,128,192 \\
+      --warmup 1 --random-modes xl,default --trials 5 \\
+      --algos nelson_simple_inline,par_parents,par_filter
 """
 
 import argparse
@@ -36,7 +33,6 @@ import csv as csvmod
 import datetime
 import glob
 import os
-import re
 import shutil
 import statistics
 import subprocess
@@ -70,35 +66,18 @@ GATES_DEFAULT_SUITES = ["iwls22_with_not", "hwmcc12_with_not"]
 
 # Algorithms surfaced in the per-phase summary table (in column order).
 # Mapping to the binaries' CSV `algorithm` tags:
-#   nelson_seq        — Nelson's original sequential CC
-#   nelson_topo       — sequential topo (sometimes unsound on cross-depth
-#                        initial unions; kept as historical baseline)
-#   nelson_topo_iter  — sequential topo_iter (sound, rounds-based)
-#   par_parents         — BSP parallel CC (parents_-frontier)
-#   par_topo_iter     — parallel topo_iter (rounds-based, sound)
-#   par_filter         — async-rounds CC, integer-sort + run-walk
-#                        semisort (production)
-#   par_filter_gbk     — same as par_filter but using parlay::group_by_key
-#                        (hash table + per-bucket sequence allocation);
-#                        kept as A/B baseline for the integer-sort swap
-#   par_naive         — naive rounds CC (semisort all non-leaves every
-#                        round; no dirty filter; the "ablation" against
-#                        par_filter that quantifies what filtering buys)
-# Default algo set: sequential baseline (nelson_simple_inline, the
-# SigK<K> + bump-arena variant) plus the two parallel headlines
-# (par_filter, par_topo_iter). Other algos are still recognized via
-# --algos but are off by default. Add "par_filter_gbk", "nelson_seq",
-# "nelson_simple", etc. via --algos when comparing more thoroughly.
+#   nelson_simple_inline — sequential CC, SigK<K> + bump-arena fallback
+#   par_parents          — BSP parallel CC (parents_-frontier)
+#   par_filter           — filter-mode parallel CC (last_marked_ stamps)
 ALGOS_OF_INTEREST = [
     "nelson_simple_inline",
+    "par_parents",
     "par_filter",
-    "par_topo_iter",
 ]
 ALGO_HEADERS = {
-    "nelson_simple":         "nl_simple",
     "nelson_simple_inline":  "nl_inline",
+    "par_parents":           "par_parents",
     "par_filter":            "par_filter",
-    "par_topo_iter":         "par_topo_it",
 }
 
 # Sequential = every algo not starting with "par_". Run only at T=1.
@@ -392,225 +371,6 @@ def run_cube_decomp(out_dir: Path, thread_counts: list[int],
 
 
 # ---------------------------------------------------------------------------
-# Phase: egg / egraph-cc on .smt2 files, dispatched per algorithm
-# ---------------------------------------------------------------------------
-
-DEFAULT_EGG_DIR = "cc-benchmarks/smt-grounded"
-CC_BENCHMARKS_LOCAL = "cc-benchmarks"
-
-# (algorithm tag, --sequential value, env-var to set, env-var value).
-# Sequential entries pass `seq_arg` and leave env empty; parallel entries
-# leave `seq_arg` None and set the chosen PE_USE_* var. nelson_topo_iter
-# and nelson_dst depend on the egraph-cc patches landing this same
-# revision (--sequential=topo_iter / =dst).
-EGG_ALGOS: list[tuple[str, str | None, str | None]] = [
-    ("nelson_seq",       "nelson",     None),
-    ("nelson_topo",      "topo",       None),
-    ("nelson_topo_iter", "topo_iter",  None),
-    ("nelson_dst",       "dst",        None),
-    ("nelson_simple",    "simple",     None),
-    ("nelson_simple_hash", "simple_hash", None),
-    ("nelson_simple_arity", "simple_arity", None),
-    ("nelson_simple_inline", "simple_inline", None),
-    ("par_parents",        None,         None),
-    ("par_topo_iter",    None,         "PE_USE_TOPO"),
-    ("par_filter",        None,         "PE_USE_ASYNC"),
-    ("par_filter_gbk",    None,         "PE_USE_ASYNC_GBK"),
-    ("par_filter_hybrid", None,         "PE_USE_ASYNC_HYBRID"),
-    ("par_filter_min_id", None,         "PE_USE_ASYNC_MIN_ID"),
-    ("par_naive",        None,         "PE_USE_NAIVE"),
-]
-
-EGG_TIMING_RE = re.compile(
-    r"timing:\s+read=(\S+)\s+parse=(\S+)\s+build=(\S+)\s+"
-    r"close=(\S+)\s+check=(\S+)\s+dtor=(\S+)"
-)
-EGG_TIMING_KEYS = ["read", "parse", "build", "close", "check", "dtor"]
-EGG_UNIT_TO_S = {"s": 1.0, "ms": 1e-3, "us": 1e-6, "µs": 1e-6, "ns": 1e-9}
-
-
-def _parse_egg_duration(token: str) -> float:
-    m = re.match(r"^([0-9]+(?:\.[0-9]+)?)([a-zµ]*)$", token)
-    if not m:
-        raise ValueError(f"unrecognized duration token: {token!r}")
-    value, unit = float(m.group(1)), m.group(2)
-    if unit == "":
-        return value
-    if unit not in EGG_UNIT_TO_S:
-        raise ValueError(f"unknown time unit in {token!r}")
-    return value * EGG_UNIT_TO_S[unit]
-
-
-def _egg_parse_timing(stderr: str) -> dict | None:
-    m = EGG_TIMING_RE.search(stderr)
-    if not m:
-        return None
-    return {k: _parse_egg_duration(m.group(i + 1))
-            for i, k in enumerate(EGG_TIMING_KEYS)}
-
-
-def _egg_parse_result(stdout: str) -> str:
-    for line in stdout.splitlines():
-        line = line.strip()
-        if line in ("sat", "unsat", "unknown"):
-            return line
-    return "UNKNOWN"
-
-
-def _egg_expected(path: str) -> str:
-    m = re.search(r"(?:^|[._])(sat|unsat)\.smt2$", os.path.basename(path))
-    return m.group(1) if m else ""
-
-
-def _ensure_cc_benchmarks(egg_dir: str) -> str:
-    """Initialize the cc-benchmarks submodule if smt-grounded is missing."""
-    if os.path.isdir(egg_dir):
-        return egg_dir
-    print(f"Initializing submodule: {CC_BENCHMARKS_LOCAL}", flush=True)
-    subprocess.run(
-        ["git", "submodule", "update", "--init", "--recursive",
-         CC_BENCHMARKS_LOCAL],
-        check=True,
-    )
-    if not os.path.isdir(egg_dir):
-        sys.exit(f"submodule init succeeded but {egg_dir} is still missing")
-    return egg_dir
-
-
-def run_egg(out_dir: Path, thread_counts: list[int],
-            *, egg_dir: str, pattern: str, timeout: float,
-            warmup: int, trials: int,
-            algos: list[str] | None,
-            numactl_prefix: list[str],
-            phase_name: str = "egg"):
-    """Run egraph-cc on every .smt2 in `egg_dir`.
-
-    phase_name controls:
-      * CSV filename:        <out_dir>/<phase_name>.csv
-      * Trace subdir:        <out_dir>/traces/<phase_name>/
-      * Log prefix:          [<phase_name>] in stderr
-      * cc-benchmarks auto-init: only runs for phase_name == "egg"
-        (the other phases point at user-supplied dirs that the driver
-        must not mutate).
-    """
-    csv_path = out_dir / f"{phase_name}.csv"
-    binary = "./build/egraph-cc"
-    if phase_name == "egg":
-        _ensure_cc_benchmarks(egg_dir)
-
-    files = sorted(glob.glob(os.path.join(egg_dir, "*.smt2")))
-    if pattern != "*":
-        import fnmatch
-        files = [f for f in files
-                 if fnmatch.fnmatch(os.path.basename(f), pattern)]
-    if not files:
-        print(f"  [{phase_name}] no .smt2 files matched in {egg_dir}",
-              flush=True)
-        return None
-
-    egg_algos = EGG_ALGOS
-    if algos:
-        wanted = set(algos)
-        egg_algos = [row for row in EGG_ALGOS if row[0] in wanted]
-        missing = wanted - {row[0] for row in EGG_ALGOS}
-        if missing:
-            print(f"  [{phase_name}] WARN: --algos contains "
-                  f"{sorted(missing)} which egraph-cc does not support; "
-                  "ignoring.", flush=True)
-
-    # (algo, T) cells: skip sequential algos when T>1.
-    cells: list[tuple[str, str | None, str | None, int]] = []
-    for t in thread_counts:
-        for algo, seq_arg, env_var in egg_algos:
-            if seq_arg is not None and t != 1:
-                continue
-            cells.append((algo, seq_arg, env_var, t))
-
-    print(f"=== {phase_name} ({len(files)} files × {len(cells)} cells) "
-          f"→ {csv_path}", flush=True)
-    traces_dir = out_dir / "traces" / phase_name
-
-    def run_invocation(path: str, t: int, seq_arg: str | None,
-                       env_var: str | None,
-                       trace_path: "Path | None" = None):
-        cmd = list(numactl_prefix) + [binary, "--timing"]
-        if seq_arg is not None:
-            cmd.append(f"--sequential={seq_arg}")
-        cmd.append(path)
-        env = os.environ.copy()
-        env["PARLAY_NUM_THREADS"] = str(t)
-        env["PE_TRACE"] = "1"
-        if env_var is not None:
-            env[env_var] = "1"
-        t0 = time.perf_counter()
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  env=env, timeout=timeout)
-            wall = time.perf_counter() - t0
-            if trace_path is not None:
-                trace_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(trace_path, "w") as tf:
-                    tf.write(proc.stderr)
-            if proc.returncode != 0:
-                return (wall, "ERROR", None,
-                        proc.stderr.strip()[:200])
-            return (wall, _egg_parse_result(proc.stdout),
-                    _egg_parse_timing(proc.stderr), "")
-        except subprocess.TimeoutExpired:
-            wall = time.perf_counter() - t0
-            return (wall, "TIMEOUT", None, f"exceeded {timeout}s")
-
-    with open(csv_path, "w", newline="") as f:
-        writer = csvmod.writer(f)
-        writer.writerow(["file", "expected", "algorithm", "threads", "trial",
-                         "result", "wall_s",
-                         *[f"{k}_s" for k in EGG_TIMING_KEYS], "error"])
-        for path in files:
-            name = os.path.basename(path)
-            expected = _egg_expected(path)
-            for algo, seq_arg, env_var, t in cells:
-                # Warmup; if it fails (TIMEOUT/ERROR) skip the trial loop.
-                bail = False
-                for wi in range(warmup):
-                    wtp = (traces_dir
-                           / f"{algo}__T{t:03d}__{name[:-len('.smt2')]}"
-                           f"__warmup{wi}.log")
-                    _, w_result, _, _ = run_invocation(
-                        path, t, seq_arg, env_var, trace_path=wtp)
-                    if w_result in ("TIMEOUT", "ERROR"):
-                        writer.writerow([name, expected, algo, t, -1,
-                                         w_result, "", *[""] * 6,
-                                         "warmup failed"])
-                        f.flush()
-                        print(f"  [{phase_name}] {name} algo={algo} T={t} "
-                              f"warmup={w_result} (skipping trials)",
-                              flush=True)
-                        bail = True
-                        break
-                if bail:
-                    continue
-                for trial in range(trials):
-                    tp = (traces_dir
-                          / f"{algo}__T{t:03d}__{name[:-len('.smt2')]}"
-                          f"__trial{trial}.log")
-                    wall, result, timing, error = run_invocation(
-                        path, t, seq_arg, env_var, trace_path=tp)
-                    row = [name, expected, algo, t, trial, result,
-                           f"{wall:.6f}"]
-                    row += [f"{timing[k]:.6f}" if timing else ""
-                            for k in EGG_TIMING_KEYS]
-                    row.append(error)
-                    writer.writerow(row)
-                    f.flush()
-                    close_s = (f"{timing['close']:.4f}s"
-                               if timing else "-")
-                    print(f"  [{phase_name}] {name} algo={algo} T={t} "
-                          f"trial={trial} {result:<8} close={close_s} "
-                          f"wall={wall:.2f}s", flush=True)
-    return csv_path
-
-
-# ---------------------------------------------------------------------------
 # Phase: gates / gates_bench on miter-cc-benchmarks
 # ---------------------------------------------------------------------------
 
@@ -634,8 +394,8 @@ def run_gates(out_dir: Path, thread_counts: list[int],
       file,suite,n_gates,n_literals,n_not_terms,total_classes,
       algorithm,trial,parlay_threads,read_s,parse_s,build_s,close_ms.
 
-    One subprocess per (file, threads) cell, mirroring run_egg's
-    per-file granularity. Two reasons we don't batch all files into
+    One subprocess per (file, threads) cell. Two reasons we don't batch
+    all files into
     one subprocess: (a) `subprocess.run(capture_output=True)` only
     flushes stdout to the parent on process exit, so a multi-hour
     invocation that gets killed leaves *zero bytes* on disk; (b) the
@@ -929,21 +689,15 @@ def main():
                     help="comma-separated n values; applied to every "
                          "selected family (default: per-family ranges)")
     ap.add_argument("--skip", action="append", default=[],
-                    choices=["random", "synthetic", "cube_decomp", "egg",
-                             "gates", "custom_smt"],
+                    choices=["random", "synthetic", "cube_decomp", "gates"],
                     help="skip a phase; repeatable")
     ap.add_argument("--algos",
-                    default="par_filter,par_topo_iter,nelson_simple",
+                    default="nelson_simple_inline,par_parents,par_filter",
                     help="comma-separated algorithm whitelist. Default: "
-                         "par_filter,par_topo_iter,nelson_simple (the two "
-                         "parallel headlines plus the sequential "
-                         "baseline). Other valid names: nelson_seq, "
-                         "nelson_topo, nelson_topo_iter, nelson_dst, "
-                         "par_parents, par_filter_gbk, "
-                         "par_filter_min_id, par_naive. Pass 'all' to run "
-                         "every recognized algo. Sets PE_BENCH_ALGOS for "
-                         "the C++ binaries and filters the egg dispatch "
-                         "loop, so unwanted algos are never run.")
+                         "nelson_simple_inline,par_parents,par_filter "
+                         "(the three algorithms exercised by the "
+                         "FMCAD artifact). Sets PE_BENCH_ALGOS for the "
+                         "C++ benchmark binaries.")
     ap.add_argument("--random-modes", default="default",
                     help="comma-separated random-phase modes. Valid: "
                          "'default' (6 baked-in workloads) and 'xl' "
@@ -954,21 +708,6 @@ def main():
                     help="comma-separated subset of XL ladder rungs to run "
                          f"(valid: {','.join(RANDOM_XL_LADDER)}). Only used "
                          "when 'xl' is in --random-modes. Default: all rungs.")
-    ap.add_argument("--egg-dir", default=DEFAULT_EGG_DIR,
-                    help=f"directory of .smt2 files for the egg phase "
-                         f"(default: {DEFAULT_EGG_DIR})")
-    ap.add_argument("--egg-pattern", default="*",
-                    help="basename glob filter for egg files (default: '*')")
-    ap.add_argument("--egg-timeout", type=float, default=120.0,
-                    help="per-invocation wall budget for egg (default: 120s)")
-    ap.add_argument("--custom-smt", default=None,
-                    help="comma-separated list of directories of .smt2 "
-                         "files to run egraph-cc on (the custom_smt phase). "
-                         "Each directory produces its own CSV named after "
-                         "its basename, e.g. smt_benchmarks/ → "
-                         "smt_benchmarks.csv. Inherits --algos, "
-                         "--egg-pattern, --egg-timeout from the egg phase. "
-                         "Skipped unless this flag is set.")
     ap.add_argument("--gates-root", default=GATES_DEFAULT_ROOT,
                     help=f"miter-cc-benchmarks root for the gates phase "
                          f"(default: {GATES_DEFAULT_ROOT})")
@@ -1018,19 +757,14 @@ def main():
             except ValueError:
                 sys.exit("--ns expects comma-separated integers")
 
-        valid_algos = {row[0] for row in EGG_ALGOS}
+        valid_algos = {"nelson_simple_inline", "par_parents", "par_filter"}
         algos: list[str] | None = None
         if args.algos:
-            if args.algos.strip() == "all":
-                # Sentinel: run every recognized algo (no filter passed to
-                # the binaries, no filter on the egg dispatch loop).
-                algos = None
-            else:
-                algos = [a.strip() for a in args.algos.split(",") if a.strip()]
-                unknown = [a for a in algos if a not in valid_algos]
-                if unknown:
-                    sys.exit(f"unknown algos: {','.join(unknown)}. "
-                             f"valid: {sorted(valid_algos)}")
+            algos = [a.strip() for a in args.algos.split(",") if a.strip()]
+            unknown = [a for a in algos if a not in valid_algos]
+            if unknown:
+                sys.exit(f"unknown algos: {','.join(unknown)}. "
+                         f"valid: {sorted(valid_algos)}")
 
         valid_random_modes = {"default", "xl"}
         random_modes = [m.strip() for m in args.random_modes.split(",")
@@ -1057,26 +791,12 @@ def main():
                 xl_labels = None
 
         skip = set(args.skip)
-        # custom_smt phase: comma-separated list of dirs. Each dir runs
-        # through run_egg (phase_name=basename), producing one CSV per dir.
-        # Empty list / unset / explicit skip → phase is a no-op.
-        custom_smt_dirs: list[str] = []
-        if args.custom_smt and "custom_smt" not in skip:
-            custom_smt_dirs = [d.strip() for d in args.custom_smt.split(",")
-                               if d.strip()]
-            missing = [d for d in custom_smt_dirs if not os.path.isdir(d)]
-            if missing:
-                sys.exit(f"--custom-smt: not a directory: {missing}")
 
         targets: list[str] = []
         if "random" not in skip:
             targets.append("closure_compare_bench")
         if ("synthetic" not in skip) or ("cube_decomp" not in skip):
             targets.append("synthetic_bench")
-        # egraph-cc is the binary for both the egg phase and the custom_smt
-        # phase; build it if either will run.
-        if "egg" not in skip or custom_smt_dirs:
-            targets.append("egraph-cc")
         if "gates" not in skip:
             targets.append("gates_bench")
         if not targets:
@@ -1091,9 +811,7 @@ def main():
         out_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"Output:        {out_dir}")
-        print(f"Phases:        {[p for p in ('random','synthetic','cube_decomp','egg','gates') if p not in skip]}")
-        if custom_smt_dirs:
-            print(f"Custom SMT:    {custom_smt_dirs}")
+        print(f"Phases:        {[p for p in ('random','synthetic','cube_decomp','gates') if p not in skip]}")
         if "random" not in skip:
             rm_label = ",".join(random_modes)
             if "xl" in random_modes:
@@ -1149,39 +867,6 @@ def main():
                                 algos=algos,
                                 numactl_prefix=numactl_prefix)
             csv_paths.append((p, ["family", "n", "d"]))
-
-        if "egg" not in skip:
-            p = run_egg(out_dir, thread_counts,
-                        egg_dir=args.egg_dir, pattern=args.egg_pattern,
-                        timeout=args.egg_timeout,
-                        warmup=args.warmup, trials=args.trials,
-                        algos=algos,
-                        numactl_prefix=numactl_prefix)
-            # egg.csv has a different schema (file/algorithm/threads, no
-            # family/n/wallclock_ms) — `summarize` won't grok it. Skip in the
-            # per-phase summary; downstream plotters handle it directly.
-
-        # custom_smt: one run_egg invocation per user-supplied dir. Each
-        # uses the dir's basename as the phase_name (drives CSV filename,
-        # log prefix, traces subdir). Refuses "egg" as a basename to keep
-        # egg.csv reserved for the cc-benchmarks phase.
-        seen_phase_names: set[str] = set()
-        for d in custom_smt_dirs:
-            phase = os.path.basename(os.path.normpath(d))
-            if phase == "egg":
-                sys.exit(f"--custom-smt: basename 'egg' collides with the "
-                         f"built-in egg phase: {d}")
-            if phase in seen_phase_names:
-                sys.exit(f"--custom-smt: duplicate phase name '{phase}' "
-                         f"(two dirs with the same basename: {d})")
-            seen_phase_names.add(phase)
-            run_egg(out_dir, thread_counts,
-                    egg_dir=d, pattern=args.egg_pattern,
-                    timeout=args.egg_timeout,
-                    warmup=args.warmup, trials=args.trials,
-                    algos=algos,
-                    numactl_prefix=numactl_prefix,
-                    phase_name=phase)
 
         gates_csv: Path | None = None
         if "gates" not in skip:
