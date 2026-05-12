@@ -1,0 +1,32 @@
+# Keep the Docker build context lean.
+#
+# The Dockerfile re-fetches submodules and rebuilds from scratch inside
+# the image, so we never need to ship local build artifacts or large
+# data directories from the host.
+
+# Local build artifacts
+build/
+build_*/
+__pycache__/
+*.pyc
+.cache/
+
+# Submodules — re-initialized inside the image via `git submodule update`
+miter-cc-benchmarks/
+cc-benchmarks/
+
+# Bench logs / previous-run results — shipped via the artifact zip, not
+# baked into the image (they bloat the image and aren't needed to *run*
+# the reproduction; reviewers always produce fresh logs)
+runs/
+bench/results/
+
+# Editor / VCS noise
+.git/
+.github/
+.claude/
+.idea/
+.vscode/
+*.swp
+*.swo
+ParallelEgraph.code-workspace

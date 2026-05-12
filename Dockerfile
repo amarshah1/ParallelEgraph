@@ -23,7 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       python3-pandas \
       python3-matplotlib \
       python3-numpy \
-      bash awk gawk coreutils \
+      bash gawk coreutils \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work
