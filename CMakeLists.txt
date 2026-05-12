@@ -24,11 +24,9 @@ set(PARLAY_BENCHMARK OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(parlaylib)
 
 # ---- ankerl::unordered_dense ----
-# Modern flat hashmap (robin-hood, single header) used by the sequential
-# Nelson baseline in place of std::unordered_map. ~3x faster on the
-# insert+lookup workload of the signature table, and avoids std's
-# chained-bucket allocator pressure. Used only by sequential_close_nelson;
-# the parallel path uses parlay's sort-based group_by_key_ordered instead.
+# Flat hashmap (robin-hood, single-header) used by the simple-inline
+# sequential baseline in place of std::unordered_map. ~3× faster on the
+# insert+lookup workload of the signature table.
 FetchContent_Declare(
   unordered_dense
   GIT_REPOSITORY https://github.com/martinus/unordered_dense.git
@@ -51,7 +49,6 @@ if(USE_JEMALLOC)
   message(STATUS "Linking with jemalloc: ${JEMALLOC_LIB}")
 endif()
 
-# ---- semisort group-by variant ----
 # ---- core library ----
 # Semisort equality is verified structurally via sigs_equal (children-walk
 # comparison resolved through the UF) — sound under any hash function.
@@ -59,7 +56,6 @@ add_library(parallel_egraph_core STATIC
   src/unionfind.cpp
   src/egraph.cpp
   src/egraph_filter.cpp
-  src/smtlib.cpp
   src/semisort.cpp
 )
 target_include_directories(parallel_egraph_core
@@ -67,25 +63,12 @@ target_include_directories(parallel_egraph_core
 )
 target_link_libraries(parallel_egraph_core PUBLIC parlay unordered_dense::unordered_dense ${JEMALLOC_LIB})
 
-# ---- CLI: egraph-cc <file.smt2> -> sat / unsat ----
-add_executable(egraph-cc src/main.cpp)
-target_link_libraries(egraph-cc PRIVATE parallel_egraph_core)
-
 # ---- benchmarks ----
 add_executable(closure_compare_bench bench/closure_compare.cpp)
 target_link_libraries(closure_compare_bench PRIVATE parallel_egraph_core)
 
-add_executable(component_bench bench/component_bench.cpp)
-target_link_libraries(component_bench PRIVATE parallel_egraph_core)
-
 add_executable(synthetic_bench bench/synthetic_bench.cpp)
 target_link_libraries(synthetic_bench PRIVATE parallel_egraph_core)
-
-add_executable(irregular_bench bench/irregular_bench.cpp)
-target_link_libraries(irregular_bench PRIVATE parallel_egraph_core)
-
-add_executable(smt_bench bench/smt_bench.cpp)
-target_link_libraries(smt_bench PRIVATE parallel_egraph_core)
 
 add_executable(gates_bench bench/gates_bench.cpp)
 target_link_libraries(gates_bench PRIVATE parallel_egraph_core)

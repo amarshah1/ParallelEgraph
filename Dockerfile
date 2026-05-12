@@ -1,4 +1,4 @@
-# Reproducible build for the FMCAD 2025 artifact.
+# Reproducible build for the FMCAD 2026 artifact.
 #
 # Build:
 #   docker build -t parallel-egraph .

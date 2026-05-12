@@ -1,8 +1,7 @@
 // Bench harness for the .gates file format used by the
 // miter-cc-benchmarks suite. Loads each file, builds an EGraph, runs
-// nelson_topo_iter (sequential), par_topo_iter, and
-// parallel_filter with PE_BENCH_WARMUP warmup +
-// PE_BENCH_TRIALS measured trials per algorithm, and emits per-trial
+// the three algorithms exercised on the FMCAD pipeline
+// (nelson_simple_inline, par_parents, par_filter), and emits per-trial
 // CSV.
 //
 // CSV schema:
@@ -10,30 +9,17 @@
 //   algorithm, trial, parlay_threads, read_s, parse_s, build_s,
 //   close_ms
 //
-// Phase timings (read/parse/build) are reported once per file (they
-// don't depend on the algorithm or thread count); the algorithm-
-// specific row reports them too so each row is self-describing.
-//
 // Env knobs:
 //   PE_BENCH_TRIALS=N        measured trials per (file, algo) (default 5)
 //   PE_BENCH_WARMUP=N        warmup invocations (default 1)
-//   PE_BENCH_HEADER=1        emit CSV header (default off; let the
-//                            python driver gate it)
+//   PE_BENCH_HEADER=1        emit CSV header (default off)
 //   PE_BENCH_ALGOS=...       comma-separated EXACT names from
-//                            {nelson_simple, nelson_topo_iter,
-//                             par_parents, par_topo_iter, par_filter,
-//                             par_filter_gbk, par_filter_hybrid}.
-//                            Default = run all seven.
-//   PE_BENCH_PAR_ONLY=1      skip every sequential algo (nelson_*).
-//                            Set on T>1 invocations so we don't
-//                            re-measure the thread-independent
-//                            sequential baseline at every thread
-//                            count. Applies after PE_BENCH_ALGOS.
-//   PE_TRACE=1               propagate to the closure routines for
-//                            per-round detail
-//
-// Usage:
-//   ./build/gates_bench <file.gates> [<file.gates> ...]
+//                            {nelson_simple_inline, par_parents,
+//                             par_filter}. Default = run all three.
+//   PE_BENCH_PAR_ONLY=1      skip every sequential algo. Applies after
+//                            PE_BENCH_ALGOS.
+//   PE_TRACE=1               propagate to closure routines for per-round
+//                            detail.
 
 #include <algorithm>
 #include <chrono>
@@ -41,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -59,13 +46,10 @@ double ms_since(clk::time_point t0) {
   return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
 }
 
-// "iwls22/h5m-n01-ands.gates" → "iwls22"
 std::string parent_suite(const fs::path& p) {
   return p.parent_path().filename().string();
 }
 
-// Build an EGraph from the loaded gates with the given ctor tag and
-// run `close` on it. Returns wallclock ms of the close call only.
 template <typename UF, typename Tag, typename CloseFn>
 double run_one(parlay::sequence<pe::ENode> nodes,
                parlay::sequence<std::pair<pe::Id, pe::Id>> eqs,
@@ -76,16 +60,13 @@ double run_one(parlay::sequence<pe::ENode> nodes,
   return ms_since(t0);
 }
 
-// Tagless overload for the sequential path (default ctor; nelson-style
-// sequential closures don't use the topo/async/parents auxiliary
-// state).
 template <typename UF, typename CloseFn>
 double run_one_seq(parlay::sequence<pe::ENode> nodes,
                    parlay::sequence<std::pair<pe::Id, pe::Id>> eqs,
                    CloseFn close) {
   auto eg = std::make_unique<pe::EGraph<UF>>(std::move(nodes));
   auto t0 = clk::now();
-  close(*eg, eqs);  // sequential closures take eqs by const ref
+  close(*eg, eqs);
   return ms_since(t0);
 }
 
@@ -98,90 +79,41 @@ int main(int argc, char** argv) {
   }
 
   const int trials = std::getenv("PE_BENCH_TRIALS")
-      ? std::atoi(std::getenv("PE_BENCH_TRIALS"))
-      : 5;
+      ? std::atoi(std::getenv("PE_BENCH_TRIALS")) : 5;
   const int warmup = std::getenv("PE_BENCH_WARMUP")
-      ? std::atoi(std::getenv("PE_BENCH_WARMUP"))
-      : 1;
+      ? std::atoi(std::getenv("PE_BENCH_WARMUP")) : 1;
   const bool csv_header = std::getenv("PE_BENCH_HEADER") != nullptr;
   const std::size_t par_threads = parlay::num_workers();
 
-  // Parse PE_BENCH_ALGOS as a comma-separated list of EXACT algorithm
-  // names. Default (env unset) = run every algorithm. If the env is set,
-  // only the listed ones run. Exact-match (not substring) so e.g.
-  // "par_filter" does NOT match "par_filter_hybrid".
-  bool run_nelson_simple             = true;
-  bool run_nelson_simple_hash        = true;
-  bool run_nelson_simple_arity       = true;
-  bool run_nelson_simple_bump        = true;
-  bool run_nelson_simple_arity_bump  = true;
-  bool run_nelson_simple_inline      = true;
-  bool run_nelson_topo_iter          = true;
-  bool run_par_parents        = true;
-  bool run_par_parents_gbk    = true;
-  bool run_topo             = true;
-  bool run_async            = true;
-  bool run_async_gbk        = true;
-  bool run_async_hybrid     = true;
+  std::set<std::string> algo_filter;
   if (const char* a = std::getenv("PE_BENCH_ALGOS")) {
     std::string s(a);
-    // Tokenize on commas.
-    std::vector<std::string> toks;
     std::size_t start = 0;
     while (start <= s.size()) {
       std::size_t end = s.find(',', start);
       if (end == std::string::npos) end = s.size();
       std::string tok = s.substr(start, end - start);
-      // Trim leading/trailing whitespace.
       while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t'))
         tok.erase(tok.begin());
       while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t'))
         tok.pop_back();
-      if (!tok.empty()) toks.push_back(std::move(tok));
+      if (!tok.empty()) algo_filter.insert(std::move(tok));
       if (end == s.size()) break;
       start = end + 1;
     }
-    auto has = [&](const std::string& want) {
-      for (const auto& t : toks) if (t == want) return true;
-      return false;
-    };
-    run_nelson_simple            = has("nelson_simple");
-    run_nelson_simple_hash       = has("nelson_simple_hash");
-    run_nelson_simple_arity      = has("nelson_simple_arity");
-    run_nelson_simple_bump       = has("nelson_simple_bump");
-    run_nelson_simple_arity_bump = has("nelson_simple_arity_bump");
-    run_nelson_simple_inline     = has("nelson_simple_inline");
-    run_nelson_topo_iter         = has("nelson_topo_iter");
-    run_par_parents           = has("par_parents");
-    run_par_parents_gbk       = has("par_parents_gbk");
-    run_topo                = has("par_topo_iter");
-    run_async               = has("par_filter");
-    run_async_gbk           = has("par_filter_gbk");
-    run_async_hybrid        = has("par_filter_hybrid");
-    if (!run_nelson_simple && !run_nelson_simple_hash && !run_nelson_simple_arity && !run_nelson_simple_bump && !run_nelson_simple_arity_bump && !run_nelson_simple_inline && !run_nelson_topo_iter && !run_par_parents && !run_par_parents_gbk &&
-        !run_topo && !run_async && !run_async_gbk && !run_async_hybrid) {
-      std::fprintf(stderr,
-          "PE_BENCH_ALGOS=%s matched nothing; valid algos are "
-          "nelson_simple, nelson_simple_hash, nelson_simple_arity, nelson_simple_bump, "
-          "nelson_topo_iter, par_parents, par_topo_iter, "
-          "par_filter, par_filter_gbk, par_filter_hybrid\n", a);
-      return 2;
-    }
   }
-  // PE_BENCH_PAR_ONLY=1: skip every sequential algorithm. Mirrors the
-  // synthetic_bench / closure_compare convention. The intent is "we
-  // already measured the sequential at T=1, don't re-run it at T>1
-  // where it produces the same number 4 times more slowly." Applies
-  // AFTER the PE_BENCH_ALGOS filter, so PE_BENCH_ALGOS=nelson_simple
-  // + PE_BENCH_PAR_ONLY=1 = no algorithms run.
-  if (std::getenv("PE_BENCH_PAR_ONLY")) {
-    run_nelson_simple            = false;
-    run_nelson_simple_hash       = false;
-    run_nelson_simple_arity      = false;
-    run_nelson_simple_bump       = false;
-    run_nelson_simple_arity_bump = false;
-    run_nelson_simple_inline     = false;
-    run_nelson_topo_iter         = false;
+  auto algo_enabled = [&](const char* name) {
+    return algo_filter.empty() || algo_filter.count(name) > 0;
+  };
+  const bool par_only = std::getenv("PE_BENCH_PAR_ONLY") != nullptr;
+  const bool run_nelson_simple_inline = !par_only && algo_enabled("nelson_simple_inline");
+  const bool run_par_parents          = algo_enabled("par_parents");
+  const bool run_par_filter           = algo_enabled("par_filter");
+  if (!run_nelson_simple_inline && !run_par_parents && !run_par_filter) {
+    std::fprintf(stderr,
+        "PE_BENCH_ALGOS matched nothing; valid algos are "
+        "nelson_simple_inline, par_parents, par_filter\n");
+    return 2;
   }
 
   if (csv_header) {
@@ -222,104 +154,11 @@ int main(int argc, char** argv) {
     };
 
     auto deep_copy_nodes = [&]() {
-      // Each trial needs a fresh EGraph (closure is destructive). Copy
-      // the nodes; eqs we move once per trial below from a fresh
-      // copy too.
       return parlay::sequence<pe::ENode>(loaded.nodes);
     };
     auto deep_copy_eqs = [&]() {
       return parlay::sequence<std::pair<pe::Id, pe::Id>>(loaded.eqs);
     };
-
-    if (run_nelson_simple) {
-      for (int i = 0; i < warmup; ++i) {
-        run_one_seq<pe::SequentialUnionFind>(
-            deep_copy_nodes(), deep_copy_eqs(),
-            [](auto& eg, const auto& eqs) {
-              eg.sequential_close_simple(eqs);
-            });
-      }
-      for (int i = 0; i < trials; ++i) {
-        double ms = run_one_seq<pe::SequentialUnionFind>(
-            deep_copy_nodes(), deep_copy_eqs(),
-            [](auto& eg, const auto& eqs) {
-              eg.sequential_close_simple(eqs);
-            });
-        emit_row("nelson_simple", i, ms);
-      }
-    }
-
-    if (run_nelson_simple_hash) {
-      for (int i = 0; i < warmup; ++i) {
-        run_one_seq<pe::SequentialUnionFind>(
-            deep_copy_nodes(), deep_copy_eqs(),
-            [](auto& eg, const auto& eqs) {
-              eg.sequential_close_simple_hash(eqs);
-            });
-      }
-      for (int i = 0; i < trials; ++i) {
-        double ms = run_one_seq<pe::SequentialUnionFind>(
-            deep_copy_nodes(), deep_copy_eqs(),
-            [](auto& eg, const auto& eqs) {
-              eg.sequential_close_simple_hash(eqs);
-            });
-        emit_row("nelson_simple_hash", i, ms);
-      }
-    }
-
-    if (run_nelson_simple_arity) {
-      for (int i = 0; i < warmup; ++i) {
-        run_one_seq<pe::SequentialUnionFind>(
-            deep_copy_nodes(), deep_copy_eqs(),
-            [](auto& eg, const auto& eqs) {
-              eg.sequential_close_simple_arity(eqs);
-            });
-      }
-      for (int i = 0; i < trials; ++i) {
-        double ms = run_one_seq<pe::SequentialUnionFind>(
-            deep_copy_nodes(), deep_copy_eqs(),
-            [](auto& eg, const auto& eqs) {
-              eg.sequential_close_simple_arity(eqs);
-            });
-        emit_row("nelson_simple_arity", i, ms);
-      }
-    }
-
-    if (run_nelson_simple_bump) {
-      for (int i = 0; i < warmup; ++i) {
-        run_one_seq<pe::SequentialUnionFind>(
-            deep_copy_nodes(), deep_copy_eqs(),
-            [](auto& eg, const auto& eqs) {
-              eg.sequential_close_simple_bump(eqs);
-            });
-      }
-      for (int i = 0; i < trials; ++i) {
-        double ms = run_one_seq<pe::SequentialUnionFind>(
-            deep_copy_nodes(), deep_copy_eqs(),
-            [](auto& eg, const auto& eqs) {
-              eg.sequential_close_simple_bump(eqs);
-            });
-        emit_row("nelson_simple_bump", i, ms);
-      }
-    }
-
-    if (run_nelson_simple_arity_bump) {
-      for (int i = 0; i < warmup; ++i) {
-        run_one_seq<pe::SequentialUnionFind>(
-            deep_copy_nodes(), deep_copy_eqs(),
-            [](auto& eg, const auto& eqs) {
-              eg.sequential_close_simple_arity_bump(eqs);
-            });
-      }
-      for (int i = 0; i < trials; ++i) {
-        double ms = run_one_seq<pe::SequentialUnionFind>(
-            deep_copy_nodes(), deep_copy_eqs(),
-            [](auto& eg, const auto& eqs) {
-              eg.sequential_close_simple_arity_bump(eqs);
-            });
-        emit_row("nelson_simple_arity_bump", i, ms);
-      }
-    }
 
     if (run_nelson_simple_inline) {
       for (int i = 0; i < warmup; ++i) {
@@ -339,34 +178,11 @@ int main(int argc, char** argv) {
       }
     }
 
-    if (run_nelson_topo_iter) {
-      // Warmup
-      for (int i = 0; i < warmup; ++i) {
-        run_one_seq<pe::SequentialUnionFind>(
-            deep_copy_nodes(), deep_copy_eqs(),
-            [](auto& eg, const auto& eqs) {
-              eg.sequential_close_topo_iter(eqs);
-            });
-      }
-      // Trials
-      for (int i = 0; i < trials; ++i) {
-        double ms = run_one_seq<pe::SequentialUnionFind>(
-            deep_copy_nodes(), deep_copy_eqs(),
-            [](auto& eg, const auto& eqs) {
-              eg.sequential_close_topo_iter(eqs);
-            });
-        emit_row("nelson_topo_iter", i, ms);
-      }
-    }
-
     if (run_par_parents) {
-      // BSP path uses the default ctor (parents_-driven, no async/topo
-      // auxiliary state). Mirrors run_one_seq's tagless build.
       for (int i = 0; i < warmup; ++i) {
         run_one_seq<pe::ConcurrentUnionFind>(
             deep_copy_nodes(), deep_copy_eqs(),
             [](auto& eg, const auto& eqs) {
-              // parallel_parents takes eqs by value (moves); copy here.
               auto e = parlay::sequence<std::pair<pe::Id, pe::Id>>(eqs);
               eg.parallel_parents(std::move(e));
             });
@@ -382,43 +198,7 @@ int main(int argc, char** argv) {
       }
     }
 
-    if (run_par_parents_gbk) {
-      for (int i = 0; i < warmup; ++i) {
-        run_one_seq<pe::ConcurrentUnionFind>(
-            deep_copy_nodes(), deep_copy_eqs(),
-            [](auto& eg, const auto& eqs) {
-              auto e = parlay::sequence<std::pair<pe::Id, pe::Id>>(eqs);
-              eg.parallel_parents_groupby_sigk(std::move(e));
-            });
-      }
-      for (int i = 0; i < trials; ++i) {
-        double ms = run_one_seq<pe::ConcurrentUnionFind>(
-            deep_copy_nodes(), deep_copy_eqs(),
-            [](auto& eg, const auto& eqs) {
-              auto e = parlay::sequence<std::pair<pe::Id, pe::Id>>(eqs);
-              eg.parallel_parents_groupby_sigk(std::move(e));
-            });
-        emit_row("par_parents_gbk", i, ms);
-      }
-    }
-
-    if (run_topo) {
-      // Warmup
-      for (int i = 0; i < warmup; ++i) {
-        run_one<pe::ConcurrentUnionFind>(
-            deep_copy_nodes(), deep_copy_eqs(), pe::topo,
-            [](auto& eg, auto eqs) { eg.parallel_topo_iter(std::move(eqs)); });
-      }
-      // Trials
-      for (int i = 0; i < trials; ++i) {
-        double ms = run_one<pe::ConcurrentUnionFind>(
-            deep_copy_nodes(), deep_copy_eqs(), pe::topo,
-            [](auto& eg, auto eqs) { eg.parallel_topo_iter(std::move(eqs)); });
-        emit_row("par_topo_iter", i, ms);
-      }
-    }
-
-    if (run_async) {
+    if (run_par_filter) {
       for (int i = 0; i < warmup; ++i) {
         run_one<pe::ConcurrentUnionFind>(
             deep_copy_nodes(), deep_copy_eqs(), pe::filter,
@@ -429,36 +209,6 @@ int main(int argc, char** argv) {
             deep_copy_nodes(), deep_copy_eqs(), pe::filter,
             [](auto& eg, auto eqs) { eg.parallel_filter(std::move(eqs)); });
         emit_row("par_filter", i, ms);
-      }
-    }
-
-    if (run_async_gbk) {
-      for (int i = 0; i < warmup; ++i) {
-        run_one<pe::ConcurrentUnionFind>(
-            deep_copy_nodes(), deep_copy_eqs(), pe::filter,
-            [](auto& eg, auto eqs) { eg.parallel_filter_groupby(std::move(eqs)); });
-      }
-      for (int i = 0; i < trials; ++i) {
-        double ms = run_one<pe::ConcurrentUnionFind>(
-            deep_copy_nodes(), deep_copy_eqs(), pe::filter,
-            [](auto& eg, auto eqs) { eg.parallel_filter_groupby(std::move(eqs)); });
-        emit_row("par_filter_gbk", i, ms);
-      }
-    }
-
-    if (run_async_hybrid) {
-      // Hybrid filter / parents-walk: uses the hybrid_t-tagged ctor,
-      // which builds both `parents_` and `last_marked_`.
-      for (int i = 0; i < warmup; ++i) {
-        run_one<pe::ConcurrentUnionFind>(
-            deep_copy_nodes(), deep_copy_eqs(), pe::hybrid,
-            [](auto& eg, auto eqs) { eg.parallel_filter_hybrid(std::move(eqs)); });
-      }
-      for (int i = 0; i < trials; ++i) {
-        double ms = run_one<pe::ConcurrentUnionFind>(
-            deep_copy_nodes(), deep_copy_eqs(), pe::hybrid,
-            [](auto& eg, auto eqs) { eg.parallel_filter_hybrid(std::move(eqs)); });
-        emit_row("par_filter_hybrid", i, ms);
       }
     }
   }

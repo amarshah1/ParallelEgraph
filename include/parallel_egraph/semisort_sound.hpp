@@ -23,15 +23,4 @@ parlay::sequence<Id> merge_and_collect_semisort(
       });
 }
 
-void apply_congruence_semisort(
-    parlay::sequence<CanonEntry> canon, ConcurrentUnionFind& uf,
-    const parlay::sequence<ENode>& nodes) {
-  apply_unions_integer_sort(std::move(canon), uf,
-      [&](const CanonEntry& a, const CanonEntry& b) {
-        // Primary hash already matched; structurally verify equality
-        // through the UF.
-        return sigs_equal(a.class_id, b.class_id, uf, nodes);
-      });
-}
-
 }  // namespace pe::detail

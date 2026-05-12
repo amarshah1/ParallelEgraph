@@ -40,12 +40,4 @@ parlay::sequence<Id> merge_and_collect_semisort(
     const parlay::sequence<ENode>& nodes,
     SemisortTimings* timings = nullptr);
 
-// Lean variant: semisort by signature, dnc_union each non-singleton
-// bucket, return nothing. Used by `parallel_topo`, which has no
-// next-round frontier to build.
-void apply_congruence_semisort(
-    parlay::sequence<CanonEntry> canon,
-    ConcurrentUnionFind& uf,
-    const parlay::sequence<ENode>& nodes);
-
 }  // namespace pe::detail
