@@ -43,9 +43,9 @@ all must pass on a clean build):
 - **Cores**: any. The reproduction script sweeps T = 1, 2, 4, …, 192
   by default; cells with T > the machine's logical-core count are still
   measured but oversubscribed.
-- **OS**: Linux preferred (Ubuntu 24.04 + GCC 13.2 on the AWS c8i.metal-48xl
-  instance used for the paper's measurements — Intel Xeon 6975P-C, 96 physical
-  cores × 2 SMT = 192 threads, single socket, NUMA SNC=3, 480 MiB shared L3).
+- **OS**: Linux preferred (Ubuntu 26.04 on the AWS c8i.metal-48xl instance
+  used for the paper's measurements — Intel Xeon 6975P-C, 96 physical cores
+  × 2 SMT = 192 threads, single socket, NUMA SNC=3, 480 MiB shared L3).
   macOS builds and runs; `numactl -i all` is Linux-only and auto-detected.
 
 ---
@@ -160,4 +160,4 @@ via `--xl-labels XL,2XL,4XL,8XL` if you want a faster run.
 - [x] Reproducible build (FetchContent for parlay; jemalloc, numactl pinned via apt)
 - [ ] Compute SHA256 of the final archive (`shasum -a 256 artifact.zip`)
 - [ ] Host the .zip at a stable URL (institutional page is fine; DOI required for camera-ready)
-- [ ] EasyChair submission: link, SHA256, tested-on description ("Ubuntu 24.04 + GCC 13.2 on AWS c8i.metal-48xl — Intel Xeon 6975P-C, 192 threads, NUMA SNC=3; also tested macOS 14 + M-series")
+- [ ] EasyChair submission: link, SHA256, tested-on description ("Ubuntu 26.04 on AWS c8i.metal-48xl — Intel Xeon 6975P-C, 192 threads, NUMA SNC=3; also tested macOS 14 + M-series via Docker")
