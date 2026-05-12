@@ -7,12 +7,12 @@
 # phases. Output lands in runs/topo_vs_async_<ts>/.
 #
 # Wall time:
-#   - 12-core laptop  : ~45-90 minutes
-#   - 144-core server : ~25-40 minutes (numactl -i all auto-detected
-#                                       when available)
+#   - 12-core laptop          : ~45-90 minutes
+#   - c8i.metal-48xl (192 hw threads, NUMA SNC=3): ~25-40 minutes
+#     (numactl -i all auto-detected when available)
 #
 # Override knobs:
-#   THREADS=1,2,4,...,192   thread-sweep (default 1,2,4,8,16,32,64,96,144,192)
+#   THREADS=1,2,4,...,192   thread-sweep (default 1,2,4,8,16,32,64,96,128,192)
 #   TRIALS=N                measured trials per cell (default 5)
 #   WARMUP=N                warmup invocations (default 1)
 #   EXTRA="--shutdown-after" appended to the python args for unattended runs
@@ -37,7 +37,7 @@ if ! ./build/closure_test 2>&1 | grep -q "7/7 closure tests passed"; then
   exit 1
 fi
 
-THREADS=${THREADS:-1,2,4,8,16,32,64,96,144,192}
+THREADS=${THREADS:-1,2,4,8,16,32,64,96,128,192}
 TRIALS=${TRIALS:-5}
 WARMUP=${WARMUP:-1}
 EXTRA=${EXTRA:-}

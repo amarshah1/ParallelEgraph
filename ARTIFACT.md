@@ -43,9 +43,10 @@ all must pass on a clean build):
 - **Cores**: any. The reproduction script sweeps T = 1, 2, 4, …, 192
   by default; cells with T > the machine's logical-core count are still
   measured but oversubscribed.
-- **OS**: Linux preferred (Ubuntu 22.04+ tested with GCC 13.2 and the
-  AMD 144-core EPYC). macOS builds and runs; `numactl -i all` is
-  Linux-only and auto-detected.
+- **OS**: Linux preferred (Ubuntu 24.04 + GCC 13.2 on the AWS c8i.metal-48xl
+  instance used for the paper's measurements — Intel Xeon 6975P-C, 96 physical
+  cores × 2 SMT = 192 threads, single socket, NUMA SNC=3, 480 MiB shared L3).
+  macOS builds and runs; `numactl -i all` is Linux-only and auto-detected.
 
 ---
 
@@ -118,7 +119,7 @@ python3 compare_topo_vs_async.py \
 
 | Env | Meaning |
 |---|---|
-| `THREADS=1,2,...,192` | thread-sweep (default `1,2,4,8,16,32,64,96,144,192`) |
+| `THREADS=1,2,...,192` | thread-sweep (default `1,2,4,8,16,32,64,96,128,192`, matching the paper invocation) |
 | `TRIALS=N` | measured trials per cell |
 | `WARMUP=N` | warmup invocations per cell |
 | `EXTRA="--shutdown-after"` | appended to the python args (unattended overnight runs) |
@@ -136,7 +137,7 @@ Phase outputs go to `runs/topo_vs_async_<timestamp>/`:
 
 ## Reproduction time
 
-| Phase | 12-core laptop | 144-core server |
+| Phase | 12-core laptop | c8i.metal-48xl (192 threads) |
 |---|---|---|
 | Build | 2 min | 1 min |
 | Correctness tests | <1 sec | <1 sec |
@@ -159,4 +160,4 @@ via `--xl-labels XL,2XL,4XL,8XL` if you want a faster run.
 - [x] Reproducible build (FetchContent for parlay; jemalloc, numactl pinned via apt)
 - [ ] Compute SHA256 of the final archive (`shasum -a 256 artifact.zip`)
 - [ ] Host the .zip at a stable URL (institutional page is fine; DOI required for camera-ready)
-- [ ] EasyChair submission: link, SHA256, tested-on description ("Ubuntu 24.04 + GCC 13.2 + 144-core EPYC; also tested macOS 14 + M-series")
+- [ ] EasyChair submission: link, SHA256, tested-on description ("Ubuntu 24.04 + GCC 13.2 on AWS c8i.metal-48xl — Intel Xeon 6975P-C, 192 threads, NUMA SNC=3; also tested macOS 14 + M-series")
