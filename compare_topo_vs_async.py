@@ -105,6 +105,16 @@ ALGO_HEADERS = {
 SEQ_ALGOS = [a for a in ALGOS_OF_INTEREST if not a.startswith("par_")]
 
 
+def _has_parallel_algo(algos: "list[str] | None") -> bool:
+    """`--algos` whitelist contains at least one parallel algo (or is unset,
+    so every algo will run). When False, T>1 invocations are pure waste:
+    PE_BENCH_PAR_ONLY=1 strips every algo from the run, but the binary still
+    pays init/parse/build cost. Callers skip the T>1 cells in that case."""
+    if algos is None:
+        return True
+    return any(a.startswith("par_") for a in algos)
+
+
 def cmake_build(targets: list[str]):
     print("Configuring CMake (Release)...", flush=True)
     subprocess.run(
@@ -204,10 +214,13 @@ def run_random_xl(out_dir: Path, thread_counts: list[int],
     traces_dir = out_dir / "traces" / "random_xl"
     first = not append
     with open(csv_path, mode) as out:
+        any_par = _has_parallel_algo(algos)
         for label, params in ladder:
             spec = ",".join(str(x) for x in params)
             for t in thread_counts:
                 par_only = t > 1
+                if par_only and not any_par:
+                    continue  # sequential-only: T>1 cells would be empty
                 tag = "par_only" if par_only else "+seq"
                 print(f"  [random-xl] {label} T={t} ({tag})", flush=True)
                 env = os.environ.copy()
@@ -247,9 +260,12 @@ def run_random(out_dir: Path, thread_counts: list[int],
           f"{' (append)' if append else ''}", flush=True)
     traces_dir = out_dir / "traces" / "random"
     first = not append  # skip CSV header on append so we don't duplicate it
+    any_par = _has_parallel_algo(algos)
     with open(csv_path, mode) as out:
         for t in thread_counts:
             par_only = t > 1
+            if par_only and not any_par:
+                continue
             tag = "par_only" if par_only else "+seq"
             print(f"  [random] T={t} ({tag})", flush=True)
             env = os.environ.copy()
@@ -289,12 +305,15 @@ def run_synthetic(out_dir: Path, families: list[str],
     print(f"=== synthetic (synthetic_bench) → {csv_path}", flush=True)
     traces_dir = out_dir / "traces" / "synthetic"
     first = True
+    any_par = _has_parallel_algo(algos)
     with open(csv_path, "w") as out:
         for fam in families:
             ns = override_ns if override_ns is not None else family_ns[fam]
             for n in ns:
                 for t in thread_counts:
                     par_only = t > 1
+                    if par_only and not any_par:
+                        continue
                     tag = "par_only" if par_only else "+seq"
                     print(f"  [synthetic] {fam} n={n} T={t} ({tag})",
                           flush=True)
@@ -336,11 +355,14 @@ def run_cube_decomp(out_dir: Path, thread_counts: list[int],
           flush=True)
     traces_dir = out_dir / "traces" / "cube_decomp"
     first = True
+    any_par = _has_parallel_algo(algos)
     with open(csv_path, "w") as out:
         for d in CUBE_DECOMP_DS:
             for k in CUBE_DECOMP_KS:
                 for t in thread_counts:
                     par_only = t > 1
+                    if par_only and not any_par:
+                        continue
                     tag = "par_only" if par_only else "+seq"
                     print(f"  [cube_decomp] d={d} k={k} T={t} ({tag})",
                           flush=True)
@@ -686,8 +708,11 @@ def run_gates(out_dir: Path, thread_counts: list[int],
                 "par_filter", "par_filter_gbk", "par_filter_hybrid")
 
     first = True
+    any_par = _has_parallel_algo(algos)
     with open(csv_path, "w") as out:
         for t in thread_counts:
+            if t > 1 and not any_par:
+                continue
             for fpath in files:
                 fname = os.path.basename(fpath)
                 print(f"  [gates] T={t} {fname}", flush=True)
