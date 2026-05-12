@@ -63,6 +63,46 @@ CUBE_DECOMP_KS = list(range(5, 206, 25))
 # both would double-count.
 GATES_DEFAULT_ROOT   = "./miter-cc-benchmarks"
 GATES_DEFAULT_SUITES = ["iwls22_with_not", "hwmcc12_with_not"]
+# URL kept in sync with .gitmodules manually. Used as a fallback when
+# the parent repo has no .git/ directory (e.g. the artifact was
+# distributed as a `git archive` zip): there's no submodule machinery
+# to invoke, so we plain `git clone` the corpus directly.
+GATES_REPO_URL = "https://github.com/amarshah1/miter-cc-benchmarks.git"
+
+
+def _fetch_gates_corpus(gates_root: str):
+    """Populate `gates_root` with the miter-cc-benchmarks corpus.
+
+    Prefer `git submodule update --init` when the parent repo has a
+    .git/ directory (the normal "clone-then-build" path). Fall back to
+    a plain `git clone` when there's no .git/ — that's what happens
+    when the artifact was distributed as a tarball / zip via
+    `git archive`, which strips .git/ by design. The submodule init
+    would fail with "fatal: not a git repository" in that case.
+    """
+    if os.path.isdir(".git"):
+        print(f"Initializing submodule: {gates_root}", flush=True)
+        subprocess.run(
+            ["git", "submodule", "update", "--init", "--recursive",
+             gates_root],
+            check=True,
+        )
+        return
+    # Tarball / zip distribution: no parent .git/. Direct clone.
+    if os.path.isdir(gates_root):
+        # Empty gitlink placeholder dir from the archive — git clone
+        # refuses to clone into a non-empty target.
+        if os.listdir(gates_root):
+            sys.exit(f"{gates_root} is non-empty but not a populated "
+                     f"clone of the corpus; please remove it or "
+                     f"clone {GATES_REPO_URL} into it manually.")
+        os.rmdir(gates_root)
+    print(f"Cloning gates corpus: {GATES_REPO_URL} -> {gates_root}",
+          flush=True)
+    subprocess.run(
+        ["git", "clone", "--depth", "1", GATES_REPO_URL, gates_root],
+        check=True,
+    )
 
 # Algorithms surfaced in the per-phase summary table (in column order).
 # Mapping to the binaries' CSV `algorithm` tags:
@@ -416,17 +456,12 @@ def run_gates(out_dir: Path, thread_counts: list[int],
         # dir for the gitlink, so `os.path.isdir(gates_root)` would say
         # True even when the submodule was never fetched. Check that
         # the expected suite subdirs are present too — that's the real
-        # "is this populated?" signal on a fresh PSC clone.
+        # "is this populated?" signal on a fresh clone.
         populated = (os.path.isdir(gates_root) and
                      all(os.path.isdir(os.path.join(gates_root, s))
                          for s in suites))
         if not populated:
-            print(f"Initializing submodule: {gates_root}", flush=True)
-            subprocess.run(
-                ["git", "submodule", "update", "--init", "--recursive",
-                 gates_root],
-                check=True,
-            )
+            _fetch_gates_corpus(gates_root)
         # The submodule ships .gates.xz; decompress per-suite (in place)
         # if any are still compressed. decompress.sh removes the .xz
         # after success, so subsequent runs are no-ops.

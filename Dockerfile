@@ -29,12 +29,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /work
 COPY . /work
 
-# Initialize the miter-cc-benchmarks submodule (gates phase). When
-# building from a `git archive` tarball the submodule won't be present,
-# so we fetch it explicitly. The build still succeeds without it; the
-# gates phase will simply report no .gates files matched.
-RUN if [ -d .git ] && [ -z "$(ls miter-cc-benchmarks 2>/dev/null)" ]; then \
-      git submodule update --init --recursive miter-cc-benchmarks || true; \
+# Fetch the miter-cc-benchmarks corpus (gates phase). .dockerignore
+# excludes the host's .git/ and submodule directory, so we always need
+# to fetch fresh inside the image — `git submodule update` won't work
+# without a parent .git/. Use a direct shallow clone. Skip on failure
+# so the image still builds in offline environments; the gates phase
+# will simply report no .gates files matched.
+RUN if [ -z "$(ls miter-cc-benchmarks 2>/dev/null)" ]; then \
+      rm -rf miter-cc-benchmarks && \
+      git clone --depth 1 https://github.com/amarshah1/miter-cc-benchmarks.git \
+        miter-cc-benchmarks || true; \
     fi
 
 RUN cmake -B build -S . -DCMAKE_BUILD_TYPE=Release \
