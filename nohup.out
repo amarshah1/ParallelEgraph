@@ -652,3 +652,325 @@ drwxrwxr-x 3 zkent zkent  4096 May  6 00:24 ..
 -rw-rw-r-- 1 zkent zkent  5484 May  6 00:35 quintic20_scaling.csv
 -rw-rw-r-- 1 zkent zkent   212 May  6 00:24 sanity.log
 -rw-rw-r-- 1 zkent zkent  6916 May  6 00:25 synthetic_144T.csv
+Configuring CMake (Release)...
+-- PARLAY VERSION 2.3.3
+-- ---------------------------- General configuration -----------------------------
+-- CMake Generator:                Unix Makefiles
+-- Compiler:                       GNU 15.2.0
+-- Build type:                     Release
+-- CMAKE_CXX_FLAGS:                
+-- CMAKE_CXX_FLAGS_DEBUG:          -g
+-- CMAKE_CXX_FLAGS_RELEASE:        -O3 -DNDEBUG
+-- CMAKE_CXX_FLAGS_RELWITHDEBINFO: -O2 -g -DNDEBUG -fno-omit-frame-pointer
+-- CMAKE_EXE_LINKER_FLAGS          
+-- CMAKE_INSTALL_PREFIX:           /usr/local
+-- -------------------------------- Library options ------------------------------
+-- Using Parlay scheduler. Switch with -DPARLAY_{CILKPLUS,OPENCILK,OPENMP,TBB}=On
+-- Elastic parallelism enabled. Disable with -DPARLAY_ELASTIC_PARALLELISM=Off
+-- ------------------------------- Static Analysis --------------------------------
+-- cppcheck:                     Disabled (enable with -DENABLE_CPPCHECK=On)
+-- clang-tidy:                   Disabled (enable with -DENABLE_CLANG_TIDY=On)
+-- include-what-you-use:         Disabled (enable with -DENABLE_IWYU=On)
+-- ---------------------------------- Unit Tests ----------------------------------
+-- testing: Disabled (enable with -DPARLAY_TEST=On)
+-- ---------------------------------- Benchmarks ----------------------------------
+-- benchmarks: Disabled (enable with -DPARLAY_BENCHMARK=On)
+-- ----------------------------------- Examples -----------------------------------
+-- examples: Disabled (enable with -DPARLAY_EXAMPLES=On)
+-- example data: Off (add -DPARLAY_EXAMPLE_DATA=On to download)
+-- Linking with jemalloc: /usr/lib/x86_64-linux-gnu/libjemalloc.so
+-- Configuring done (0.9s)
+-- Generating done (0.0s)
+-- Build files have been written to: /home/ubuntu/ParallelEgraph/build
+Building closure_compare_bench, synthetic_bench, gates_bench...
+[ 75%] Built target parallel_egraph_core
+[100%] Built target closure_compare_bench
+[ 75%] Built target parallel_egraph_core
+[100%] Built target synthetic_bench
+[ 75%] Built target parallel_egraph_core
+[100%] Built target gates_bench
+Output:        runs/topo_vs_async_20260512_014529
+Phases:        ['random', 'cube_decomp', 'gates']
+Random modes:  xl (xl=['XL', '2XL', '4XL', '8XL', '16XL', '32XL'])
+Threads:       [1, 4, 8]
+Families:      ['chain', 'grid', 'cube', 'quartic', 'quintic', 'mixed_depth']
+Warmup/trials: 1/5
+Algos:         ['nelson_simple_inline']  (PE_BENCH_ALGOS filter active)
+numactl:       /usr/bin/numactl -i all
+
+=== random (XL ladder, ['XL', '2XL', '4XL', '8XL', '16XL', '32XL']) -> runs/topo_vs_async_20260512_014529/random.csv
+  [random-xl] XL T=1 (+seq)
+  [random-xl] 2XL T=1 (+seq)
+  [random-xl] 4XL T=1 (+seq)
+  [random-xl] 8XL T=1 (+seq)
+  [random-xl] 16XL T=1 (+seq)
+  [random-xl] 32XL T=1 (+seq)
+=== cube_decomp (synthetic_bench cube only) → runs/topo_vs_async_20260512_014529/cube_decomp.csv
+  [cube_decomp] d=2 k=5 T=1 (+seq)
+  [cube_decomp] d=2 k=30 T=1 (+seq)
+  [cube_decomp] d=2 k=55 T=1 (+seq)
+  [cube_decomp] d=2 k=80 T=1 (+seq)
+  [cube_decomp] d=2 k=105 T=1 (+seq)
+  [cube_decomp] d=2 k=130 T=1 (+seq)
+  [cube_decomp] d=2 k=155 T=1 (+seq)
+  [cube_decomp] d=2 k=180 T=1 (+seq)
+  [cube_decomp] d=2 k=205 T=1 (+seq)
+  [cube_decomp] d=3 k=5 T=1 (+seq)
+  [cube_decomp] d=3 k=30 T=1 (+seq)
+  [cube_decomp] d=3 k=55 T=1 (+seq)
+  [cube_decomp] d=3 k=80 T=1 (+seq)
+  [cube_decomp] d=3 k=105 T=1 (+seq)
+  [cube_decomp] d=3 k=130 T=1 (+seq)
+  [cube_decomp] d=3 k=155 T=1 (+seq)
+  [cube_decomp] d=3 k=180 T=1 (+seq)
+  [cube_decomp] d=3 k=205 T=1 (+seq)
+  [cube_decomp] d=4 k=5 T=1 (+seq)
+  [cube_decomp] d=4 k=30 T=1 (+seq)
+  [cube_decomp] d=4 k=55 T=1 (+seq)
+  [cube_decomp] d=4 k=80 T=1 (+seq)
+  [cube_decomp] d=4 k=105 T=1 (+seq)
+  [cube_decomp] d=4 k=130 T=1 (+seq)
+  [cube_decomp] d=4 k=155 T=1 (+seq)
+  [cube_decomp] d=4 k=180 T=1 (+seq)
+  [cube_decomp] d=4 k=205 T=1 (+seq)
+  [cube_decomp] d=5 k=5 T=1 (+seq)
+  [cube_decomp] d=5 k=30 T=1 (+seq)
+  [cube_decomp] d=5 k=55 T=1 (+seq)
+  [cube_decomp] d=5 k=80 T=1 (+seq)
+  [cube_decomp] d=5 k=105 T=1 (+seq)
+  [cube_decomp] d=5 k=130 T=1 (+seq)
+  [cube_decomp] d=5 k=155 T=1 (+seq)
+  [cube_decomp] d=5 k=180 T=1 (+seq)
+  [cube_decomp] d=5 k=205 T=1 (+seq)
+=== gates (gates_bench) → runs/topo_vs_async_20260512_014529/gates.csv
+  [gates] 22 file(s) × 3 thread count(s)
+  [gates] T=1 h5m-n01-ands.gates
+[gates_bench] ./miter-cc-benchmarks/iwls22_with_not/h5m-n01-ands.gates ...
+  literals=1083431  NOT=499915  gates=1660156  total_classes=3243502  read=0.205s parse=0.165s build=0.314s
+    done in 4.7s
+  [gates] T=1 h5m-n01-xits.gates
+[gates_bench] ./miter-cc-benchmarks/iwls22_with_not/h5m-n01-xits.gates ...
+  literals=613618  NOT=249946  gates=1105612  total_classes=1969176  read=0.139s parse=0.113s build=0.208s
+    done in 2.8s
+  [gates] T=1 h5m-n04-ands.gates
+[gates_bench] ./miter-cc-benchmarks/iwls22_with_not/h5m-n04-ands.gates ...
+  literals=1246980  NOT=573992  gates=1782230  total_classes=3603202  read=0.221s parse=0.161s build=0.333s
+    done in 5.3s
+  [gates] T=1 h5m-n04-xits.gates
+[gates_bench] ./miter-cc-benchmarks/iwls22_with_not/h5m-n04-xits.gates ...
+  literals=707582  NOT=308278  gates=1268358  total_classes=2284218  read=0.161s parse=0.121s build=0.209s
+    done in 3.2s
+  [gates] T=1 h5m-n06-ands.gates
+[gates_bench] ./miter-cc-benchmarks/iwls22_with_not/h5m-n06-ands.gates ...
+  literals=3206860  NOT=1500349  gates=4663996  total_classes=9371205  read=0.618s parse=0.505s build=0.949s
+    done in 15.1s
+  [gates] T=1 h5m-n06-xits.gates
+[gates_bench] ./miter-cc-benchmarks/iwls22_with_not/h5m-n06-xits.gates ...
+  literals=1735829  NOT=729369  gates=3117439  total_classes=5582637  read=0.405s parse=0.320s build=0.595s
+    done in 9.1s
+  [gates] T=1 h5m-test01-ands.gates
+[gates_bench] ./miter-cc-benchmarks/iwls22_with_not/h5m-test01-ands.gates ...
+  literals=1038141  NOT=465435  gates=1380000  total_classes=2883576  read=0.177s parse=0.140s build=0.271s
+    done in 4.0s
+  [gates] T=1 h5m-test01-xits.gates
+[gates_bench] ./miter-cc-benchmarks/iwls22_with_not/h5m-test01-xits.gates ...
+  literals=589597  NOT=270675  gates=1112914  total_classes=1973186  read=0.145s parse=0.119s build=0.208s
+    done in 2.9s
+  [gates] T=1 h5m-test02-ands.gates
+[gates_bench] ./miter-cc-benchmarks/iwls22_with_not/h5m-test02-ands.gates ...
+  literals=2446158  NOT=984808  gates=3476413  total_classes=6907379  read=0.492s parse=0.365s build=0.681s
+    done in 10.8s
+  [gates] T=1 h5m-test02-xits.gates
+[gates_bench] ./miter-cc-benchmarks/iwls22_with_not/h5m-test02-xits.gates ...
+  literals=1336652  NOT=613910  gates=2740997  total_classes=4691559  read=0.335s parse=0.303s build=0.523s
+    done in 7.8s
+  [gates] T=1 6s100-ands-opt.gates
+[gates_bench] ./miter-cc-benchmarks/hwmcc12_with_not/6s100-ands-opt.gates ...
+  literals=3040530  NOT=1304136  gates=3442638  total_classes=7787304  read=0.422s parse=0.360s build=0.733s
+    done in 12.3s
+  [gates] T=1 6s100-xits-opt.gates
+[gates_bench] ./miter-cc-benchmarks/hwmcc12_with_not/6s100-xits-opt.gates ...
+  literals=2571412  NOT=835018  gates=3435519  total_classes=6841949  read=0.469s parse=0.365s build=0.714s
+    done in 11.6s
+  [gates] T=1 6s104-ands-opt.gates
+[gates_bench] ./miter-cc-benchmarks/hwmcc12_with_not/6s104-ands-opt.gates ...
+  literals=4624476  NOT=2055360  gates=5408579  total_classes=12088415  read=0.736s parse=0.580s build=1.155s
+    done in 19.3s
+  [gates] T=1 6s104-xits-opt.gates
+[gates_bench] ./miter-cc-benchmarks/hwmcc12_with_not/6s104-xits-opt.gates ...
+  literals=3893762  NOT=1312166  gates=5454645  total_classes=10660573  read=0.796s parse=0.601s build=1.120s
+    done in 17.9s
+  [gates] T=1 6s114-ands-opt.gates
+[gates_bench] ./miter-cc-benchmarks/hwmcc12_with_not/6s114-ands-opt.gates ...
+  literals=3710951  NOT=1561263  gates=4017244  total_classes=9289458  read=0.496s parse=0.434s build=0.891s
+    done in 14.9s
+  [gates] T=1 6s114-xits-opt.gates
+[gates_bench] ./miter-cc-benchmarks/hwmcc12_with_not/6s114-xits-opt.gates ...
+  literals=3211512  NOT=1061874  gates=4390625  total_classes=8664011  read=0.604s parse=0.475s build=0.916s
+    done in 14.6s
+  [gates] T=1 6s117-ands-opt.gates
+[gates_bench] ./miter-cc-benchmarks/hwmcc12_with_not/6s117-ands-opt.gates ...
+  literals=1880426  NOT=831949  gates=2213528  total_classes=4925903  read=0.281s parse=0.224s build=0.474s
+    done in 7.9s
+  [gates] T=1 6s117-xits-opt.gates
+[gates_bench] ./miter-cc-benchmarks/hwmcc12_with_not/6s117-xits-opt.gates ...
+  literals=1588740  NOT=540263  gates=2292599  total_classes=4421602  read=0.293s parse=0.228s build=0.476s
+    done in 7.3s
+  [gates] T=1 6s125-ands-opt.gates
+[gates_bench] ./miter-cc-benchmarks/hwmcc12_with_not/6s125-ands-opt.gates ...
+  literals=13211558  NOT=5806462  gates=15232733  total_classes=34250753  read=2.284s parse=1.702s build=3.522s
+    done in 61.7s
+  [gates] T=1 6s125-xits-opt.gates
+[gates_bench] ./miter-cc-benchmarks/hwmcc12_with_not/6s125-xits-opt.gates ...
+  literals=10526836  NOT=3121730  gates=14734601  total_classes=28383167  read=2.252s parse=1.653s build=3.068s
+    done in 53.1s
+  [gates] T=1 6s163-ands-opt.gates
+[gates_bench] ./miter-cc-benchmarks/hwmcc12_with_not/6s163-ands-opt.gates ...
+  literals=5133510  NOT=2412539  gates=6042399  total_classes=13588448  read=0.701s parse=0.652s build=1.304s
+    done in 22.4s
+  [gates] T=1 6s163-xits-opt.gates
+[gates_bench] ./miter-cc-benchmarks/hwmcc12_with_not/6s163-xits-opt.gates ...
+  literals=3836213  NOT=1115222  gates=5675417  total_classes=10626852  read=0.770s parse=0.620s build=1.159s
+    done in 17.1s
+
+--- random.csv ---
+workload              thr |  nl_inline par_filter par_topo_it | simple/async topo_it/async
+------------------------------------------------------------------------------------------
+16XL                    1 |   12775.87          -           - |            -             -
+
+2XL                     1 |    1199.23          -           - |            -             -
+
+32XL                    1 |   28834.25          -           - |            -             -
+
+4XL                     1 |    2677.49          -           - |            -             -
+
+8XL                     1 |    5809.34          -           - |            -             -
+
+XL                      1 |     523.27          -           - |            -             -
+
+
+--- cube_decomp.csv ---
+family/n/d            thr |  nl_inline par_filter par_topo_it | simple/async topo_it/async
+------------------------------------------------------------------------------------------
+cube/105/2              1 |     967.62          -           - |            -             -
+
+cube/105/3              1 |     740.31          -           - |            -             -
+
+cube/105/4              1 |     737.95          -           - |            -             -
+
+cube/105/5              1 |     606.42          -           - |            -             -
+
+cube/130/2              1 |    1934.49          -           - |            -             -
+
+cube/130/3              1 |    1647.96          -           - |            -             -
+
+cube/130/4              1 |    1287.26          -           - |            -             -
+
+cube/130/5              1 |    1458.56          -           - |            -             -
+
+cube/155/2              1 |    3740.79          -           - |            -             -
+
+cube/155/3              1 |    2360.06          -           - |            -             -
+
+cube/155/4              1 |    1962.63          -           - |            -             -
+
+cube/155/5              1 |    2479.74          -           - |            -             -
+
+cube/180/2              1 |    5769.70          -           - |            -             -
+
+cube/180/3              1 |    4689.19          -           - |            -             -
+
+cube/180/4              1 |    4447.91          -           - |            -             -
+
+cube/180/5              1 |    3459.80          -           - |            -             -
+
+cube/205/2              1 |    9243.23          -           - |            -             -
+
+cube/205/3              1 |    7335.93          -           - |            -             -
+
+cube/205/4              1 |    5604.42          -           - |            -             -
+
+cube/205/5              1 |    4736.87          -           - |            -             -
+
+cube/30/2               1 |      12.71          -           - |            -             -
+
+cube/30/3               1 |      10.73          -           - |            -             -
+
+cube/30/4               1 |       8.96          -           - |            -             -
+
+cube/30/5               1 |       9.17          -           - |            -             -
+
+cube/5/2                1 |       0.03          -           - |            -             -
+
+cube/5/3                1 |       0.03          -           - |            -             -
+
+cube/5/4                1 |       0.02          -           - |            -             -
+
+cube/5/5                1 |       0.21          -           - |            -             -
+
+cube/55/2               1 |     102.34          -           - |            -             -
+
+cube/55/3               1 |      78.93          -           - |            -             -
+
+cube/55/4               1 |      70.55          -           - |            -             -
+
+cube/55/5               1 |      71.24          -           - |            -             -
+
+cube/80/2               1 |     393.95          -           - |            -             -
+
+cube/80/3               1 |     270.89          -           - |            -             -
+
+cube/80/4               1 |     289.31          -           - |            -             -
+
+cube/80/5               1 |     258.45          -           - |            -             -
+
+
+file                              thr |    topo_ms   async_ms | topo/async  topo_T1/T  async_T1/T |      gates    classes
+------------------------------------------------------------------------------------------------------------------------
+6s100-ands-opt                      1 |          -          - |          -          -           - |    3442638    7787304
+
+6s100-xits-opt                      1 |          -          - |          -          -           - |    3435519    6841949
+
+6s104-ands-opt                      1 |          -          - |          -          -           - |    5408579   12088415
+
+6s104-xits-opt                      1 |          -          - |          -          -           - |    5454645   10660573
+
+6s114-ands-opt                      1 |          -          - |          -          -           - |    4017244    9289458
+
+6s114-xits-opt                      1 |          -          - |          -          -           - |    4390625    8664011
+
+6s117-ands-opt                      1 |          -          - |          -          -           - |    2213528    4925903
+
+6s117-xits-opt                      1 |          -          - |          -          -           - |    2292599    4421602
+
+6s125-ands-opt                      1 |          -          - |          -          -           - |   15232733   34250753
+
+6s125-xits-opt                      1 |          -          - |          -          -           - |   14734601   28383167
+
+6s163-ands-opt                      1 |          -          - |          -          -           - |    6042399   13588448
+
+6s163-xits-opt                      1 |          -          - |          -          -           - |    5675417   10626852
+
+h5m-n01-ands                        1 |          -          - |          -          -           - |    1660156    3243502
+
+h5m-n01-xits                        1 |          -          - |          -          -           - |    1105612    1969176
+
+h5m-n04-ands                        1 |          -          - |          -          -           - |    1782230    3603202
+
+h5m-n04-xits                        1 |          -          - |          -          -           - |    1268358    2284218
+
+h5m-n06-ands                        1 |          -          - |          -          -           - |    4663996    9371205
+
+h5m-n06-xits                        1 |          -          - |          -          -           - |    3117439    5582637
+
+h5m-test01-ands                     1 |          -          - |          -          -           - |    1380000    2883576
+
+h5m-test01-xits                     1 |          -          - |          -          -           - |    1112914    1973186
+
+h5m-test02-ands                     1 |          -          - |          -          -           - |    3476413    6907379
+
+h5m-test02-xits                     1 |          -          - |          -          -           - |    2740997    4691559
+
+
+Done. CSVs under: runs/topo_vs_async_20260512_014529
+--shutdown-after set; running `shutdown -h now`
