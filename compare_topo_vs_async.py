@@ -149,10 +149,32 @@ def cmake_build(targets: list[str]):
 
 
 def _numactl_prefix(no_numactl: bool) -> list[str]:
+    """Return `["numactl", "-i", "all"]` only when (1) numactl is on
+    PATH and (2) the host actually has more than one NUMA node. On
+    single-NUMA-node hosts (laptops, single-socket without SNC, Docker
+    Desktop's VM, restricted cgroups) `numactl -i all` errors with
+    "This system does not support NUMA policy"; auto-detecting avoids
+    that failure mode without forcing reviewers to know the
+    `--no-numactl` flag.
+    """
     if no_numactl:
         return []
     which = shutil.which("numactl")
-    return [which, "-i", "all"] if which else []
+    if not which:
+        return []
+    # Probe numactl directly. Parsing "available: N nodes" from
+    # `numactl --hardware` works on Linux, but we also want to catch
+    # the case where numactl exists but interleaving fails (restricted
+    # cgroup, Docker Desktop, etc). One small invocation that does
+    # nothing-but-succeed gives a definitive answer.
+    probe = subprocess.run([which, "-i", "all", "true"],
+                           capture_output=True, text=True)
+    if probe.returncode != 0:
+        print(f"[numactl] '{which} -i all' rejected by kernel "
+              f"({probe.stderr.strip()}); running without NUMA "
+              f"interleaving.", file=sys.stderr, flush=True)
+        return []
+    return [which, "-i", "all"]
 
 
 def _run_binary(binary: str, *, env: dict, numactl_prefix: list[str],
