@@ -33,8 +33,8 @@ all must pass on a clean build):
 
 ## Resource requirements
 
-- **Disk**: ~3 GB total (2 GB cc-benchmarks submodule + ~500 MB build +
-  ~500 MB results).
+- **Disk**: ~3 GB total (~1 GB miter-cc-benchmarks gates corpus, fetched
+  on first run + ~500 MB build artifacts + ~500 MB results).
 - **RAM**: ~32 GB peak. The XL ladder's `32XL` rung builds a 64M-node
   e-graph (50K leaves × 16 fns × 64M nodes / 6.4M merges); peak working
   set hits roughly 8 bytes × 64M ≈ 0.5 GB UF + ~5 GB parents_
@@ -71,8 +71,18 @@ all must pass on a clean build):
 ## Quickstart (no Docker)
 
 ```bash
-# 1. Fetch the miter-cc-benchmarks submodule (used by the gates phase).
-git submodule update --init --recursive miter-cc-benchmarks
+# 1. Fetch the miter-cc-benchmarks corpus (used by the gates phase).
+#    If this artifact was extracted from a zip, the empty
+#    `miter-cc-benchmarks/` placeholder needs to be replaced by a
+#    direct clone (there's no .git/ to drive submodule init from):
+[ -d .git ] \
+  && git submodule update --init --recursive miter-cc-benchmarks \
+  || { rmdir miter-cc-benchmarks 2>/dev/null; \
+       git clone --depth 1 \
+         https://github.com/amarshah1/miter-cc-benchmarks.git \
+         miter-cc-benchmarks; }
+# (Step 1 is optional. If you skip it, the python driver will auto-fetch
+#  the corpus the first time the gates phase needs it.)
 
 # 2. Build (~2 minutes).
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
