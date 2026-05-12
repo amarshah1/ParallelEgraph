@@ -90,15 +90,65 @@ Expected smoke-test final line: `kick-the-tires complete.` with
 
 ## Quickstart (Docker)
 
+Docker is an alternative path for reviewers who'd rather not install
+the Linux dependencies (`build-essential`, `cmake`, `libjemalloc-dev`,
+`numactl`, `python3`) directly on the host. If you've never used
+Docker before:
+
+**1. Install Docker.** On Linux, follow the official engine
+instructions at <https://docs.docker.com/engine/install/>. On macOS
+or Windows, install Docker Desktop from
+<https://www.docker.com/products/docker-desktop/> and launch it once.
+You can confirm Docker is working with:
+
+```bash
+docker run --rm hello-world
+```
+
+If you see "Hello from Docker!" then Docker is ready.
+
+**2. Build the image.** From this artifact's top-level directory
+(the one containing the `Dockerfile`):
+
 ```bash
 docker build -t parallel-egraph .
+```
 
-docker run --rm -it parallel-egraph ./bench/scripts/kick_the_tires.sh
+This downloads an Ubuntu 26.04 base image, installs the build
+dependencies, and compiles the C++ binaries. First build takes
+roughly 3-5 minutes; later builds reuse cached layers. The final
+image is about 1 GB.
 
+**3. Run the smoke test inside the image.** No host side-effects:
+the `--rm` flag removes the container after it exits.
+
+```bash
+docker run --rm parallel-egraph ./bench/scripts/kick_the_tires.sh
+```
+
+Expected last line: `kick-the-tires complete.`
+
+**4. Run the full reproduction.** Mount a host directory so the CSV
+outputs (about ~300 MB) persist after the container exits:
+
+```bash
 mkdir -p results
-docker run --rm -it -v "$PWD/results:/work/runs" parallel-egraph \
+docker run --rm -v "$PWD/results:/work/runs" parallel-egraph \
   ./bench/scripts/run_artifact.sh
 ```
+
+If your host has only a single NUMA node (laptops, Docker Desktop),
+pass `--no-numactl` to skip the numactl auto-detect:
+
+```bash
+docker run --rm -v "$PWD/results:/work/runs" parallel-egraph \
+  python3 compare_topo_vs_async.py --skip synthetic --no-numactl \
+  --algos nelson_simple_inline,par_parents,par_filter
+```
+
+After the run finishes, the `results/` directory on your host holds
+the CSVs (`random.csv`, `cube_decomp.csv`, `gates.csv`) and the raw
+trace logs.
 
 ---
 
@@ -148,16 +198,3 @@ Phase outputs go to `runs/topo_vs_async_<timestamp>/`:
 
 The XL ladder's `32XL` rung (64M nodes) dominates the random phase; cap
 via `--xl-labels XL,2XL,4XL,8XL` if you want a faster run.
-
----
-
-## Submission checklist (for ourselves, before uploading to EasyChair)
-
-- [x] LICENSE (MIT) at repo root
-- [x] README + ARTIFACT.md
-- [x] Dockerfile
-- [x] kick_the_tires.sh and run_artifact.sh
-- [x] Reproducible build (FetchContent for parlay; jemalloc, numactl pinned via apt)
-- [ ] Compute SHA256 of the final archive (`shasum -a 256 artifact.zip`)
-- [ ] Host the .zip at a stable URL (institutional page is fine; DOI required for camera-ready)
-- [ ] EasyChair submission: link, SHA256, tested-on description ("Ubuntu 26.04 on AWS c8i.metal-48xl — Intel Xeon 6975P-C, 192 threads, NUMA SNC=3; also tested macOS 14 + M-series via Docker")
