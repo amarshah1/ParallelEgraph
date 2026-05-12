@@ -509,6 +509,24 @@ std::vector<double> bench_nelson_simple_hash(Family f, std::size_t n,
   return times;
 }
 
+std::vector<double> bench_nelson_simple_inline(Family f, std::size_t n,
+                                                std::size_t g_arity,
+                                                int warmup, int trials) {
+  for (int i = 0; i < warmup; ++i) {
+    auto g = build<SequentialUnionFind>(f, n, g_arity);
+    g.eg->sequential_close_simple_inline(g.eqs);
+  }
+  std::vector<double> times;
+  times.reserve(trials);
+  for (int i = 0; i < trials; ++i) {
+    auto g = build<SequentialUnionFind>(f, n, g_arity);
+    auto t0 = clk::now();
+    g.eg->sequential_close_simple_inline(g.eqs);
+    times.push_back(elapsed_ms(t0));
+  }
+  return times;
+}
+
 std::vector<double> bench_parallel_parents(Family f, std::size_t n,
                                           std::size_t g_arity,
                                           int warmup, int trials) {
@@ -809,6 +827,10 @@ int main() {
       if (!par_only && algo_enabled("nelson_simple_hash")) {
         nsimh = bench_nelson_simple_hash(f, n, g_arity, warmup, trials);
       }
+      std::vector<double> nsimi;
+      if (!par_only && algo_enabled("nelson_simple_inline")) {
+        nsimi = bench_nelson_simple_inline(f, n, g_arity, warmup, trials);
+      }
       std::vector<double> par, pti, pa, pam, pnv, pagbk;
       double mp = 0.0, mpti = 0.0, mpa = 0.0, mpam = 0.0;
       if (algo_enabled("par_parents")) {
@@ -849,6 +871,8 @@ int main() {
             emit_csv(f, n, classes, merges, "nelson_simple", nsim);
           if (algo_enabled("nelson_simple_hash"))
             emit_csv(f, n, classes, merges, "nelson_simple_hash", nsimh);
+          if (algo_enabled("nelson_simple_inline"))
+            emit_csv(f, n, classes, merges, "nelson_simple_inline", nsimi);
         }
         if (algo_enabled("par_parents"))
           emit_csv(f, n, classes, merges, "par_parents", par);

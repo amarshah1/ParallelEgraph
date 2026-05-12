@@ -84,19 +84,21 @@ GATES_DEFAULT_SUITES = ["iwls22_with_not", "hwmcc12_with_not"]
 #   par_naive         — naive rounds CC (semisort all non-leaves every
 #                        round; no dirty filter; the "ablation" against
 #                        par_filter that quantifies what filtering buys)
-# Default algo set: sequential baseline (nelson_simple) plus the two
-# parallel headlines (par_filter, par_topo_iter). Other algos are still
-# recognized via --algos but are off by default. Add "par_filter_gbk",
-# "nelson_seq", etc. via --algos when comparing more thoroughly.
+# Default algo set: sequential baseline (nelson_simple_inline, the
+# SigK<K> + bump-arena variant) plus the two parallel headlines
+# (par_filter, par_topo_iter). Other algos are still recognized via
+# --algos but are off by default. Add "par_filter_gbk", "nelson_seq",
+# "nelson_simple", etc. via --algos when comparing more thoroughly.
 ALGOS_OF_INTEREST = [
-    "nelson_simple",
+    "nelson_simple_inline",
     "par_filter",
     "par_topo_iter",
 ]
 ALGO_HEADERS = {
-    "nelson_simple":  "nl_simple",
-    "par_filter":      "par_filter",
-    "par_topo_iter":  "par_topo_it",
+    "nelson_simple":         "nl_simple",
+    "nelson_simple_inline":  "nl_inline",
+    "par_filter":            "par_filter",
+    "par_topo_iter":         "par_topo_it",
 }
 
 # Sequential = every algo not starting with "par_". Run only at T=1.
@@ -387,6 +389,7 @@ EGG_ALGOS: list[tuple[str, str | None, str | None]] = [
     ("nelson_simple",    "simple",     None),
     ("nelson_simple_hash", "simple_hash", None),
     ("nelson_simple_arity", "simple_arity", None),
+    ("nelson_simple_inline", "simple_inline", None),
     ("par_parents",        None,         None),
     ("par_topo_iter",    None,         "PE_USE_TOPO"),
     ("par_filter",        None,         "PE_USE_ASYNC"),
@@ -677,8 +680,10 @@ def run_gates(out_dir: Path, thread_counts: list[int],
 
     # Algo names gates_bench currently understands.
     GATES_OK = ("nelson_simple", "nelson_simple_hash", "nelson_simple_arity",
-                "nelson_topo_iter",
-                "par_parents", "par_topo_iter", "par_filter")
+                "nelson_simple_bump", "nelson_simple_arity_bump",
+                "nelson_simple_inline", "nelson_topo_iter",
+                "par_parents", "par_parents_gbk", "par_topo_iter",
+                "par_filter", "par_filter_gbk", "par_filter_hybrid")
 
     first = True
     with open(csv_path, "w") as out:
@@ -857,11 +862,14 @@ def summarize(csv_path: Path, group_keys: list[str]):
                              else f"{'-':>{col_w[a]}}")
             # Headline ratios:
             #   simple/async   = sequential baseline / par_filter (parallel
-            #                    speedup over single-threaded simple).
+            #                    speedup over single-threaded simple). Prefer
+            #                    nelson_simple_inline (the SigK+bump sound
+            #                    sequential) when present; fall back to
+            #                    nelson_simple (textbook) otherwise.
             #   topo_it/async  = par_topo_iter / par_filter (relative cost
             #                    of the depth-stratified parallel path).
             pa = vals.get("par_filter")
-            ns = vals.get("nelson_simple")
+            ns = vals.get("nelson_simple_inline") or vals.get("nelson_simple")
             pt = vals.get("par_topo_iter")
             ratio_simple_async = (f"{ns/pa:>11.2f}x"
                                   if (ns and pa and pa > 0)

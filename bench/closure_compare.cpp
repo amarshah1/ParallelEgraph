@@ -408,6 +408,22 @@ std::vector<double> bench_nelson_simple_hash(const Workload& w) {
   return times;
 }
 
+std::vector<double> bench_nelson_simple_inline(const Workload& w) {
+  for (int i = 0; i < WARMUP; ++i) {
+    auto g = build<SequentialUnionFind>(w);
+    g.eg->sequential_close_simple_inline(g.eqs);
+  }
+  std::vector<double> times;
+  times.reserve(TRIALS);
+  for (int i = 0; i < TRIALS; ++i) {
+    auto g = build<SequentialUnionFind>(w);
+    auto t0 = clk::now();
+    g.eg->sequential_close_simple_inline(g.eqs);
+    times.push_back(elapsed_ms(t0));
+  }
+  return times;
+}
+
 std::vector<double> bench_nelson_topo_iter(const Workload& w) {
   for (int i = 0; i < WARMUP; ++i) {
     auto g = build<SequentialUnionFind>(w);
@@ -670,6 +686,10 @@ int main() {
     if (!par_only && algo_enabled("nelson_simple_hash")) {
       nsimh = bench_nelson_simple_hash(w);
     }
+    std::vector<double> nsimi;
+    if (!par_only && algo_enabled("nelson_simple_inline")) {
+      nsimi = bench_nelson_simple_inline(w);
+    }
     std::vector<double> par, pti, pa, pam, pnv;
     double mp = 0.0, mpti = 0.0, mpa = 0.0, mpam = 0.0;
     if (algo_enabled("par_parents")) {
@@ -705,6 +725,7 @@ int main() {
         if (algo_enabled("nelson_dst"))       emit_csv(w, "nelson_dst", dst);
         if (algo_enabled("nelson_simple"))    emit_csv(w, "nelson_simple", nsim);
         if (algo_enabled("nelson_simple_hash")) emit_csv(w, "nelson_simple_hash", nsimh);
+        if (algo_enabled("nelson_simple_inline")) emit_csv(w, "nelson_simple_inline", nsimi);
       }
       if (algo_enabled("par_parents"))        emit_csv(w, "par_parents", par);
       if (algo_enabled("par_topo_iter"))    emit_csv(w, "par_topo_iter", pti);
